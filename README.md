@@ -83,10 +83,17 @@ podkop-probe -s 'https://link.example.com/s/AAAA' -s 'https://other.example/sub/
    - A subscription that still fails is skipped with the reason; the others
      are still used.
 2. **Countries.** You choose "Europe only", all countries, or a list such
-   as `DE,NL,FI` (`--countries`). The country comes from the flag emoji or
-   the country/city name in the server name. Servers that are clearly
-   outside the choice are not even tested. After the test, the real exit
-   country (from the exit IP) is checked too.
+   as `DE,NL,FI` (`--countries`). A server is kept only if all three
+   checks agree:
+   - **the name:** flag emoji or country/city name;
+   - **the server's IP,** i.e. where you connect to. The domain is
+     resolved via public DNS and the IP looked up on ipinfo.io. This drops
+     relays such as "Германия через 🇷🇺", whose entry point is in Russia.
+     Servers behind a CDN like Cloudflare are left to the other two checks
+     (`--no-entry-check` turns this check off);
+   - **the exit IP,** after the test.
+
+   Servers failing the first two checks are not even tested.
 3. **Merge.** Nodes from all subscriptions are merged. The same server listed
    in several subscriptions is tested only once.
 4. **Check every node:**
@@ -97,8 +104,11 @@ podkop-probe -s 'https://link.example.com/s/AAAA' -s 'https://other.example/sub/
      - If the first round all fail, the node is DEAD at once.
      - A node that has lost more than 30% by half-way stops early: it's
        BAD either way.
-   - **Speed, one node at a time, with nothing else running:** every node
-     that lost at most 20% downloads through itself. The file is
+   - **Speed, after all latency tests:** every node that lost at most 20%
+     downloads through itself. First the script measures your line
+     directly (5 s from Hetzner), then runs one test per ~200 Mbit/s of
+     line at a time, up to 3 (`--speed-jobs N` to set it). On a 700 Mbit/s
+     line that's 3 at once; on a 100 Mbit/s line, 1. The file is
      Cloudflare's speed-test file (25 MB, repeated as needed), or Hetzner's
      if Cloudflare refuses. Your provider blocking Cloudflare doesn't
      matter here: this download always goes through the VLESS node, never
@@ -124,7 +134,7 @@ podkop-probe -s 'https://link.example.com/s/AAAA' -s 'https://other.example/sub/
    to `/etc/config/podkop.probe-backup.<date>`; the 3 newest backups are
    kept.
 
-40 nodes take about 3–4 minutes. `-q` does a quick run (12 requests,
+40 nodes take about 2–3 minutes on a fast line. `-q` does a quick run (12 requests,
 at most 4 s of speed test).
 
 The best links are also saved to `/tmp/podkop-probe-best.txt`.
@@ -215,7 +225,10 @@ Sources:
                     links); repeat -s for several
   -C FILE           sing-box config.json to take the outbounds from
   --countries LIST  test/choose only servers in these countries:
-                    europe, all (default), or codes like DE,NL,FI
+                    europe, all (default), or codes like DE,NL,FI; checked
+                    by name, by the server's IP and by the exit IP
+  --no-entry-check  don't look up the server's IP country (keeps relays
+                    whose entry point is elsewhere, e.g. "via RU")
 
 Test:
   -n N              requests per node               (default 40)
@@ -228,6 +241,8 @@ Test:
   -F                thorough run: -n 100, 15 s speed test
   -p PORT           first local SOCKS port          (default 39000)
   --no-speed        skip the download speed test
+  --speed-jobs N    speed tests at the same time (default: from the line
+                    speed, 1 per ~200 Mbit/s, max 3)
   --speed-url URL   file for the speed test (default: Cloudflare, then Hetzner)
 
 Podkop (for link sources: -s, -f, links):
