@@ -31,68 +31,62 @@ sh <(wget -O - https://github.com/dkagramanyan/podkop-keys-availability-/release
 
 | It asks | You do |
 |---|---|
-| `What do you want to do?` | type `2`, press Enter |
+| `What do you want to do?` | press Enter (`1`: test my keys) |
 | `Paste subscription URLs` | paste your keys (the links you import into Happ / Streisand / INCY), one per line, then press Enter on an empty line |
-| `Which servers?` | press Enter for **Europe only** (or `2` for all countries) |
+| `Servers: 1) Europe only ...` | press Enter for **Europe only** (or `2` for all countries) |
 
-**4. Wait 2–4 minutes.** Every server is tested for lost requests, latency
-and download speed. At the end you see a table. The servers marked `*` are
-the proposed top 10:
+**4. Wait 2–4 minutes.** A progress line counts through the servers. Then
+you get a short table. The servers marked `*` are the proposed top 10:
 
 ```
-  #   verdict            ok  fail%     min  median     p90  Mbit/s  exit IP         cc  node
-* 50  GOOD            40/40    0.0   0.148   0.239   0.449   137.4  212.x.x.x       LT  🇱🇹 Литва GRPC
-* 41  GOOD            40/40    0.0   0.180   0.230   0.410   122.0  213.x.x.x       FR  🇫🇷 Франция GRPC
-  12  GOOD            40/40    0.0   0.161   0.209   0.431     7.8  77.x.x.x        DE  🇩🇪 Германия #2 GRPC
-  22  DEAD              0/4  100.0       -       -       -       -  -               AT  🇦🇹 Австрия
+Done in 2m41s: 41 good, 4 unstable, 10 bad, 4 can't run in podkop (xhttp)
+
+  #   ping ms  Mbit/s  lost  cc  server
+* 50      239   137.4    0%  LT  🇱🇹 Литва GRPC
+* 41      230   122.0    0%  FR  🇫🇷 Франция GRPC
+* 35      235   116.0    0%  NL  🇳🇱 Нидерланды #2 GRPC
+  ...
+  +30 more (-v shows all servers and why the others failed)
 ```
 
-**5. Choose.**
-- Press Enter to take the proposed 10, or type the `#` numbers you prefer
-  (e.g. `50 41 35`).
-- Press Enter again (or `y`) to put them into podkop.
-- The script sets podkop to **URLTest** with those servers and restarts it.
-  Your old podkop settings are backed up first (see Guide 3).
+**5. One question: put them into podkop?**
+- **Enter:** podkop is set to URLTest with the marked servers and
+  restarted. Your old podkop settings are backed up first (see Guide 3).
+- **n:** nothing is changed.
+- **Numbers** (e.g. `50 41 35`): use those servers instead.
 
-**6. Keep the line it prints at the end.** You need it for Guide 2.
+**6. "Repeat this every night?"** Press Enter. The script installs itself
+as `podkop-probe` and saves your keys, then shows the one line for
+Guide 2.
 
 ---
 
 ## Guide 2: update every night at 04:30
 
-At the end of Guide 1 the script prints a line like this:
-
-```
-30 4 * * * wget -q -O /tmp/podkop-probe.sh https://github.com/.../probe.sh && sh /tmp/podkop-probe.sh --cron -s 'https://your-key-1' -s 'https://your-key-2' --countries 'europe' > /tmp/podkop-probe.log 2>&1
-```
-
 1. Open LuCI in the browser (`http://192.168.1.1`).
-2. Go to **System → Scheduled Tasks**.
-3. Paste the line on a new line and click **Save**.
-4. Go to **System → Startup**. Make sure **cron** is *Enabled*, and click
+2. Go to **System → Scheduled Tasks**, add this line and click **Save**:
+   ```
+   30 4 * * * podkop-probe --cron
+   ```
+3. Go to **System → Startup**. Make sure **cron** is *Enabled*, and click
    **Restart** next to it.
-5. Check **System → System → Timezone**. 04:30 is the router's local time.
+4. Check **System → System → Timezone**. 04:30 is the router's local time.
 
-That's it. Every night at 04:30 the router downloads the latest version,
-tests your keys again and puts the new top 10 into podkop. If the top 10 is
-the same as before, podkop is not restarted. If nothing works (e.g. the
-internet is down), podkop is left alone.
+Every night at 04:30 the router:
+- updates podkop-probe to the latest release;
+- tests your saved keys;
+- puts the new top 10 into podkop and restarts podkop.
 
-- **Want a different time?** The first two numbers are minutes and hours:
+If nothing works (e.g. the internet is down), podkop is left alone.
+
+- **Did last night's run work?** Run `cat /tmp/podkop-probe.log`, or look in
+  **Status → System Log** for `podkop-probe`.
+- **Run it now:** `podkop-probe --cron`
+- **Change the keys or countries:** run `podkop-probe` and choose `4`.
+- **Different time:** the first two numbers are minutes and hours, so
   `0 3 * * *` is 03:00.
-- **Want to get the line again, or for other keys?** Run the script
-  (Guide 1, step 2) and choose menu item `4`.
-- **Did last night's run work?** SSH in and run
-  `cat /tmp/podkop-probe.log`, or look in **Status → System Log** for
-  `podkop-probe`.
-- **Want to test it right now?** Copy the part of the line after
-  `30 4 * * * ` and run it over SSH.
-- **Want to stop it?** Delete the line in **System → Scheduled Tasks** and
-  click Save.
-
-> Used the nightly option of version 1.5 or older? Remove the old job once
-> with:
-> `sh <(wget -O - https://github.com/dkagramanyan/podkop-keys-availability-/releases/latest/download/probe.sh) --nightly-off`
+- **Stop it:** delete the line in Scheduled Tasks. To remove everything,
+  run `podkop-probe --uninstall`.
 
 ---
 
@@ -196,13 +190,17 @@ Podkop:
   --section NAME    podkop section to write to      (default main)
 
 Nightly run:
-  --cron-line HH:MM print the line for LuCI -> System -> Scheduled Tasks
-  --cron            unattended run (used by that line)
-  --nightly-off     remove the nightly job of versions <= 1.5
+  --install         install as /usr/bin/podkop-probe, save the -s keys and
+                    options in /etc/podkop-probe.conf
+  --cron            run with the saved settings, no questions: update podkop
+                    and restart it (log: /tmp/podkop-probe.log)
+  --cron-line HH:MM print the Scheduled Tasks line for another time
+  --update          update the installed copy to the latest release
+  --uninstall       remove the installed copy and the saved settings
 
 Output:
   -o FILE           also save results as CSV
-  -v                verbose: per-request timings, sing-box errors
+  -v                verbose: all servers, every measurement, why servers failed
   -y                answer "yes" to questions
   --no-color        plain output
 ```
@@ -223,23 +221,25 @@ uses now.
 sh <(wget -O - https://github.com/dkagramanyan/podkop-keys-availability-/releases/latest/download/probe.sh)
 ```
 
-- Выберите `2`.
-- Вставьте ваши ключи-подписки (по одному в строке), затем нажмите Enter
-  на пустой строке.
+- Нажмите Enter (пункт 1).
+- Вставьте ваши ключи-подписки, затем нажмите Enter на пустой строке.
 - Нажмите Enter, чтобы оставить «только Европа».
 
 Через 2–4 минуты появится таблица, а лучшие 10 серверов будут отмечены
-`*`. Нажмите Enter, чтобы их взять, или впишите свои номера. Затем Enter
-ещё раз: серверы запишутся в podkop как URLTest, и podkop перезапустится.
-Старые настройки сохраняются в `/etc/config/podkop.probe-backup.*`.
+`*`. Нажмите Enter, и podkop переключится на них (URLTest) и
+перезапустится. На вопрос «Repeat this every night?» тоже нажмите Enter:
+скрипт установится как `podkop-probe` и сохранит ключи.
 
-**2. Каждую ночь в 04:30.** В конце скрипт печатает строку вида
-`30 4 * * * wget ... --cron -s '...'`.
+**2. Каждую ночь в 04:30.** В LuCI откройте **Система → Планировщик**,
+добавьте строку и сохраните:
 
-- Вставьте её в LuCI: **Система → Планировщик**, затем «Сохранить».
-- В **Система → Загрузка** включите `cron` и перезапустите его.
-- Лог последнего запуска: `/tmp/podkop-probe.log`.
-- Чтобы отключить, удалите строку в планировщике.
+```
+30 4 * * * podkop-probe --cron
+```
+
+Затем в **Система → Загрузка** включите `cron` и перезапустите его. Лог
+последнего запуска: `/tmp/podkop-probe.log`. Чтобы поменять ключи,
+запустите `podkop-probe` и выберите пункт 4.
 
 **Откат:**
 
