@@ -12,7 +12,7 @@
 #
 # https://github.com/dkagramanyan/podkop-keys-availability-
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 REPO_URL="https://github.com/dkagramanyan/podkop-keys-availability-"
 SELF_URLS="$REPO_URL/releases/latest/download/probe.sh
 https://raw.githubusercontent.com/dkagramanyan/podkop-keys-availability-/main/probe.sh"
@@ -30,7 +30,10 @@ BASEPORT=39000
 FILE=""; SUBS=""; CONFIG=""; CSV=""
 VERBOSE=0; ASSUME_YES=0; COLOR=auto; SOURCE=""
 TOP=10; APPLY=ask; SECTION=main
-SPEED=1; SPEED_URL=""; SPEED_T=8
+SPEED=1; SPEED_URL=""; SPEED_T=8; SPEED_J=""; ENTRY_CHECK=1
+# direct download used to measure the router's own line (not Cloudflare,
+# which some providers block without a VPN)
+LINE_URL="https://fsn1-speed.hetzner.com/100MB.bin"
 # speed test files, tried in order; a file that ends early is fetched again
 # until SPEED_T is used up (Cloudflare refuses single requests of 100 MB)
 SPEED_URLS="https://speed.cloudflare.com/__down?bytes=25000000
@@ -72,7 +75,10 @@ Sources:
                     links); repeat -s for several
   -C FILE           sing-box config.json to take the outbounds from
   --countries LIST  test/choose only servers in these countries:
-                    europe, all (default), or codes like DE,NL,FI
+                    europe, all (default), or codes like DE,NL,FI; checked
+                    by name, by the server's IP and by the exit IP
+  --no-entry-check  don't look up the server's IP country (keeps relays
+                    whose entry point is elsewhere, e.g. "via RU")
 
 Test:
   -n N              requests per node               (default $N)
@@ -85,6 +91,8 @@ Test:
   -F                thorough run: -n 100, 15 s speed test
   -p PORT           first local SOCKS port          (default $BASEPORT)
   --no-speed        skip the download speed test
+  --speed-jobs N    speed tests at the same time (default: from the line
+                    speed, 1 per ~200 Mbit/s, max 3)
   --speed-url URL   file for the speed test (default: Cloudflare, then Hetzner)
 
 Podkop (for link sources: -s, -f, links):
@@ -153,7 +161,7 @@ is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -gt 0 ]; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    -f|-s|-C|--config|-n|-c|-j|-t|-u|-p|-o|--top|--section|--speed-url|--nightly|--countries)
+    -f|-s|-C|--config|-n|-c|-j|-t|-u|-p|-o|--top|--section|--speed-url|--nightly|--countries|--speed-jobs)
       [ $# -ge 2 ] || { echo "option $1 needs a value" >&2; usage 1; }
       case "$1" in
         -f) FILE="$2" ;; -s) SUBS="$SUBS$2
@@ -162,6 +170,7 @@ while [ $# -gt 0 ]; do
         -u) URL="$2" ;; -p) BASEPORT="$2" ;; -o) CSV="$2" ;;
         --top) TOP="$2" ;; --section) SECTION="$2" ;;
         --speed-url) SPEED_URL="$2" ;; --nightly) NIGHTLY="$2" ;;
+        --speed-jobs) SPEED_J="$2" ;;
         --countries) COUNTRIES="$2" ;;
       esac
       shift 2 ;;
@@ -172,6 +181,7 @@ while [ $# -gt 0 ]; do
     --apply) APPLY=yes; shift ;;
     --no-apply) APPLY=no; shift ;;
     --no-speed) SPEED=0; shift ;;
+    --no-entry-check) ENTRY_CHECK=0; shift ;;
     --nightly-off) NIGHTLY_OFF=1; shift ;;
     --cron) CRON=1; shift ;;
     --no-color) COLOR=0; shift ;;
@@ -195,6 +205,7 @@ for _v in N C T BASEPORT TOP; do
   eval "_x=\$$_v"; is_uint "$_x" || die "$_v must be a positive number, got '$_x'"
 done
 [ -z "$J" ] || is_uint "$J" || die "-j must be a positive number"
+[ -z "$SPEED_J" ] || is_uint "$SPEED_J" || die "--speed-jobs must be a positive number"
 [ "$C" -le "$N" ] || C=$N
 
 setup_color
@@ -670,6 +681,7 @@ from_sub() {
   awk -v t="$TAB" '{print "L" t $0}' "$_raw.real" >> "$NODES"
   info "$2 ($_host): $(wc -l < "$_raw.real" | tr -d ' ') server(s) (fetched as $_app)"
   _si=$(sub_info "$_raw.h" 2>/dev/null); [ -n "$_si" ] && info "    $_si"
+  return 0
 }
 
 from_subs() {
@@ -735,6 +747,54 @@ menu() {
 }
 
 count_nodes() { [ -s "$NODES" ] && wc -l < "$NODES" | tr -d ' ' || echo 0; }
+
+# --- server IP country ------------------------------------------------------
+
+# resolve <host> -> first IPv4 address (public resolvers first: the router's
+# own DNS may answer podkop's fake IPs)
+resolve() {
+  case "$1" in *[!0-9.]*) ;; *) echo "$1"; return ;; esac
+  for _ns in 77.88.8.8 8.8.8.8 ""; do
+    _a=$(nslookup "$1" $_ns 2>/dev/null | awk '/^Name:/ { n = 1; next } n && /^Address/ { sub(/^Address[^:]*: */, ""); sub(/ .*/, ""); if ($0 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) { print; exit } }')
+    case "$_a" in ""|198.18.*|198.19.*) ;; *) echo "$_a"; return ;; esac
+  done
+}
+
+# entry_countries: <dir>/ecc = country of each node's server IP ("-" when
+# unknown or behind a CDN such as Cloudflare, where the IP says nothing)
+entry_countries() {
+  mkdir -p "$WORK/geo"; : > "$WORK/geo/hosts"
+  _i=0
+  while [ "$_i" -lt "$COUNT" ]; do
+    _i=$((_i + 1)); _d="$WORK/n/$_i"; echo "-" > "$_d/ecc"
+    [ -f "$_d/ob.json" ] || continue
+    _h=$(sed -n 's/.*"server":"\([^"]*\)".*/\1/p' "$_d/ob.json" | head -n 1)
+    [ -n "$_h" ] && printf '%s\t%s\n' "$_i" "$_h" >> "$WORK/geo/hosts"
+  done
+  [ -s "$WORK/geo/hosts" ] || return 0
+  : > "$WORK/geo/ips"
+  cut -f 2 "$WORK/geo/hosts" | sort -u | while IFS= read -r _h; do
+    _ip=$(resolve "$_h"); [ -n "$_ip" ] && printf '%s\t%s\n' "$_h" "$_ip" >> "$WORK/geo/ips"
+  done
+  [ -s "$WORK/geo/ips" ] || return 0
+  cut -f 2 "$WORK/geo/ips" | sort -u | while IFS= read -r _ip; do
+    printf 'url = "https://ipinfo.io/%s/json"\noutput = "%s"\n' "$_ip" "$WORK/geo/$_ip"
+  done > "$WORK/geo/req.cfg"
+  if [ "$HAS_PARALLEL" = 1 ]; then
+    curl -s -Z --parallel-max 8 --max-time 8 -K "$WORK/geo/req.cfg" 2>/dev/null
+  else
+    curl -s --max-time 8 -K "$WORK/geo/req.cfg" 2>/dev/null
+  fi
+  while IFS="$TAB" read -r _n _h; do
+    _ip=$(awk -F "$TAB" -v h="$_h" '$1 == h { print $2; exit }' "$WORK/geo/ips")
+    [ -n "$_ip" ] || continue
+    [ -f "$WORK/geo/$_ip" ] || continue
+    _org=$(sed -n 's/.*"org": *"\([^"]*\)".*/\1/p' "$WORK/geo/$_ip" | head -n 1)
+    case "$_org" in *[Cc]loudflare*|*Fastly*|*Akamai*|*G-Core*|*Gcore*|*CDN77*|*CloudFront*) continue ;; esac
+    _c=$(sed -n 's/.*"country": *"\([A-Z][A-Z]\)".*/\1/p' "$WORK/geo/$_ip" | head -n 1)
+    [ -n "$_c" ] && echo "$_c" > "$WORK/n/$_n/ecc"
+  done < "$WORK/geo/hosts"
+}
 
 # --- per-node worker ---------------------------------------------------------
 
@@ -1013,6 +1073,7 @@ nightly_install() {
     echo "SECTION=$(shq "$SECTION")"
     echo "URL=$(shq "$URL")"
     echo "SPEED=$SPEED"
+    [ -n "$SPEED_J" ] && echo "SPEED_J=$SPEED_J"
     echo "COUNTRIES=$(shq "$COUNTRIES")"
     [ -n "$SPEED_URL" ] && echo "SPEED_URL=$(shq "$SPEED_URL")"
     echo "NIGHTLY=$(shq "$NIGHTLY")"
@@ -1171,8 +1232,32 @@ while IFS= read -r _line; do
   fi
 done < "$NODES"
 COUNT=$_i
+
+HAS_PARALLEL=0
+curl --help all 2>/dev/null | grep -q -- '--parallel-immediate' && HAS_PARALLEL=1
+
+# drop nodes whose server IP is outside the wanted countries, e.g. relays
+# "via RU" whose entry point is in Russia
+OUT_ENTRY=0
+case "$COUNTRIES" in all|"") ;; *)
+  if [ "$ENTRY_CHECK" = 1 ] && [ "$COUNT" -gt 0 ]; then
+    info "checking where the $COUNT server(s) are ..."
+    entry_countries
+    _i=0; _j=0
+    while [ "$_i" -lt "$COUNT" ]; do
+      _i=$((_i + 1))
+      if cc_allowed "$(cat "$WORK/n/$_i/ecc" 2>/dev/null || echo -)"; then
+        _j=$((_j + 1)); [ "$_j" -ne "$_i" ] && mv "$WORK/n/$_i" "$WORK/n/$_j"
+      else
+        rm -rf "$WORK/n/$_i"; OUT_ENTRY=$((OUT_ENTRY + 1))
+      fi
+    done
+    COUNT=$_j
+  fi ;;
+esac
+
 if [ "$COUNT" -eq 0 ]; then
-  warn "all $OUT_REGION node(s) are outside $(countries_label)"
+  warn "all node(s) are outside $(countries_label)"
   exit 1
 fi
 
@@ -1190,8 +1275,6 @@ fi
 
 # request list, shared by all nodes; "Connection: close" makes every request
 # open a fresh tunnel through the node, which is what we want to measure
-HAS_PARALLEL=0
-curl --help all 2>/dev/null | grep -q -- '--parallel-immediate' && HAS_PARALLEL=1
 # req_cfg <count>: curl config with <count> requests
 req_cfg() {
   [ "$1" -gt 0 ] || return 0
@@ -1212,10 +1295,13 @@ DIRECT_IP=${1:-none}; DIRECT_CC=${2:--}
 
 echo
 info "source:    ${SOURCE:-?}"
-info "nodes:     $COUNT, $J at a time$( [ "$OUT_REGION" -gt 0 ] && echo " ($OUT_REGION outside $(countries_label) skipped by name)")"
+_sk=""
+[ "$OUT_REGION" -gt 0 ] && _sk="$OUT_REGION by name"
+[ "$OUT_ENTRY" -gt 0 ] && _sk="${_sk:+$_sk, }$OUT_ENTRY by server IP"
+info "nodes:     $COUNT, $J at a time${_sk:+ (skipped outside $(countries_label): $_sk)}"
 info "countries: $(countries_label)"
 info "test:      $N requests per node, $C in flight, timeout ${T}s -> $URL"
-[ "$SPEED" = 1 ] && info "speed:     up to ${SPEED_T}s download per node, one at a time (nodes losing >20% are skipped)"
+[ "$SPEED" = 1 ] && info "speed:     up to ${SPEED_T}s download per node (nodes losing >20% are skipped)"
 info "router IP: $DIRECT_IP ($DIRECT_CC)   sing-box $SB_VER"
 echo
 
@@ -1248,23 +1334,48 @@ if [ "$SPEED" = 1 ]; then
     printf '%s\t%s\t%s\n' "$_md" "$_i" "$(same_key "$_i")" >> "$WORK/speedlist"
   done
   sort -t "$TAB" -k1,1g "$WORK/speedlist" -o "$WORK/speedlist"
-  _ns=$(cut -f 3 "$WORK/speedlist" | sort -u | wc -l | tr -d ' ')
+  # one test per server/port/transport; duplicates get its result afterwards
+  awk -F "$TAB" '!seen[$3]++ { print $2 }' "$WORK/speedlist" > "$WORK/speed.uniq"
+  _ns=$(wc -l < "$WORK/speed.uniq" | tr -d ' ')
   if [ "$_ns" -gt 0 ]; then
     echo
-    info "speed test: $_ns server(s), one at a time, until the result is stable (max ${SPEED_T}s)"
-    : > "$WORK/speedkeys"; _k=0
-    while IFS="$TAB" read -r _md _n _key; do
-      _src=$(awk -F "$TAB" -v k="$_key" '$1 == k { print $2; exit }' "$WORK/speedkeys")
-      if [ -n "$_src" ]; then                 # same server tested already
-        cp "$WORK/n/$_src/speed" "$WORK/n/$_n/speed"
-        [ -f "$WORK/n/$_src/speed.why" ] && cp "$WORK/n/$_src/speed.why" "$WORK/n/$_n/speed.why"
-        continue
+    if [ -z "$SPEED_J" ]; then
+      # how many tests fit on the line at once: measure it directly, then
+      # allow one test per ~200 Mbit/s (a node rarely gives more than ~150)
+      SPEED_J=1
+      if [ "$_ns" -gt 1 ]; then
+        _line=$(curl -s -o /dev/null --max-time 5 -w '%{size_download} %{time_total}' "$LINE_URL" 2>/dev/null |
+          awk '$2 > 0 && $1 > 1000000 { printf "%.0f", $1 * 8 / $2 / 1000000 }')
+        if [ -n "$_line" ]; then
+          SPEED_J=$(( _line / 200 )); [ "$SPEED_J" -lt 1 ] && SPEED_J=1; [ "$SPEED_J" -gt 3 ] && SPEED_J=3
+          info "your line (direct): ~$_line Mbit/s"
+        fi
       fi
-      _k=$((_k + 1))
-      speed_node "$_n"
-      printf '%s\t%s\n' "$_key" "$_n" >> "$WORK/speedkeys"
-      printf '  [%*d/%d] %7s Mbit/s  %s\n' "${#_ns}" "$_k" "$_ns" "$(cat "$WORK/n/$_n/speed")" "$(cat "$WORK/n/$_n/name")"
-    done < "$WORK/speedlist"
+    fi
+    [ "$SPEED_J" -gt "$_ns" ] && SPEED_J=$_ns
+    info "speed test: $_ns server(s), $SPEED_J at a time, until the result is stable (max ${SPEED_T}s)"
+    mkfifo "$WORK/ssem" && exec 5<>"$WORK/ssem"
+    _k=0; while [ "$_k" -lt "$SPEED_J" ]; do echo >&5; _k=$((_k + 1)); done
+    : > "$WORK/speed.done"
+    while IFS= read -r _n; do
+      read -r _ <&5
+      (
+        speed_node "$_n"
+        echo "$_n" >> "$WORK/speed.done"
+        printf '  [%*d/%d] %7s Mbit/s  %s\n' "${#_ns}" "$(wc -l < "$WORK/speed.done")" "$_ns" \
+          "$(cat "$WORK/n/$_n/speed")" "$(cat "$WORK/n/$_n/name")"
+        echo >&5
+      ) &
+    done < "$WORK/speed.uniq"
+    wait
+    exec 5>&-
+    # copy results to the duplicates
+    awk -F "$TAB" -v OFS="$TAB" '!($3 in f) { f[$3] = $2 } { print $2, f[$3] }' "$WORK/speedlist" > "$WORK/speed.map"
+    while IFS="$TAB" read -r _n _src; do
+      [ "$_n" = "$_src" ] && continue
+      [ -f "$WORK/n/$_src/speed" ] && cp "$WORK/n/$_src/speed" "$WORK/n/$_n/speed"
+      [ -f "$WORK/n/$_src/speed.why" ] && cp "$WORK/n/$_src/speed.why" "$WORK/n/$_n/speed.why"
+    done < "$WORK/speed.map"
   fi
 fi
 
@@ -1317,7 +1428,8 @@ END {
 pick() { # <n>: add node n to the pick list
   cat "$WORK/n/$1/link" >> "$WORK/best"
   IFS="$TAB" read -r _s _ok _tot _mn _md _p9 _xi _xc _sp _nm < "$WORK/n/$1/result"
-  printf '#%-3s median %6ss %7s Mbit/s  %s\n' "$1" "$_md" "$_sp" "$_nm" >> "$WORK/best.names"
+  _sp=$(cat "$WORK/n/$1/speed" 2>/dev/null); [ -n "$_sp" ] || _sp=-   # measured after the result line
+  printf '#%-3s median %6ss %7s Mbit/s  %-3s %s\n' "$1" "$_md" "$_sp" "$_xc" "$_nm" >> "$WORK/best.names"
   echo "$_xi" >> "$WORK/best.ips"
 }
 while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
