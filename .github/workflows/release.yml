@@ -17,8 +17,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref }}
 
       - name: Lint
         run: shellcheck -s dash probe.sh
@@ -36,5 +34,5 @@ jobs:
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" probe.sh --clobber
           else
-            gh release create "$tag" probe.sh --title "podkop-probe $tag" --generate-notes
+            gh release create "$tag" probe.sh --target "$GITHUB_SHA" --title "podkop-probe $tag" --generate-notes
           fi
