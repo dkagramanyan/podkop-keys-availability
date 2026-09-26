@@ -532,7 +532,7 @@ build_link() {
       [ -n "$_sni" ] || _sni=${_hh:-$L_host}
       [ -n "$_hh" ] || _hh=$_sni
       _tr=$(transport_json "${q_type:-tcp}" "$_hh" "${q_path:-}" "${q_serviceName:-}") ||
-        { skip "transport '${q_type:-}' is not supported by sing-box"; return; }
+        { skip "transport '${q_type:-}' is not supported by podkop (sing-box)"; return; }
       _tls=""
       case "$_sec" in tls|reality|xtls)
         _tls=$(tls_json "$_sec" "$_sni" "${q_fp:-}" "${q_alpn:-}" "$_ins" "${q_pbk:-}" "${q_sid:-}") ;;
@@ -549,7 +549,7 @@ build_link() {
     vmess)
       _sni=${v_sni:-${v_host:-$L_host}}; _hh=${v_host:-$_sni}
       _tr=$(transport_json "${v_net:-tcp}" "$_hh" "${v_path:-}" "${v_path:-}") ||
-        { skip "transport '${v_net:-}' is not supported by sing-box"; return; }
+        { skip "transport '${v_net:-}' is not supported by podkop (sing-box)"; return; }
       _tls=""
       [ "${v_tls:-}" = tls ] && _tls=$(tls_json tls "$_sni" "${v_fp:-}" "${v_alpn:-}" 0 "" "")
       printf '{"type":"vmess","tag":"node",%s,"uuid":%s,"security":%s,"alter_id":%s,%s%s"packet_encoding":"xudp"}\n' \
