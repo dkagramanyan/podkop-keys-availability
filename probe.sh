@@ -12,7 +12,7 @@
 #
 # https://github.com/dkagramanyan/podkop-keys-availability-
 
-VERSION="1.6.0"
+VERSION="1.7.0"
 REPO_URL="https://github.com/dkagramanyan/podkop-keys-availability-"
 RELEASE_URL="$REPO_URL/releases/latest/download/probe.sh"
 BIN=/usr/bin/podkop-probe            # installed copy, used by the nightly run
@@ -103,8 +103,8 @@ Podkop (for link sources: -s, -f, links):
   --section NAME    podkop section to write to                (default $SECTION)
 
 Nightly run:
-  --install         install as $BIN and save the -s keys
-                    and options in $CONF
+  --install         install as $BIN (asks for the keys,
+                    or saves the -s keys and options in $CONF)
   --cron            run with the saved settings, no questions: update podkop
                     and restart it (log: $LOG). In LuCI ->
                     System -> Scheduled Tasks:  30 4 * * * podkop-probe --cron
@@ -748,7 +748,7 @@ menu() {
   echo "  1) Test my keys and put the best $TOP servers into podkop"
   echo "  2) Test the servers podkop uses now"
   echo "  3) Test pasted links"
-  echo "  4) Nightly run: $(nightly_status)"
+  echo "  4) Install / change keys for the nightly run ($(nightly_status))"
   echo "  q) Quit"
   printf '> '
   read -r _m < "$TTY" || exit 1
@@ -1054,11 +1054,9 @@ print_progress() {
 shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
 nightly_status() {
-  if [ -f "$CONF" ] && [ -x "$BIN" ]; then
-    ( . "$CONF"; printf 'set up, %s key(s), %s' "$(printf '%s' "$SUBS" | grep -c .)" "$(countries_label)" )
-  else
-    echo "not set up"
-  fi
+  if [ ! -x "$BIN" ]; then echo "not installed"
+  elif [ -f "$CONF" ]; then ( . "$CONF"; printf 'installed, %s key(s), %s' "$(printf '%s' "$SUBS" | grep -c .)" "$(countries_label)" )
+  else echo "installed, no keys"; fi
 }
 
 ask_time() {
@@ -1107,21 +1105,32 @@ save_conf() {
 }
 
 # install + save + show the cron line
+# install the script (+ keys, if any) and show what to put into cron
 nightly_install() {
-  [ -n "$SUBS" ] || die "no keys to save (-s URL)"
   install_self || die "could not install $BIN"
-  save_conf || die "could not write $CONF"
-  info "installed $BIN, keys saved in $CONF"
-  cron_line
-  grep -qs 'podkop-probe --cron' "$CRONTAB" && echo "(a podkop-probe line is already in Scheduled Tasks; keep just one)"
+  if [ -n "$SUBS" ]; then
+    save_conf || die "could not write $CONF"
+    info "installed $BIN, $(printf '%s' "$SUBS" | grep -c .) key(s) saved ($(countries_label))"
+  elif [ -n "$SAVED_SUBS" ]; then
+    info "installed $BIN, your saved keys are kept"
+  else
+    info "installed $BIN (no keys yet: run 'podkop-probe' and choose 4 to add them)"
+    return 0
+  fi
+  if grep -qs 'podkop-probe --cron' "$CRONTAB"; then
+    info "the nightly line is already in Scheduled Tasks: $(grep 'podkop-probe --cron' "$CRONTAB" | head -n 1)"
+  else
+    cron_line
+  fi
   return 0
 }
 
+# ask for keys, countries and time, then install
 nightly_setup() {
-  ask_subs || die "no key given"
+  ask_subs || { nightly_install; return; }
   [ -z "$COUNTRIES" ] && COUNTRIES=$SAVED_C
   ask_countries
-  ask_time
+  grep -qs 'podkop-probe --cron' "$CRONTAB" || ask_time
   nightly_install
 }
 
@@ -1152,7 +1161,10 @@ if [ -f "$CONF" ]; then
 fi
 if [ "$UNINSTALL" = 1 ]; then uninstall; exit 0; fi
 if [ "$UPDATE" = 1 ]; then self_update || info "already the latest version ($VERSION)"; exit 0; fi
-if [ "$INSTALL" = 1 ]; then nightly_install; exit 0; fi
+if [ "$INSTALL" = 1 ]; then
+  if [ -z "$SUBS" ] && [ -n "$TTY" ]; then nightly_setup; else nightly_install; fi
+  exit 0
+fi
 if [ -n "$CRON_TIME" ]; then cron_line; exit 0; fi
 if [ "$CRON" = 1 ] && [ "$NO_UPDATE" = 0 ] && [ "$0" -ef "$BIN" ] && self_update; then
   exec sh "$BIN" --cron --no-update
