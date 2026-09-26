@@ -89,16 +89,26 @@ podkop-probe -s 'https://link.example.com/s/AAAA' -s 'https://other.example/sub/
    country (from the exit IP) is checked too.
 3. **Merge.** Nodes from all subscriptions are merged. The same server listed
    in several subscriptions is tested only once.
-4. **One full check per node, one node at a time**, so no two tests share
-   your line and skew each other:
-   - **Latency:** 40 requests (4 at a time), each over a new connection
-     through the node. The script records the failures and the min /
-     median / p90 time.
+4. **Check every node:**
+   - **Latency, 4 nodes at a time:** 40 requests (4 at a time) per node,
+     each over a new connection through the node. The script records the
+     failures and the min / median / p90 time. These are tiny requests, so
+     nodes tested side by side don't disturb each other.
      - If the first round all fail, the node is DEAD at once.
      - A node that has lost more than 30% by half-way stops early: it's
        BAD either way.
-   - **Speed:** nodes that lost at most 20% then download from Cloudflare
-     for 8 seconds through the same connection. The result is in Mbit/s.
+   - **Speed, one node at a time, with nothing else running:** every node
+     that lost at most 20% downloads through itself. The file is
+     Cloudflare's speed-test file (25 MB, repeated as needed), or Hetzner's
+     if Cloudflare refuses. Your provider blocking Cloudflare doesn't
+     matter here: this download always goes through the VLESS node, never
+     directly.
+     - The running average is checked every second. The test stops once
+       it has settled (changed <3% twice in a row, after at least 3 s) or
+       after 8 s, which is usually 4–5 s.
+     - Links to the same server, port and transport (e.g. "Германия #1"
+       and "Германия #1 (для iOS)") share one speed test.
+     - If the download fails, the HTTP code is shown under *Problems*.
 5. **Ranking.** Nodes that lost ≤5% come first, then ≤20%. Inside each
    group:
    *score = median latency ÷ best median + best speed ÷ this speed*.
@@ -114,8 +124,8 @@ podkop-probe -s 'https://link.example.com/s/AAAA' -s 'https://other.example/sub/
    to `/etc/config/podkop.probe-backup.<date>`; the 3 newest backups are
    kept.
 
-A full check takes about 10–15 s per node, so 40 nodes take roughly
-8 minutes. `-q` does a quick run (12 requests, 4 s speed test).
+40 nodes take about 3–4 minutes. `-q` does a quick run (12 requests,
+at most 4 s of speed test).
 
 The best links are also saved to `/tmp/podkop-probe-best.txt`.
 
@@ -210,15 +220,15 @@ Sources:
 Test:
   -n N              requests per node               (default 40)
   -c N              requests in flight per node     (default 4)
-  -j N              nodes tested at the same time   (default 1: one at a time,
-                    so tests don't share the line; speed tests always are)
+  -j N              nodes latency-tested at the same time (default 4, less
+                    with little free RAM); speed tests always run one at a time
   -t SEC            timeout per request, seconds    (default 8)
   -u URL            target URL                      (default https://www.gstatic.com/generate_204)
   -q                quick run:    -n 12, 4 s speed test
   -F                thorough run: -n 100, 15 s speed test
   -p PORT           first local SOCKS port          (default 39000)
   --no-speed        skip the download speed test
-  --speed-url URL   file for the speed test (default: Cloudflare, 8 s download)
+  --speed-url URL   file for the speed test (default: Cloudflare, then Hetzner)
 
 Podkop (for link sources: -s, -f, links):
   --top N           how many best nodes to offer for podkop   (default 10)

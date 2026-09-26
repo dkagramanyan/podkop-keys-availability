@@ -12,7 +12,7 @@
 #
 # https://github.com/dkagramanyan/podkop-keys-availability-
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 REPO_URL="https://github.com/dkagramanyan/podkop-keys-availability-"
 SELF_URLS="$REPO_URL/releases/latest/download/probe.sh
 https://raw.githubusercontent.com/dkagramanyan/podkop-keys-availability-/main/probe.sh"
@@ -30,7 +30,11 @@ BASEPORT=39000
 FILE=""; SUBS=""; CONFIG=""; CSV=""
 VERBOSE=0; ASSUME_YES=0; COLOR=auto; SOURCE=""
 TOP=10; APPLY=ask; SECTION=main
-SPEED=1; SPEED_URL="https://speed.cloudflare.com/__down?bytes=100000000"; SPEED_T=8
+SPEED=1; SPEED_URL=""; SPEED_T=8
+# speed test files, tried in order; a file that ends early is fetched again
+# until SPEED_T is used up (Cloudflare refuses single requests of 100 MB)
+SPEED_URLS="https://speed.cloudflare.com/__down?bytes=25000000
+https://fsn1-speed.hetzner.com/100MB.bin"
 NIGHTLY=""; NIGHTLY_OFF=0; CRON=0
 COUNTRIES=all
 # Subscription panels (Remnawave, Marzban, 3x-ui...) only hand the real server
@@ -81,7 +85,7 @@ Test:
   -F                thorough run: -n 100, 15 s speed test
   -p PORT           first local SOCKS port          (default $BASEPORT)
   --no-speed        skip the download speed test
-  --speed-url URL   file for the speed test (default: Cloudflare, ${SPEED_T}s download)
+  --speed-url URL   file for the speed test (default: Cloudflare, then Hetzner)
 
 Podkop (for link sources: -s, -f, links):
   --top N           how many best nodes to offer for podkop   (default $TOP)
@@ -184,6 +188,7 @@ if [ "$CRON" = 1 ]; then
   [ -f "$CONF" ] || { echo "no $CONF, nothing to do" >&2; exit 1; }
   . "$CONF"
   ASSUME_YES=1; APPLY=yes; COLOR=0; TTY=""
+  case "$SPEED_URL" in *speed.cloudflare.com/__down*) SPEED_URL="" ;; esac   # old defaults
 fi
 
 for _v in N C T BASEPORT TOP; do
@@ -738,33 +743,92 @@ port_busy() { grep -q ":$(printf '%04X' "$1") 00000000:0000 0A" /proc/net/tcp 2>
 # sb_start <idx>: run sing-box for node idx on a free local port.
 # Sets _pid and _port; fails if sing-box did not come up.
 sb_start() {
-  _sd="$WORK/n/$1"; _port=$((BASEPORT + $1))
-  while port_busy "$_port"; do _port=$((_port + 500)); done
-  printf '{"log":{"level":"error"},%s"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":%s}],"outbounds":[%s,{"type":"direct","tag":"direct"}],"route":{"final":"node"%s}}\n' \
-    "$SB_DNS" "$_port" "$(cat "$_sd/ob.json")" "$SB_RES" > "$_sd/config.json"
-  sing-box run -c "$_sd/config.json" > "$_sd/sb.log" 2>&1 &
-  _pid=$!; echo "$_pid" > "$WORK/pids/$1"
-  _sk=0
+  _sd="$WORK/n/$1"; _port=$((BASEPORT + $1)); _try=0
   while :; do
-    kill -0 "$_pid" 2>/dev/null || return 1
-    port_busy "$_port" && return 0
-    _sk=$((_sk + 1)); [ "$_sk" -ge "$WAIT_TICKS" ] && return 1
-    sleep "$NAP"
+    while port_busy "$_port"; do _port=$((_port + 500)); done
+    printf '{"log":{"level":"error"},%s"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":%s}],"outbounds":[%s,{"type":"direct","tag":"direct"}],"route":{"final":"node"%s}}\n' \
+      "$SB_DNS" "$_port" "$(cat "$_sd/ob.json")" "$SB_RES" > "$_sd/config.json"
+    sing-box run -c "$_sd/config.json" > "$_sd/sb.log" 2>&1 &
+    _pid=$!; echo "$_pid" > "$WORK/pids/$1"
+    _sk=0
+    while :; do
+      if ! kill -0 "$_pid" 2>/dev/null; then
+        # port taken between our check and sing-box's bind (another run?)
+        _try=$((_try + 1))
+        grep -q 'address already in use' "$_sd/sb.log" && [ "$_try" -lt 4 ] && break
+        return 1
+      fi
+      port_busy "$_port" && return 0
+      _sk=$((_sk + 1)); [ "$_sk" -ge "$WAIT_TICKS" ] && return 1
+      sleep "$NAP"
+    done
+    _port=$((_port + 500))
   done
 }
 
 sb_stop() { kill "$_pid" 2>/dev/null; rm -f "$WORK/pids/$1"; }
 
-# speed_measure <dir>: download through the running node for SPEED_T seconds
-# -> <dir>/speed in Mbit/s. Only one download runs at a time (lock on fd 4),
-# so tests never share the router's bandwidth.
+# speed_fetch <url>: download <url> through the node (again, if it ends
+# early) and watch curl's progress every second. Stops when the running
+# average has settled (changed <3% twice in a row, after 3 s) or after
+# SPEED_T seconds -> Mbit/s on stdout; on failure the reason and exit 1.
+SPEED_AWK='
+function b(x, m) { m = 1; if (x ~ /k$/) m = 1024; else if (x ~ /M$/) m = 1048576; else if (x ~ /G$/) m = 1073741824
+  sub(/[kMG]$/, "", x); return x * m }
+# progress meter records: % Total % Received % Xferd AvgDload AvgUpload ...
+NF >= 12 && $1 ~ /^[0-9]+$/ { r = b($4); a = b($7) }
+END { printf "%.0f %.0f\n", r, a }'
+speed_fetch() {
+  _u=$1; _B=0; _T=0; _prev=0; _stab=0; _done=0
+  while [ "$_done" = 0 ]; do
+    _rem=$(awk -v a="$SPEED_T" -v t="$_T" 'BEGIN { r = a - t; if (r < 0.5) exit 1; printf "%.1f", r }') || break
+    curl -o /dev/null --noproxy '' -x "$_px" --max-time "$_rem" \
+      -w '%{http_code} %{size_download} %{time_total}\n' "$_u" > "$_sd/sp.out" 2> "$_sd/sp.prog" &
+    _cp=$!
+    while sleep 1; kill -0 "$_cp" 2>/dev/null; do
+      set -- $(tr '\r' '\n' < "$_sd/sp.prog" | awk "$SPEED_AWK")
+      # -> "stop B T avg stab prev" using this chunk's bytes so far and avg speed
+      set -- $(awk -v B="$_B" -v T="$_T" -v rb="${1:-0}" -v ra="${2:-0}" -v p="$_prev" -v st="$_stab" -v lim="$SPEED_T" 'BEGIN {
+        if (ra <= 0) { print 0, B, T, 0, 0, p; exit }
+        t = T + rb / ra; avg = (B + rb) / t
+        st = (t >= 3 && p > 0 && (avg > p ? avg - p : p - avg) < 0.03 * avg) ? st + 1 : 0
+        printf "%d %.0f %.3f %.0f %d %.0f\n", (st >= 2 || t >= lim - 0.3), B + rb, t, avg, st, avg }')
+      _stab=$5; _prev=$6
+      if [ "$1" = 1 ]; then
+        kill "$_cp" 2>/dev/null; wait "$_cp" 2>/dev/null
+        _B=$2; _T=$3; _done=1; break
+      fi
+    done
+    [ "$_done" = 1 ] && break
+    wait "$_cp" 2>/dev/null
+    set -- $(cat "$_sd/sp.out" 2>/dev/null)
+    if [ -z "${2:-}" ] || [ "${2:-0}" -lt 100000 ] 2>/dev/null; then
+      [ "$_B" = 0 ] && { _h=${_u#*://}; echo "HTTP ${1:-000} from ${_h%%/*}"; return 1; }
+      break
+    fi
+    # a whole chunk arrived: add it and check the running average again
+    set -- $(awk -v B="$_B" -v T="$_T" -v b="$2" -v t="${3:-0}" -v p="$_prev" -v st="$_stab" -v lim="$SPEED_T" 'BEGIN {
+      B += b; T += t; avg = (T > 0) ? B / T : 0
+      st = (T >= 3 && p > 0 && (avg > p ? avg - p : p - avg) < 0.03 * avg) ? st + 1 : 0
+      printf "%d %.0f %.3f %d %.0f\n", (st >= 2 || T >= lim - 0.3), B, T, st, avg }')
+    _B=$2; _T=$3; _stab=$4; _prev=$5
+    [ "$1" = 1 ] && break
+  done
+  awk -v b="$_B" -v t="$_T" 'BEGIN { if (t > 0) printf "%.1f\n", b * 8 / t / 1000000; else print "0.0" }'
+}
+
+# speed_measure <dir>: download speed through the running node -> <dir>/speed
+# in Mbit/s (reason for a failure in <dir>/speed.why)
 speed_measure() {
-  _sf="$1/speed"
-  read -r _ <&4
-  set -- $(curl -s -o /dev/null --noproxy '' -x "$_px" --max-time "$SPEED_T" \
-    -w '%{size_download} %{speed_download}' "$SPEED_URL" 2>/dev/null)
-  echo >&4
-  awk -v b="${1:-0}" -v s="${2:-0}" 'BEGIN { if (b < 100000) print "0.0"; else printf "%.1f\n", s * 8 / 1000000 }' > "$_sf"
+  _sd=$1; _why=""; _res=""
+  set -f
+  for _su in ${SPEED_URL:-$SPEED_URLS}; do
+    if _res=$(speed_fetch "$_su"); then _why=""; break; fi
+    _why="${_why:+$_why, }$_res"; _res=""
+  done
+  set +f
+  echo "${_res:-0.0}" > "$1/speed"
+  [ -n "$_why" ] && echo "$_why" > "$1/speed.why"
 }
 
 # fire <curl-config> <times-file>: the requests of one stage
@@ -774,6 +838,30 @@ fire() {
       --max-time "$T" --noproxy '' -x "$_px" -w '%{http_code} %{time_total}\n' >> "$2" 2>/dev/null
   else
     curl -s -K "$1" --max-time "$T" --noproxy '' -x "$_px" -w '%{http_code} %{time_total}\n' >> "$2" 2>/dev/null
+  fi
+}
+
+# speed_node <idx>: start the node again and measure its speed
+speed_node() {
+  _sn=$1
+  if sb_start "$_sn"; then
+    _px="socks5h://127.0.0.1:$_port"
+    speed_measure "$WORK/n/$_sn"
+  else
+    echo "0.0" > "$WORK/n/$_sn/speed"; echo "sing-box did not start" > "$WORK/n/$_sn/speed.why"
+  fi
+  sb_stop "$_sn"
+}
+
+# same_key <idx>: links to the same server/port/transport share a speed test
+# (e.g. "Германия #1" and "Германия #1 (для iOS)")
+same_key() {
+  if [ -f "$WORK/n/$1/link" ]; then
+    sed -e 's/#.*//' -e 's|^\([a-z0-9]*\)://[^@]*@\([^?/]*\).*|\1 \2|' "$WORK/n/$1/link" | tr -d '\n'
+    printf ' %s %s\n' "$(sed -n 's/.*[?&]type=\([^&#]*\).*/\1/p' "$WORK/n/$1/link")" \
+      "$(sed -n 's/.*[?&]security=\([^&#]*\).*/\1/p' "$WORK/n/$1/link")"
+  else
+    echo "node $1"
   fi
 }
 
@@ -802,10 +890,6 @@ run_node() {
       if [ -s "$WORK/req2.cfg" ] && awk '$1 == "000" { f++ } END { exit !(f * 10 <= NR * 3) }' "$_d/times"; then
         fire "$WORK/req2.cfg" "$_d/times"
       fi
-    fi
-    # speed test for nodes that lost at most 20% of the requests
-    if [ "$SPEED" = 1 ] && awk '$1 == "000" { f++ } END { exit !(NR > 0 && f * 5 <= NR) }' "$_d/times"; then
-      speed_measure "$_d"
     fi
     wait "$_epid" 2>/dev/null
     set -- $(cat "$_d/exit")
@@ -878,8 +962,8 @@ vcolor() {
 print_progress() {
   IFS="$TAB" read -r _s _ok _tot _mn _md _p9 _xi _xc _sp _nm < "$2"
   _v=$(verdict "$_s" "$_ok" "$_tot")
-  printf '  [%*d/%d] %s%-12s%s %5s  med %-6s %6s Mbit/s  %-15s %-3s %s\n' \
-    "${#COUNT}" "$1" "$COUNT" "$(vcolor "$_v")" "$_v" "$R0" "$_ok/$_tot" "$_md" "$_sp" "$_xi" "$_xc" "$_nm"
+  printf '  [%*d/%d] %s%-12s%s %5s  med %-6s  %-15s %-3s %s\n' \
+    "${#COUNT}" "$1" "$COUNT" "$(vcolor "$_v")" "$_v" "$R0" "$_ok/$_tot" "$_md" "$_xi" "$_xc" "$_nm"
 }
 
 
@@ -930,7 +1014,7 @@ nightly_install() {
     echo "URL=$(shq "$URL")"
     echo "SPEED=$SPEED"
     echo "COUNTRIES=$(shq "$COUNTRIES")"
-    echo "SPEED_URL=$(shq "$SPEED_URL")"
+    [ -n "$SPEED_URL" ] && echo "SPEED_URL=$(shq "$SPEED_URL")"
     echo "NIGHTLY=$(shq "$NIGHTLY")"
   } > "$CONF" || die "cannot write $CONF"
   chmod 600 "$CONF"
@@ -1092,14 +1176,15 @@ if [ "$COUNT" -eq 0 ]; then
   exit 1
 fi
 
-# one node at a time by default: parallel tests would share the router's
-# line and memory and skew each other; -j N allows more (~40 MB each)
+# latency tests of up to 4 nodes run side by side: they are small requests
+# that don't disturb each other (~40 MB of RAM per node). Speed tests always
+# run one at a time afterwards, with nothing else going on.
+_mem=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null)
+_max=$(( ${_mem:-160} / 40 )); [ "$_max" -lt 1 ] && _max=1
 if [ -z "$J" ]; then
-  J=1
-else
-  _mem=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null)
-  _max=$(( ${_mem:-160} / 40 )); [ "$_max" -lt 1 ] && _max=1
-  [ "$J" -gt "$_max" ] && { warn "-j $J needs more free RAM, using $_max"; J=$_max; }
+  J=4; [ "$J" -gt "$_max" ] && J=$_max
+elif [ "$J" -gt "$_max" ]; then
+  warn "-j $J needs more free RAM, using $_max"; J=$_max
 fi
 [ "$J" -gt "$COUNT" ] && J=$COUNT
 
@@ -1130,14 +1215,13 @@ info "source:    ${SOURCE:-?}"
 info "nodes:     $COUNT, $J at a time$( [ "$OUT_REGION" -gt 0 ] && echo " ($OUT_REGION outside $(countries_label) skipped by name)")"
 info "countries: $(countries_label)"
 info "test:      $N requests per node, $C in flight, timeout ${T}s -> $URL"
-[ "$SPEED" = 1 ] && info "speed:     ${SPEED_T}s download per node (nodes losing >20% are not speed-tested)"
+[ "$SPEED" = 1 ] && info "speed:     up to ${SPEED_T}s download per node, one at a time (nodes losing >20% are skipped)"
 info "router IP: $DIRECT_IP ($DIRECT_CC)   sing-box $SB_VER"
 echo
 
 START=$(date +%s)
-mkfifo "$WORK/sem" "$WORK/slock" || die "mkfifo failed"
-exec 3<>"$WORK/sem" 4<>"$WORK/slock"
-echo >&4
+mkfifo "$WORK/sem" || die "mkfifo failed"
+exec 3<>"$WORK/sem"
 _k=0; while [ "$_k" -lt "$J" ]; do echo >&3; _k=$((_k + 1)); done
 
 _i=0
@@ -1147,7 +1231,42 @@ while [ "$_i" -lt "$COUNT" ]; do
   ( run_node "$_i"; echo >&3 ) &
 done
 wait
-exec 3>&- 4>&-
+exec 3>&-
+
+# --- speed test --------------------------------------------------------------
+
+# nodes that lost at most 20%, best latency first; one download at a time
+if [ "$SPEED" = 1 ]; then
+  : > "$WORK/speedlist"
+  _i=0
+  while [ "$_i" -lt "$COUNT" ]; do
+    _i=$((_i + 1))
+    IFS="$TAB" read -r _s _ok _tot _mn _md _rest < "$WORK/n/$_i/result" || continue
+    case "$_s" in ok|noexit) ;; *) continue ;; esac
+    [ "$_ok" -gt 0 ] || continue
+    [ $(( (_tot - _ok) * 5 )) -le "$_tot" ] || continue
+    printf '%s\t%s\t%s\n' "$_md" "$_i" "$(same_key "$_i")" >> "$WORK/speedlist"
+  done
+  sort -t "$TAB" -k1,1g "$WORK/speedlist" -o "$WORK/speedlist"
+  _ns=$(cut -f 3 "$WORK/speedlist" | sort -u | wc -l | tr -d ' ')
+  if [ "$_ns" -gt 0 ]; then
+    echo
+    info "speed test: $_ns server(s), one at a time, until the result is stable (max ${SPEED_T}s)"
+    : > "$WORK/speedkeys"; _k=0
+    while IFS="$TAB" read -r _md _n _key; do
+      _src=$(awk -F "$TAB" -v k="$_key" '$1 == k { print $2; exit }' "$WORK/speedkeys")
+      if [ -n "$_src" ]; then                 # same server tested already
+        cp "$WORK/n/$_src/speed" "$WORK/n/$_n/speed"
+        [ -f "$WORK/n/$_src/speed.why" ] && cp "$WORK/n/$_src/speed.why" "$WORK/n/$_n/speed.why"
+        continue
+      fi
+      _k=$((_k + 1))
+      speed_node "$_n"
+      printf '%s\t%s\n' "$_key" "$_n" >> "$WORK/speedkeys"
+      printf '  [%*d/%d] %7s Mbit/s  %s\n' "${#_ns}" "$_k" "$_ns" "$(cat "$WORK/n/$_n/speed")" "$(cat "$WORK/n/$_n/name")"
+    done < "$WORK/speedlist"
+  fi
+fi
 
 # --- ranking -----------------------------------------------------------------
 
@@ -1156,7 +1275,9 @@ _i=0
 : > "$WORK/all"
 while [ "$_i" -lt "$COUNT" ]; do
   _i=$((_i + 1))
-  [ -f "$WORK/n/$_i/result" ] && printf '%s\t%s\n' "$_i" "$(cat "$WORK/n/$_i/result")" >> "$WORK/all"
+  [ -f "$WORK/n/$_i/result" ] || continue
+  _sp=$(cat "$WORK/n/$_i/speed" 2>/dev/null)
+  awk -F "$TAB" -v OFS="$TAB" -v n="$_i" -v sp="${_sp:--}" '{ $9 = sp; print n, $0 }' "$WORK/n/$_i/result" >> "$WORK/all"
 done
 ELAPSED=$(( $(date +%s) - START ))
 
@@ -1249,7 +1370,7 @@ while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
   case "$_s" in ok|noexit)
     [ "$_ok" -eq 0 ] && _why="all $_tot requests failed: node unreachable, blocked, or wrong credentials" ;;
   esac
-  [ "$_sp" = "0.0" ] && _why="${_why:+$_why; }speed test download failed (Cloudflare blocked through this node?)"
+  [ "$_sp" = "0.0" ] && _why="${_why:+$_why; }speed test failed: $(cat "$WORK/n/$_n/speed.why" 2>/dev/null || echo "no data")"
   [ -n "$_why" ] || continue
   [ "$_hdr" = 0 ] && { echo; printf '%sProblems:%s\n' "$BD" "$R0"; _hdr=1; }
   printf '  #%-3s %s: %s\n' "$_n" "$_nm" "$_why"
@@ -1286,7 +1407,7 @@ fi
 echo
 printf '%sLegend:%s ok = successful requests; min/median/p90 = seconds per request\n' "$DM" "$R0"
 printf '%s        (new connection through the node + HTTPS to the target each time);%s\n' "$DM" "$R0"
-printf '%s        Mbit/s = download speed during %ss, one node at a time.%s\n' "$DM" "$SPEED_T" "$R0"
+printf '%s        Mbit/s = download speed through the node (up to %ss, one node at a time).%s\n' "$DM" "$SPEED_T" "$R0"
 printf '%s        GOOD 0%% fail, OK <=5%%, FLAKY <=20%%, BAD >20%%, DEAD = nothing got through.%s\n' "$DM" "$R0"
 printf '%s        Order: fewest failures, then latency and speed together; * = picked.%s\n' "$DM" "$R0"
 
