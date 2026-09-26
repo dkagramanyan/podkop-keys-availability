@@ -1,0 +1,40 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Lint
+        run: shellcheck -s dash probe.sh
+
+      - name: Check version matches tag
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          grep -q "^VERSION=\"${tag#v}\"" probe.sh || { echo "VERSION in probe.sh does not match $tag"; exit 1; }
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" probe.sh --clobber
+          else
+            gh release create "$tag" probe.sh --title "podkop-probe $tag" --generate-notes
+          fi
