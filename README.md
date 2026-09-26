@@ -70,7 +70,14 @@ podkop-probe -s 'https://link.example.com/s/AAAA' -s 'https://other.example/sub/
    the way Happ, Streisand, INCY, v2RayTun, v2rayNG, Hiddify and sing-box
    do, in that order, until real servers come back.
    - Answers can be a base64 or plain list of links, or xray / sing-box
-     JSON; all three are converted to links.
+     JSON; all three are converted to links. A plain list wins because it
+     carries the provider's own server names ("🇩🇪 Германия #1"); many
+     panels send Happ/Streisand/INCY an xray JSON with "Автоматический"
+     balancer groups instead.
+   - The profile name, traffic used and expiry date sent by the panel are
+     shown.
+   - Servers using the `xhttp` transport are skipped: sing-box, and so
+     podkop, can't run them. Their tcp/grpc twins are tested.
    - Fake entries ("App not supported", "30 days left", 0.0.0.0 servers…)
      are dropped.
    - A subscription that still fails is skipped with the reason; the others

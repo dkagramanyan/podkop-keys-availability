@@ -27,7 +27,7 @@ $fmt //= '';
 if ($t =~ /^\s*</) { my ($ti) = $t =~ m{<title>(.*?)</title>}is; $fmt .= 'HTML web page' . ($ti ? " (title: $ti)" : ''); out() }
 if ($t =~ m{happ://crypt}) { $fmt .= 'encrypted happ://crypt links'; out() }
 if ($t =~ /^\s*[\[{]/) {
-  my $j = eval { JSON::PP->new->decode($t) }; unless ($j) { $fmt .= 'broken JSON'; out() }
+  my $j = eval { decode_json($t) }; unless ($j) { $fmt .= 'broken JSON'; out() }
   my @c = ref $j eq 'ARRAY' ? @$j : ($j); $fmt .= 'JSON (' . scalar(@c) . ' config(s))';
   for my $c (@c) { next unless ref $c eq 'HASH';
     for my $o (@{ $c->{outbounds} // [] }) { next unless ref $o eq 'HASH';
@@ -44,7 +44,7 @@ $fmt .= 'list of ' . scalar(@l) . ' link(s)';
 for (@l) {
   my ($s, $rest) = m{^([a-z0-9]+)://(.*)$}; my $name = ($rest =~ /#(.*)$/) ? $1 : '';
   $name =~ s/%([0-9A-Fa-f]{2})/chr hex $1/ge;
-  if ($s eq 'vmess') { my $v = eval { JSON::PP->new->decode(decode_base64((split /#/, $rest)[0])) } // {};
+  if ($s eq 'vmess') { my $v = eval { decode_json(decode_base64((split /#/, $rest)[0])) } // {};
     push @rows, sprintf("%-10s %-11s %-8s %-7s port=%-5s %s", 'vmess', $v->{net} // '-', $v->{tls} || 'none', maskh($v->{add}), $v->{port} // '?', b($v->{ps} // '')); next }
   my ($hp) = $rest =~ m{@([^?#/]+)}; $hp //= (split /[?#\/]/, $rest)[0];
   my ($h, $port) = $hp =~ /^(.*):(\d+)$/ ? ($1, $2) : ($hp, '-');

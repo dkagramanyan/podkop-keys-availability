@@ -40,10 +40,10 @@ SUB_UAS="Happ/3.9.0
 Streisand/2.3.1
 INCY/1.2.0
 v2RayTun/5.12.0
-v2rayNG/1.10.2
 Hiddify/2.5.7
-sing-box/1.12.0"
-EUROPE="AD AL AT BA BE BG CH CY CZ DE DK EE ES FI FR GB GR HR HU IE IS IT LI LT LU LV MC MD ME MK MT NL NO PL PT RO RS SE SI SK SM UA VA XK"
+sing-box/1.12.0
+v2rayNG/1.10.2"
+EUROPE="EU AD AL AT BA BE BG CH CY CZ DE DK EE ES FI FR GB GR HR HU IE IS IT LI LT LU LV MC MD ME MK MT NL NO PL PT RO RS SE SI SK SM UA VA XK"
 ARGLINKS=""
 WORK="/tmp/podkop-probe.$$"
 TAB=$(printf '\t')
@@ -256,8 +256,10 @@ def sq(o): [kv("type"; o.transport.type // "tcp"),
   kv("alpn"; (o.tls.alpn // []) | join(",")),
   kv("path"; o.transport.path), kv("host"; o.transport.headers.Host // o.transport.host),
   kv("serviceName"; o.transport.service_name)];
-(if type == "array" then .[] else . end) | select(type == "object") | (.remarks // "") as $name
+(if type == "array" then .[] else . end) | select(type == "object") | (.remarks // "") as $rem
+| ([.outbounds[]? | select(type == "object" and ((.protocol // .type) | tostring | test("^(vless|trojan|shadowsocks|hysteria2)$")))] | length) as $np
 | .outbounds[]? | select(type == "object")
+| ($rem + (if $np > 1 and ((.tag // "proxy") | test("^proxy$") | not) then " [\(.tag)]" else "" end)) as $name
 | if .protocol == "vless" then .settings.vnext[0] as $v | $v.users[0] as $u
     | "vless://\($u.id)@\(hp($v.address; $v.port))?" + (xq(.streamSettings // {}) + [kv("flow"; $u.flow), "encryption=none"] | join("&")) + "#" + ($name | enc)
   elif .protocol == "trojan" then .settings.servers[0] as $v
@@ -315,7 +317,25 @@ sub_fetch() {
     [ -n "$HWID" ] || HWID=0000000000000000
   fi
   curl -sL --max-time 20 -A "$2" -H "Accept: */*" -H "x-hwid: $HWID" -H "x-device-os: Linux" \
-    -H "x-ver-os: OpenWrt" -H "x-device-model: ${ROUTER_MODEL:-OpenWrt}" "$1" > "$3" 2>/dev/null
+    -H "x-ver-os: OpenWrt" -H "x-device-model: ${ROUTER_MODEL:-OpenWrt}" -D "$3.h" "$1" > "$3" 2>/dev/null
+}
+
+# sub_info <headers>: "title, used X of Y GB, expires DATE" from the panel's headers
+sub_info() {
+  _t=$(sed -n 's/^[Pp]rofile-[Tt]itle: *//p' "$1" | tr -d '\r' | tail -n 1)
+  case "$_t" in base64:*) _t=$(printf '%s' "${_t#base64:}" | b64d) ;; esac
+  _ui=$(sed -n 's/^[Ss]ubscription-[Uu]serinfo: *//p' "$1" | tr -d '\r' | tail -n 1)
+  _uiv() { printf '%s' "$_ui" | tr ';' '\n' | sed -n "s/^ *$1=\([0-9]*\).*/\1/p"; }
+  _up=$(_uiv upload); _dn=$(_uiv download); _tot=$(_uiv total); _exp=$(_uiv expire)
+  _out=${_t:+$_t}
+  if [ -n "$_dn$_up" ]; then
+    _out="${_out:+$_out, }$(awk -v u="${_up:-0}" -v d="${_dn:-0}" -v t="${_tot:-0}" 'BEGIN {
+      printf "used %.1f GB", (u + d) / 1073741824; if (t > 0) printf " of %.0f GB", t / 1073741824 }')"
+  fi
+  if [ -n "$_exp" ] && [ "$_exp" -gt 0 ] 2>/dev/null; then
+    _out="${_out:+$_out, }expires $(date -d "@$_exp" +%Y-%m-%d 2>/dev/null || echo "$_exp")"
+  fi
+  printf '%s' "$_out"
 }
 
 # sub_parse <raw> -> links on stdout (base64 / plain list / xray or sing-box JSON)
@@ -607,8 +627,8 @@ ask_links() {
 # real servers, the same thing Happ/Streisand/INCY do when a key is imported
 from_sub() {
   _host=${1#*://}; _host=${_host%%/*}
-  _raw="$WORK/sub.$_k"; _why=""; _app=""
-  : > "$_raw.real"
+  _raw="$WORK/sub.$_k"; _why=""; _app=""; _japp=""
+  : > "$_raw.real"; rm -f "$_raw.json" "/tmp/podkop-probe-sub$_k.txt"
   _uas=$(printf '%s\n' "$SUB_UAS" | tr ' ' '~')
   set -f
   for _ua in $_uas; do
@@ -620,13 +640,22 @@ from_sub() {
     if [ -z "$_why" ] || { [ -s "$_raw.try.links" ] && case "$_why" in "only placeholder"*) false ;; *) true ;; esac; }; then
       _why=$(sub_why "$_raw.try")
     fi
-    [ "$VERBOSE" = 1 ] && [ -z "$_app" ] && cp "$_raw.try" "/tmp/podkop-probe-sub$_k.txt"
-    if [ -s "$_raw.try.real" ]; then
-      _app=${_ua%%/*}; mv "$_raw.try.real" "$_raw.real"
-      break
-    fi
+    [ "$VERBOSE" = 1 ] && [ ! -f "/tmp/podkop-probe-sub$_k.txt" ] && cp "$_raw.try" "/tmp/podkop-probe-sub$_k.txt"
+    [ -s "$_raw.try.real" ] || continue
+    # a plain list of links carries the provider's own server names; a JSON
+    # answer (xray config for Happ & co.) is only kept as a fallback
+    case "$(tr -d ' \r\n\t' < "$_raw.try" | cut -c 1)" in
+      "{"|"[")
+        [ -s "$_raw.json" ] || { mv "$_raw.try.real" "$_raw.json"; cp "$_raw.try.h" "$_raw.json.h" 2>/dev/null; _japp=${_ua%%/*}; }
+        continue ;;
+    esac
+    _app=${_ua%%/*}; mv "$_raw.try.real" "$_raw.real"; cp "$_raw.try.h" "$_raw.h" 2>/dev/null
+    break
   done
   set +f
+  if [ ! -s "$_raw.real" ] && [ -s "$_raw.json" ]; then
+    mv "$_raw.json" "$_raw.real"; mv "$_raw.json.h" "$_raw.h" 2>/dev/null; _app="$_japp, xray JSON"
+  fi
   if [ ! -s "$_raw.real" ]; then
     warn "$2 ($_host): $_why"
     [ "$VERBOSE" = 1 ] && info "first answer saved to /tmp/podkop-probe-sub$_k.txt"
@@ -634,6 +663,7 @@ from_sub() {
   fi
   awk -v t="$TAB" '{print "L" t $0}' "$_raw.real" >> "$NODES"
   info "$2 ($_host): $(wc -l < "$_raw.real" | tr -d ' ') server(s) (fetched as $_app)"
+  _si=$(sub_info "$_raw.h" 2>/dev/null); [ -n "$_si" ] && info "    $_si"
 }
 
 from_subs() {
@@ -1170,19 +1200,20 @@ END {
 
 echo
 printf '%s%-3s %-12s %8s %6s %7s %7s %7s %7s  %-15s %-3s %s%s\n' "$BD" "#" "verdict" "ok" "fail%" "min" "median" "p90" "Mbit/s" "exit IP" "cc" "node" "$R0"
-_good=0; _okn=0; _bad=0; BEST=""
+_good=0; _okn=0; _bad=0; _skp=0; BEST=""
 while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
   _v=$(verdict "$_s" "$_ok" "$_tot")
   _fp="-"; [ "$_tot" -gt 0 ] && _fp=$(awk -v o="$_ok" -v t="$_tot" 'BEGIN {printf "%.1f", (t - o) * 100 / t}')
   printf '%-3s %s%-12s%s %8s %6s %7s %7s %7s %7s  %-15s %-3s %s\n' \
     "$_n" "$(vcolor "$_v")" "$_v" "$R0" "$_ok/$_tot" "$_fp" "$_mn" "$_md" "$_p9" "$_sp" "$_xi" "$_xc" "$_nm"
-  case "$_v" in GOOD) _good=$((_good + 1)) ;; OK|FLAKY) _okn=$((_okn + 1)) ;; *) _bad=$((_bad + 1)) ;; esac
+  case "$_v" in GOOD) _good=$((_good + 1)) ;; OK|FLAKY) _okn=$((_okn + 1)) ;; SKIPPED) _skp=$((_skp + 1)) ;; *) _bad=$((_bad + 1)) ;; esac
   [ -z "$BEST" ] && case "$_v" in GOOD|OK|FLAKY) BEST="$_nm (#$_n, median ${_md}s, $_sp Mbit/s)" ;; esac
 done < "$WORK/sorted"
 
 echo
-printf 'Summary: %s%d good%s, %s%d usable%s, %s%d not working%s — %ds total\n' \
-  "$GR" "$_good" "$R0" "$YL" "$_okn" "$R0" "$RD" "$_bad" "$R0" "$ELAPSED"
+printf 'Summary: %s%d good%s, %s%d usable%s, %s%d not working%s%s — %ds total\n' \
+  "$GR" "$_good" "$R0" "$YL" "$_okn" "$R0" "$RD" "$_bad" "$R0" \
+  "$( [ "$_skp" -gt 0 ] && echo ", $_skp skipped (can't run in sing-box/podkop)")" "$ELAPSED"
 [ -n "$BEST" ] && printf 'Best node: %s%s%s\n' "$BD" "$BEST" "$R0"
 
 # explain problems in plain words
@@ -1190,7 +1221,7 @@ _hdr=0
 while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
   _why=""
   case "$_s" in
-    skip)   _why=$(cat "$WORK/n/$_n/skip") ;;
+    skip)   cat "$WORK/n/$_n/skip" >> "$WORK/skipped"; continue ;;
     start)  _why="sing-box did not start: $(grep -v '^[[:space:]]*$' "$WORK/n/$_n/sb.log" 2>/dev/null | tail -n 1 | cut -c 1-200)" ;;
     direct) _why="exit IP equals the router's own IP: traffic did not go through the node, results are void" ;;
     region) _why="exit country $_xc is outside $(countries_label), not chosen" ;;
@@ -1204,6 +1235,14 @@ while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
   [ "$_hdr" = 0 ] && { echo; printf '%sProblems:%s\n' "$BD" "$R0"; _hdr=1; }
   printf '  #%-3s %s: %s\n' "$_n" "$_nm" "$_why"
 done < "$WORK/sorted"
+
+# skipped links, one line per reason
+if [ -s "$WORK/skipped" ]; then
+  [ "$_hdr" = 0 ] && { echo; printf '%sProblems:%s\n' "$BD" "$R0"; }
+  sort "$WORK/skipped" | uniq -c | while read -r _c _why; do
+    printf '  %s link(s) skipped: %s\n' "$_c" "$_why"
+  done
+fi
 
 if [ "$VERBOSE" = 1 ]; then
   echo
