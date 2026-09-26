@@ -1,5 +1,5 @@
 #!/bin/sh
-# shellcheck shell=dash disable=SC1090,SC2012,SC2016,SC2046,SC2154,SC2317
+# shellcheck shell=dash disable=SC1090,SC2012,SC2016,SC2018,SC2019,SC2046,SC2154,SC2317
 #
 # podkop-probe — measure how reliable every proxy node is, right on the
 # OpenWrt router that runs podkop (https://github.com/itdoginfo/podkop).
@@ -12,7 +12,7 @@
 #
 # https://github.com/dkagramanyan/podkop-keys-availability-
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 REPO_URL="https://github.com/dkagramanyan/podkop-keys-availability-"
 SELF_URLS="$REPO_URL/releases/latest/download/probe.sh
 https://raw.githubusercontent.com/dkagramanyan/podkop-keys-availability-/main/probe.sh"
@@ -32,7 +32,18 @@ VERBOSE=0; ASSUME_YES=0; COLOR=auto; SOURCE=""
 TOP=10; APPLY=ask; SECTION=main
 SPEED=1; SPEED_URL="https://speed.cloudflare.com/__down?bytes=10000000"; SPEED_T=10
 NIGHTLY=""; NIGHTLY_OFF=0; CRON=0
-UA="v2rayNG/1.9.0"
+COUNTRIES=all
+# Subscription panels (Remnawave, Marzban, 3x-ui...) only hand the real server
+# list to client apps they know, so we introduce ourselves like those apps.
+UA="Happ/3.9.0"
+SUB_UAS="Happ/3.9.0
+Streisand/2.3.1
+INCY/1.2.0
+v2RayTun/5.12.0
+v2rayNG/1.10.2
+Hiddify/2.5.7
+sing-box/1.12.0"
+EUROPE="AD AL AT BA BE BG CH CY CZ DE DK EE ES FI FR GB GR HR HU IE IS IT LI LT LU LV MC MD ME MK MT NL NO PL PT RO RS SE SI SK SM UA VA XK"
 ARGLINKS=""
 WORK="/tmp/podkop-probe.$$"
 TAB=$(printf '\t')
@@ -56,6 +67,8 @@ Sources:
   -s URL            subscription URL / "main key" (plain or base64 list of
                     links); repeat -s for several
   -C FILE           sing-box config.json to take the outbounds from
+  --countries LIST  test/choose only servers in these countries:
+                    europe, all (default), or codes like DE,NL,FI
 
 Test:
   -n N              requests per node               (default $N)
@@ -135,7 +148,7 @@ is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -gt 0 ]; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    -f|-s|-C|--config|-n|-c|-j|-t|-u|-p|-o|--top|--section|--speed-url|--nightly)
+    -f|-s|-C|--config|-n|-c|-j|-t|-u|-p|-o|--top|--section|--speed-url|--nightly|--countries)
       [ $# -ge 2 ] || { echo "option $1 needs a value" >&2; usage 1; }
       case "$1" in
         -f) FILE="$2" ;; -s) SUBS="$SUBS$2
@@ -144,6 +157,7 @@ while [ $# -gt 0 ]; do
         -u) URL="$2" ;; -p) BASEPORT="$2" ;; -o) CSV="$2" ;;
         --top) TOP="$2" ;; --section) SECTION="$2" ;;
         --speed-url) SPEED_URL="$2" ;; --nightly) NIGHTLY="$2" ;;
+        --countries) COUNTRIES="$2" ;;
       esac
       shift 2 ;;
     -q) N=10; shift ;;
@@ -218,6 +232,156 @@ fetch() {
   else
     wget -q -U "$UA" -O - "$1"
   fi
+}
+
+# --- subscriptions -----------------------------------------------------------
+
+# xray / sing-box JSON subscription -> share links (needs jq)
+JSON2LINKS='
+def enc: tostring | @uri;
+def kv(k; v): if (v // "" | tostring) == "" then empty else "\(k)=\(v | enc)" end;
+def hp(a; p): (if (a | tostring | test(":")) then "[\(a)]" else "\(a)" end) + ":\(p)";
+def xq(s): [kv("type"; s.network // "tcp"), kv("security"; s.security // "none"),
+  kv("sni"; s.realitySettings.serverName // s.tlsSettings.serverName),
+  kv("fp"; s.realitySettings.fingerprint // s.tlsSettings.fingerprint),
+  kv("pbk"; s.realitySettings.publicKey), kv("sid"; s.realitySettings.shortId),
+  kv("alpn"; (s.tlsSettings.alpn // []) | join(",")),
+  kv("path"; s.wsSettings.path // s.httpupgradeSettings.path // s.xhttpSettings.path),
+  kv("host"; s.wsSettings.headers.Host // s.wsSettings.host // s.httpupgradeSettings.host // s.xhttpSettings.host),
+  kv("serviceName"; s.grpcSettings.serviceName)];
+def sq(o): [kv("type"; o.transport.type // "tcp"),
+  kv("security"; if o.tls.reality.enabled then "reality" elif o.tls.enabled then "tls" else "none" end),
+  kv("sni"; o.tls.server_name), kv("fp"; o.tls.utls.fingerprint),
+  kv("pbk"; o.tls.reality.public_key), kv("sid"; o.tls.reality.short_id),
+  kv("alpn"; (o.tls.alpn // []) | join(",")),
+  kv("path"; o.transport.path), kv("host"; o.transport.headers.Host // o.transport.host),
+  kv("serviceName"; o.transport.service_name)];
+(if type == "array" then .[] else . end) | select(type == "object") | (.remarks // "") as $name
+| .outbounds[]? | select(type == "object")
+| if .protocol == "vless" then .settings.vnext[0] as $v | $v.users[0] as $u
+    | "vless://\($u.id)@\(hp($v.address; $v.port))?" + (xq(.streamSettings // {}) + [kv("flow"; $u.flow), "encryption=none"] | join("&")) + "#" + ($name | enc)
+  elif .protocol == "trojan" then .settings.servers[0] as $v
+    | "trojan://\($v.password | enc)@\(hp($v.address; $v.port))?" + (xq(.streamSettings // {}) | join("&")) + "#" + ($name | enc)
+  elif .protocol == "shadowsocks" then .settings.servers[0] as $v
+    | "ss://" + ("\($v.method):\($v.password)" | @base64) + "@\(hp($v.address; $v.port))#" + ($name | enc)
+  elif .type == "vless" then
+    "vless://\(.uuid)@\(hp(.server; .server_port))?" + (sq(.) + [kv("flow"; .flow), "encryption=none"] | join("&")) + "#" + ((.tag // "") | enc)
+  elif .type == "trojan" then
+    "trojan://\(.password | enc)@\(hp(.server; .server_port))?" + (sq(.) | join("&")) + "#" + ((.tag // "") | enc)
+  elif .type == "shadowsocks" then
+    "ss://" + ("\(.method):\(.password)" | @base64) + "@\(hp(.server; .server_port))#" + ((.tag // "") | enc)
+  elif .type == "hysteria2" then
+    "hysteria2://\(.password | enc)@\(hp(.server; .server_port))?" + ([kv("sni"; .tls.server_name), kv("obfs"; .obfs.type), kv("obfs-password"; .obfs.password)] | join("&")) + "#" + ((.tag // "") | enc)
+  else empty end'
+
+URLDEC_AWK='
+function hv(c) { return index("0123456789abcdef", tolower(c)) - 1 }
+function dec(s,   o, i, c, a, b) {
+  o = ""
+  for (i = 1; i <= length(s); i++) {
+    c = substr(s, i, 1)
+    if (c == "%" && i + 2 <= length(s)) {
+      a = hv(substr(s, i + 1, 1)); b = hv(substr(s, i + 2, 1))
+      if (a >= 0 && b >= 0) { o = o sprintf("%c", a * 16 + b); i += 2; continue }
+    }
+    o = o (c == "+" ? " " : c)
+  }
+  return o
+}'
+
+# drop the fake entries panels put into subscriptions ("App not supported",
+# traffic left, expiry date, device limit...). stdin/stdout: links
+REAL_AWK="$URLDEC_AWK"'
+{
+  l = $0; name = ""; p = index(l, "#"); if (p) { name = tolower(dec(substr(l, p + 1))); l = substr(l, 1, p - 1) }
+  sub(/\?.*/, "", l); sub(/^[a-z0-9]+:\/\//, "", l); sub(/^.*@/, "", l); sub(/\/.*$/, "", l)
+  host = l; sub(/:[0-9]+$/, "", host); gsub(/[][]/, "", host)
+  if (host == "" || host ~ /^(0\.0\.0\.0|127\.|localhost$|::1?$|example\.)/) next
+  if ($0 ~ /00000000-0000-0000-0000-000000000000/) next
+  if (name ~ /not supported|unsupported|please update|update (the |your )?app|expired|traffic limit|device limit|hwid|renew/) next
+  if (name ~ /не поддерж|обнови|истек|истёк|лимит|устройств|продли|осталось/) next
+  print
+}'
+
+HWID=""
+ROUTER_MODEL=$( { tr -d '\n' < /tmp/sysinfo/model; } 2>/dev/null)
+
+# sub_fetch <url> <user-agent> <out>: download the way the client app would.
+# Panels with a device limit want a stable x-hwid; the router gets one.
+sub_fetch() {
+  if [ -z "$HWID" ]; then
+    HWID=$( { cat /sys/class/net/br-lan/address /sys/class/net/eth0/address 2>/dev/null
+              cat /proc/sys/kernel/hostname 2>/dev/null; } | md5sum 2>/dev/null | cut -c 1-16)
+    [ -n "$HWID" ] || HWID=0000000000000000
+  fi
+  curl -sL --max-time 20 -A "$2" -H "Accept: */*" -H "x-hwid: $HWID" -H "x-device-os: Linux" \
+    -H "x-ver-os: OpenWrt" -H "x-device-model: ${ROUTER_MODEL:-OpenWrt}" "$1" > "$3" 2>/dev/null
+}
+
+# sub_parse <raw> -> links on stdout (base64 / plain list / xray or sing-box JSON)
+sub_parse() {
+  case "$(tr -d ' \r\n\t' < "$1" | cut -c 1)" in
+    "{"|"[") command -v jq >/dev/null 2>&1 && jq -r "$JSON2LINKS" "$1" 2>/dev/null | grep -oE "$LINK_RE" ;;
+    *) extract_links < "$1" ;;
+  esac
+}
+
+# sub_why <raw>: short human reason why nothing usable came back
+sub_why() {
+  if [ ! -s "$1" ]; then echo "empty answer (wrong URL, expired key, or the site is blocked)"; return; fi
+  _h=$(head -c 400 "$1" | tr 'A-Z' 'a-z')
+  case "$_h" in
+    *"<html"*|*"<!doctype"*) echo "got a web page instead of a server list" ;;
+    *happ://crypt*) echo "only encrypted happ://crypt links (Happ-only format, can't be decoded)" ;;
+    *"proxies:"*|*"proxy-groups"*) echo "got a Clash config (not supported)" ;;
+    *) if [ -s "$1.links" ]; then
+         echo "only placeholder entries: $(sed -n 's/.*#//p' "$1.links" | head -n 2 | awk "$URLDEC_AWK"'{ print dec($0) }' | tr '\n' ';')"
+       else
+         echo "no vless/vmess/trojan/ss/hysteria2 links inside"
+       fi ;;
+  esac
+}
+
+# --- countries ---------------------------------------------------------------
+
+# node name -> ISO country code from its flag emoji or a country/city name
+CC_AWK='
+BEGIN {
+  pre = sprintf("%c%c%c", 240, 159, 135)
+  for (i = 0; i < 26; i++) RI[sprintf("%c", 166 + i)] = sprintf("%c", 65 + i)
+  n = split("Germany=DE Германия=DE Frankfurt=DE Франкфурт=DE Netherlands=NL Нидерланды=NL Holland=NL Голландия=NL Amsterdam=NL Амстердам=NL Finland=FI Финляндия=FI Helsinki=FI Хельсинки=FI France=FR Франция=FR Paris=FR Париж=FR Poland=PL Польша=PL Warsaw=PL Варшава=PL Sweden=SE Швеция=SE Stockholm=SE Стокгольм=SE Britain=GB Британия=GB Великобритания=GB Англия=GB London=GB Лондон=GB Latvia=LV Латвия=LV Riga=LV Рига=LV Estonia=EE Эстония=EE Tallinn=EE Таллин=EE Lithuania=LT Литва=LT Austria=AT Австрия=AT Vienna=AT Вена=AT Switzerland=CH Швейцария=CH Italy=IT Италия=IT Milan=IT Милан=IT Spain=ES Испания=ES Madrid=ES Мадрид=ES Norway=NO Норвегия=NO Czech=CZ Чехия=CZ Prague=CZ Прага=CZ Romania=RO Румыния=RO Bulgaria=BG Болгария=BG Moldova=MD Молдова=MD Serbia=RS Сербия=RS Hungary=HU Венгрия=HU Portugal=PT Португалия=PT Ireland=IE Ирландия=IE Denmark=DK Дания=DK Belgium=BE Бельгия=BE Greece=GR Греция=GR Slovakia=SK Словакия=SK Slovenia=SI Словения=SI Croatia=HR Хорватия=HR Luxembourg=LU Люксембург=LU Iceland=IS Исландия=IS Cyprus=CY Кипр=CY Ukraine=UA Украина=UA Russia=RU Россия=RU Moscow=RU Москва=RU Belarus=BY Беларусь=BY Turkey=TR Турция=TR Istanbul=TR Стамбул=TR Kazakhstan=KZ Казахстан=KZ USA=US США=US America=US Америка=US Canada=CA Канада=CA Japan=JP Япония=JP Singapore=SG Сингапур=SG Kong=HK Гонконг=HK Israel=IL Израиль=IL UAE=AE ОАЭ=AE Dubai=AE Дубай=AE Armenia=AM Армения=AM Georgia=GE Грузия=GE India=IN Индия=IN", W, " ")
+  for (i = 1; i <= n; i++) { p = index(W[i], "="); K[i] = substr(W[i], 1, p - 1); V[i] = substr(W[i], p + 1) }
+}
+{
+  s = $0; cc = "-"; p = index(s, pre)
+  while (p) {
+    a = substr(s, p + 3, 1); b = substr(s, p + 7, 1)
+    if (substr(s, p + 4, 3) == pre && (a in RI) && (b in RI)) { cc = RI[a] RI[b]; break }
+    s = substr(s, p + 4); p = index(s, pre)
+  }
+  if (cc == "-") for (i = 1; i <= n; i++) if (index($0, K[i])) { cc = V[i]; break }
+  if (cc == "-") {
+    s = $0; gsub(/[^A-Za-z]+/, " ", s); m = split(s, T, " ")
+    for (i = 1; i <= m; i++) if (T[i] ~ /^[A-Z][A-Z]$/ && index(" " cl " ", " " T[i] " ")) { cc = T[i]; break }
+  }
+  print cc
+}'
+KNOWN_CC="$EUROPE RU BY TR KZ US CA JP SG HK IL AE AM GE IN"
+
+name_cc() { printf '%s\n' "$1" | awk -v cl="$KNOWN_CC" "$CC_AWK"; }
+
+# cc_allowed <cc>: unknown ("-") passes; the exit IP check decides later
+cc_allowed() {
+  [ "$1" = "-" ] && return 0
+  case "$COUNTRIES" in
+    all|"") return 0 ;;
+    europe|Europe|EU|eu) case " $EUROPE " in *" $1 "*) return 0 ;; esac; return 1 ;;
+    *) case ",$(echo "$COUNTRIES" | tr 'a-z ' 'A-Z,')," in *",$1,"*) return 0 ;; esac; return 1 ;;
+  esac
+}
+
+countries_label() {
+  case "$COUNTRIES" in all|"") echo "all countries" ;; europe|Europe|EU|eu) echo "Europe only" ;; *) echo "$COUNTRIES" ;; esac
 }
 
 # stdin: any text (plain or base64) -> supported links, one per line
@@ -439,15 +603,37 @@ ask_links() {
   SOURCE="pasted links"
 }
 
-# from_sub <url> <label>
+# from_sub <url> <label>: try the client apps one by one until the panel gives
+# real servers, the same thing Happ/Streisand/INCY do when a key is imported
 from_sub() {
   _host=${1#*://}; _host=${_host%%/*}
-  fetch "$1" > "$WORK/sub" 2>/dev/null || { warn "$2 ($_host): download failed"; return 1; }
-  _before=$(count_nodes)
-  add_links < "$WORK/sub"
-  [ "$(count_nodes)" -gt "$_before" ] ||
-    { warn "$2 ($_host): no vless/vmess/trojan/ss/hysteria2 links inside"; return 1; }
-  info "$2 ($_host): $(( $(count_nodes) - _before )) link(s)"
+  _raw="$WORK/sub.$_k"; _why=""; _app=""
+  : > "$_raw.real"
+  _uas=$(printf '%s\n' "$SUB_UAS" | tr ' ' '~')
+  set -f
+  for _ua in $_uas; do
+    _ua=$(printf '%s' "$_ua" | tr '~' ' ')
+    sub_fetch "$1" "$_ua" "$_raw.try"
+    sub_parse "$_raw.try" > "$_raw.try.links"
+    awk "$REAL_AWK" "$_raw.try.links" > "$_raw.try.real"
+    # keep the most telling reason: placeholder entries beat "web page" etc.
+    if [ -z "$_why" ] || { [ -s "$_raw.try.links" ] && case "$_why" in "only placeholder"*) false ;; *) true ;; esac; }; then
+      _why=$(sub_why "$_raw.try")
+    fi
+    [ "$VERBOSE" = 1 ] && [ -z "$_app" ] && cp "$_raw.try" "/tmp/podkop-probe-sub$_k.txt"
+    if [ -s "$_raw.try.real" ]; then
+      _app=${_ua%%/*}; mv "$_raw.try.real" "$_raw.real"
+      break
+    fi
+  done
+  set +f
+  if [ ! -s "$_raw.real" ]; then
+    warn "$2 ($_host): $_why"
+    [ "$VERBOSE" = 1 ] && info "first answer saved to /tmp/podkop-probe-sub$_k.txt"
+    return 1
+  fi
+  awk -v t="$TAB" '{print "L" t $0}' "$_raw.real" >> "$NODES"
+  info "$2 ($_host): $(wc -l < "$_raw.real" | tr -d ' ') server(s) (fetched as $_app)"
 }
 
 from_subs() {
@@ -455,6 +641,7 @@ from_subs() {
   set -f
   for _u in $SUBS; do
     _k=$((_k + 1))
+    _u=$(printf '%s' "$_u" | sed 's/^\[//; s/[])]*$//')
     from_sub "$_u" "subscription $_k/$_total" && _oks=$((_oks + 1))
   done
   set +f
@@ -478,6 +665,19 @@ ask_subs() {
   SUBS=$_got
 }
 
+ask_countries() {
+  echo "Which servers should be tested and chosen?"
+  echo "  1) Europe only   2) all countries   3) let me list country codes (e.g. DE,NL,FI)"
+  printf '> [1] '
+  read -r _c < "$TTY" || return
+  case "$_c" in
+    ""|1) COUNTRIES=europe ;;
+    2) COUNTRIES=all ;;
+    3) printf 'Country codes, comma separated: '; read -r _c < "$TTY"; COUNTRIES=${_c:-europe} ;;
+    *) COUNTRIES=$_c ;;
+  esac
+}
+
 menu() {
   echo
   printf '%sWhat do you want to do?%s\n' "$BD" "$R0"
@@ -491,7 +691,7 @@ menu() {
   read -r _m < "$TTY" || exit 1
   case "$_m" in
     1|"") MODE=podkop ;;
-    2) ask_subs || die "no subscription URL given"; MODE=sub ;;
+    2) ask_subs || die "no subscription URL given"; ask_countries; MODE=sub ;;
     3) MODE="paste" ;;
     4) nightly_menu; exit 0 ;;
     *) exit 0 ;;
@@ -537,6 +737,16 @@ speed_node() {
   sb_stop "$_si"
 }
 
+# fire <curl-config> <times-file>: the requests of one stage
+fire() {
+  if [ "$HAS_PARALLEL" = 1 ]; then
+    curl -s -K "$1" -Z --parallel-max "$C" --parallel-immediate \
+      --max-time "$T" --noproxy '' -x "$_px" -w '%{http_code} %{time_total}\n' >> "$2" 2>/dev/null
+  else
+    curl -s -K "$1" --max-time "$T" --noproxy '' -x "$_px" -w '%{http_code} %{time_total}\n' >> "$2" 2>/dev/null
+  fi
+}
+
 run_node() {
   _i=$1; _d="$WORK/n/$_i"
   _st=ok; _ip=""; _cc=""
@@ -552,25 +762,18 @@ run_node() {
     exit_ip "$_px" > "$_d/exit" &                  # runs alongside the requests
     _epid=$!
 
-    if [ "$HAS_PARALLEL" = 1 ]; then
-      curl -s -K "$WORK/req.cfg" -Z --parallel-max "$C" --parallel-immediate \
-        --max-time "$T" --noproxy '' -x "$_px" -w '%{http_code} %{time_total}\n' >> "$_d/times" 2>/dev/null
-    else
-      _pids=""; _l=1
-      while [ "$_l" -le "$C" ]; do
-        curl -s -K "$WORK/req.$_l.cfg" --max-time "$T" --noproxy '' -x "$_px" \
-          -w '%{http_code} %{time_total}\n' > "$_d/times.$_l" 2>/dev/null &
-        _pids="$_pids $!"; _l=$((_l + 1))
-      done
-      for _p in $_pids; do wait "$_p" 2>/dev/null; done
-      cat "$_d"/times.* >> "$_d/times" 2>/dev/null
-    fi
+    # a few requests first: a node where none of them gets through is dead,
+    # no need to wait for the whole series to time out
+    fire "$WORK/req0.cfg" "$_d/times"
+    grep -qv '^000' "$_d/times" && [ -s "$WORK/req1.cfg" ] && fire "$WORK/req1.cfg" "$_d/times"
     wait "$_epid" 2>/dev/null
     set -- $(cat "$_d/exit")
     _ip=${1:-}; _cc=${2:-}
+    [ "${_cc:--}" = "-" ] && _cc=$(cat "$_d/ncc" 2>/dev/null)
     if [ -z "$_ip" ]; then _st=noexit
     elif [ "$_ip" = "$DIRECT_IP" ]; then _st=direct
     fi
+    cc_allowed "${_cc:--}" || _st=region
     sb_stop "$_i"
   elif [ "$_st" = start ]; then
     sb_stop "$_i"
@@ -615,6 +818,7 @@ verdict() {
     skip)   echo "SKIPPED" ; return ;;
     start)  echo "NO START"; return ;;
     direct) echo "NOT VIA NODE"; return ;;
+    region) echo "OTHER REGION"; return ;;
   esac
   [ "$3" -gt 0 ] || { echo "DEAD"; return; }
   _f=$(( ($3 - $2) * 1000 / $3 ))
@@ -645,7 +849,7 @@ nightly_on() { [ -f "$CONF" ] && grep -q 'podkop-probe --cron' "$CRONTAB" 2>/dev
 
 nightly_status() {
   if nightly_on; then
-    ( . "$CONF"; printf 'ON at %s, %s subscription(s), best %s' "${NIGHTLY:-?}" "$(printf '%s' "$SUBS" | grep -c .)" "$TOP" )
+    ( . "$CONF"; printf 'ON at %s, %s subscription(s), best %s, %s' "${NIGHTLY:-?}" "$(printf '%s' "$SUBS" | grep -c .)" "$TOP" "$(countries_label)" )
   else
     echo "off"
   fi
@@ -683,6 +887,7 @@ nightly_install() {
     echo "SECTION=$(shq "$SECTION")"
     echo "URL=$(shq "$URL")"
     echo "SPEED=$SPEED"
+    echo "COUNTRIES=$(shq "$COUNTRIES")"
     echo "SPEED_URL=$(shq "$SPEED_URL")"
     echo "NIGHTLY=$(shq "$NIGHTLY")"
   } > "$CONF" || die "cannot write $CONF"
@@ -696,7 +901,7 @@ nightly_install() {
     grep -qxF "$_f" /etc/sysupgrade.conf 2>/dev/null || echo "$_f" >> /etc/sysupgrade.conf
   done
   info "nightly auto-update is ON: every day at $NIGHTLY"
-  info "  subscriptions: $(printf '%s' "$SUBS" | grep -c .), best $TOP node(s) go to podkop section '$SECTION'"
+  info "  subscriptions: $(printf '%s' "$SUBS" | grep -c .), $(countries_label), best $TOP node(s) go to podkop section '$SECTION'"
   info "  settings: $CONF   last run log: /tmp/podkop-probe.log"
   info "  run it now: $BIN --cron    turn off: $BIN --nightly-off"
 }
@@ -730,10 +935,12 @@ nightly_menu() {
     echo "(empty line right away keeps the current subscriptions)"
     ask_subs || SUBS=$_old
     NIGHTLY=$_oldt
+    ask_countries
   else
     echo "Every night the router re-tests your subscriptions and puts the best"
     echo "$TOP nodes (by ping and speed) into podkop as URLTest, then restarts podkop."
     ask_subs || die "no subscription URL given"
+    ask_countries
   fi
   ask_time || return
   nightly_install
@@ -821,7 +1028,7 @@ if [ "$COUNT" -eq 0 ]; then
   exit 1
 fi
 
-_i=0
+_i=0; OUT_REGION=0
 while IFS= read -r _line; do
   _i=$((_i + 1)); _d="$WORK/n/$_i"; mkdir -p "$_d"
   case "$_line" in
@@ -832,7 +1039,16 @@ while IFS= read -r _line; do
       printf '%s\n' "${_r#*"$TAB"}" > "$_d/ob.json" ;;
   esac
   [ -f "$_d/ob.json" ] || [ -f "$_d/skip" ] || echo "build failed" > "$_d/skip"
+  _ncc=$(name_cc "$(cat "$_d/name")"); echo "$_ncc" > "$_d/ncc"
+  if ! cc_allowed "$_ncc"; then           # e.g. "🇺🇸 USA" when only Europe is wanted
+    rm -rf "$_d"; _i=$((_i - 1)); OUT_REGION=$((OUT_REGION + 1))
+  fi
 done < "$NODES"
+COUNT=$_i
+if [ "$COUNT" -eq 0 ]; then
+  warn "all $OUT_REGION node(s) are outside $(countries_label)"
+  exit 1
+fi
 
 # parallelism: ~40 MB per sing-box + curl, keep 1..4 unless -j given
 if [ -z "$J" ]; then
@@ -845,21 +1061,16 @@ fi
 # open a fresh tunnel through the node, which is what we want to measure
 HAS_PARALLEL=0
 curl --help all 2>/dev/null | grep -q -- '--parallel-immediate' && HAS_PARALLEL=1
-{
+# req_cfg <count>: curl config with <count> requests
+req_cfg() {
+  [ "$1" -gt 0 ] || return 0
   echo 'http1.1'
   echo 'header = "Connection: close"'
-  _k=0; while [ "$_k" -lt "$N" ]; do printf 'url = "%s"\noutput = "/dev/null"\n' "$URL"; _k=$((_k + 1)); done
-} > "$WORK/req.cfg"
-if [ "$HAS_PARALLEL" = 0 ]; then
-  _l=1
-  while [ "$_l" -le "$C" ]; do
-    _cnt=$(( N / C )); [ "$_l" -le $(( N % C )) ] && _cnt=$((_cnt + 1))
-    { echo 'http1.1'; echo 'header = "Connection: close"'
-      _k=0; while [ "$_k" -lt "$_cnt" ]; do printf 'url = "%s"\noutput = "/dev/null"\n' "$URL"; _k=$((_k + 1)); done
-    } > "$WORK/req.$_l.cfg"
-    _l=$((_l + 1))
-  done
-fi
+  _k=0; while [ "$_k" -lt "$1" ]; do printf 'url = "%s"\noutput = "/dev/null"\n' "$URL"; _k=$((_k + 1)); done
+}
+N0=$C; [ "$N0" -gt "$N" ] && N0=$N
+req_cfg "$N0" > "$WORK/req0.cfg"
+req_cfg $((N - N0)) > "$WORK/req1.cfg"
 
 if sleep 0.1 2>/dev/null; then NAP=0.2; WAIT_TICKS=75; else NAP=1; WAIT_TICKS=15; fi
 
@@ -868,7 +1079,8 @@ DIRECT_IP=${1:-none}; DIRECT_CC=${2:--}
 
 echo
 info "source:    ${SOURCE:-?}"
-info "nodes:     $COUNT, $J at a time"
+info "nodes:     $COUNT, $J at a time$( [ "$OUT_REGION" -gt 0 ] && echo " ($OUT_REGION outside $(countries_label) skipped by name)")"
+info "countries: $(countries_label)"
 info "test:      $N requests per node, $C in flight, timeout ${T}s -> $URL"
 info "router IP: $DIRECT_IP ($DIRECT_CC)   sing-box $SB_VER"
 echo
@@ -935,7 +1147,7 @@ awk -F "$TAB" -v OFS="$TAB" '
   st = $2; ok = $3 + 0; tot = $4 + 0
   fail = tot > 0 ? (tot - ok) / tot : 1
   if ((st == "ok" || st == "noexit") && ok > 0) cls = (fail <= 0.05) ? 0 : (fail <= 0.2 ? 1 : 2)
-  else if (st == "direct") cls = 3
+  else if (st == "direct" || st == "region") cls = 3
   else if (st == "ok" || st == "noexit") cls = 2
   else cls = 4
   C[NR] = cls; F[NR] = fail
@@ -981,6 +1193,7 @@ while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
     skip)   _why=$(cat "$WORK/n/$_n/skip") ;;
     start)  _why="sing-box did not start: $(grep -v '^[[:space:]]*$' "$WORK/n/$_n/sb.log" 2>/dev/null | tail -n 1 | cut -c 1-200)" ;;
     direct) _why="exit IP equals the router's own IP: traffic did not go through the node, results are void" ;;
+    region) _why="exit country $_xc is outside $(countries_label), not chosen" ;;
     noexit) _why="could not learn the exit IP through the node (ipinfo.io / ipify blocked or node down)" ;;
   esac
   case "$_s" in ok|noexit)

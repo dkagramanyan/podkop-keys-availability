@@ -64,26 +64,54 @@ command line:
 podkop-probe -s 'https://link.example.com/s/AAAA' -s 'https://other.example/sub/BBBB'
 ```
 
-1. **Download.** Every subscription is fetched, plain or base64. The script
-   sends a v2ray client User-Agent, so providers return the link list and
-   not a web page. A subscription that fails is reported and skipped; the
-   others are still used.
-2. **Merge.** Nodes from all subscriptions are merged. The same server listed
+1. **Download, like your VPN app does.** Subscription panels (Remnawave,
+   Marzban, 3x-ui…) give the real server list only to apps they know.
+   Anything else gets a fake "App not supported" entry. So the script asks
+   the way Happ, Streisand, INCY, v2RayTun, v2rayNG, Hiddify and sing-box
+   do, in that order, until real servers come back.
+   - Answers can be a base64 or plain list of links, or xray / sing-box
+     JSON; all three are converted to links.
+   - Fake entries ("App not supported", "30 days left", 0.0.0.0 servers…)
+     are dropped.
+   - A subscription that still fails is skipped with the reason; the others
+     are still used.
+2. **Countries.** You choose "Europe only", all countries, or a list such
+   as `DE,NL,FI` (`--countries`). The country comes from the flag emoji or
+   the country/city name in the server name. Servers that are clearly
+   outside the choice are not even tested. After the test, the real exit
+   country (from the exit IP) is checked too.
+3. **Merge.** Nodes from all subscriptions are merged. The same server listed
    in several subscriptions is tested only once.
-3. **Ping test.** Every node gets N requests, each over a new connection
-   through the node: failures, min / median / p90 time.
-4. **Speed test.** The 2×10 best-answering nodes download a 10 MB file
+4. **Ping test.** Every node gets N requests, each over a new connection
+   through the node: failures, min / median / p90 time. A node where the
+   first round of requests all fail is marked DEAD at once, without waiting
+   for the rest to time out.
+5. **Speed test.** The 2×10 best-answering nodes download a 10 MB file
    through the node, one at a time so they don't share the router's
    bandwidth.
-5. **Ranking.** Nodes with ≤5% failures come first, then ≤20%. Inside each
+6. **Ranking.** Nodes with ≤5% failures come first, then ≤20%. Inside each
    group, the order is *latency rank + speed rank*, so a node has to be
    both quick to answer and fast to download to reach the top.
-6. **Apply.** The top 10 (`--top N`) are shown, and the script asks before
+7. **Apply.** The top 10 (`--top N`) are shown, and the script asks before
    writing them into podkop's `main` section as `urltest` and restarting
    podkop. The old config is backed up to
    `/etc/config/podkop.probe-backup.<date>`; the 3 newest backups are kept.
 
 The best links are also saved to `/tmp/podkop-probe-best.txt`.
+
+### A subscription gives no servers?
+
+Check what it returns to each app. This runs on a Mac or Linux, prints no
+secrets (no UUIDs, keys or passwords; server addresses show only as
+`ip`/`domain`), so the output is safe to share:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dkagramanyan/podkop-keys-availability-/main/tools/sub-check.sh -o /tmp/sub-check.sh
+bash /tmp/sub-check.sh 'https://your-subscription-url' 'https://another-one'
+```
+
+On the router, `podkop-probe -v -s URL` saves the raw answer to
+`/tmp/podkop-probe-sub1.txt`.
 
 ## Every night, automatically
 
@@ -153,6 +181,8 @@ Sources:
   -s URL            subscription URL / "main key" (plain or base64 list of
                     links); repeat -s for several
   -C FILE           sing-box config.json to take the outbounds from
+  --countries LIST  test/choose only servers in these countries:
+                    europe, all (default), or codes like DE,NL,FI
 
 Test:
   -n N              requests per node               (default 30)
