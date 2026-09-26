@@ -89,20 +89,33 @@ podkop-probe -s 'https://link.example.com/s/AAAA' -s 'https://other.example/sub/
    country (from the exit IP) is checked too.
 3. **Merge.** Nodes from all subscriptions are merged. The same server listed
    in several subscriptions is tested only once.
-4. **Ping test.** Every node gets N requests, each over a new connection
-   through the node: failures, min / median / p90 time. A node where the
-   first round of requests all fail is marked DEAD at once, without waiting
-   for the rest to time out.
-5. **Speed test.** The 2×10 best-answering nodes download a 10 MB file
-   through the node, one at a time so they don't share the router's
-   bandwidth.
-6. **Ranking.** Nodes with ≤5% failures come first, then ≤20%. Inside each
-   group, the order is *latency rank + speed rank*, so a node has to be
-   both quick to answer and fast to download to reach the top.
-7. **Apply.** The top 10 (`--top N`) are shown, and the script asks before
-   writing them into podkop's `main` section as `urltest` and restarting
-   podkop. The old config is backed up to
-   `/etc/config/podkop.probe-backup.<date>`; the 3 newest backups are kept.
+4. **One full check per node, one node at a time**, so no two tests share
+   your line and skew each other:
+   - **Latency:** 40 requests (4 at a time), each over a new connection
+     through the node. The script records the failures and the min /
+     median / p90 time.
+     - If the first round all fail, the node is DEAD at once.
+     - A node that has lost more than 30% by half-way stops early: it's
+       BAD either way.
+   - **Speed:** nodes that lost at most 20% then download from Cloudflare
+     for 8 seconds through the same connection. The result is in Mbit/s.
+5. **Ranking.** Nodes that lost ≤5% come first, then ≤20%. Inside each
+   group:
+   *score = median latency ÷ best median + best speed ÷ this speed*.
+   2.0 would be best at both; lower is better. 20% more latency weighs the
+   same as 20% less speed.
+6. **Your choice.** The top 10 (`--top N`) are proposed, one link per
+   server (exit IP) where possible: "Польша #2" and "Польша #2 GRPC" are
+   the same machine and would waste a slot. The picks are marked `*` in
+   the table. Press Enter to take them, or type the `#` numbers you want
+   instead.
+7. **Apply.** The script asks before writing them into podkop's `main`
+   section as `urltest` and restarting podkop. The old config is backed up
+   to `/etc/config/podkop.probe-backup.<date>`; the 3 newest backups are
+   kept.
+
+A full check takes about 10–15 s per node, so 40 nodes take roughly
+8 minutes. `-q` does a quick run (12 requests, 4 s speed test).
 
 The best links are also saved to `/tmp/podkop-probe-best.txt`.
 
@@ -150,17 +163,20 @@ writes the new top list into podkop. Details:
 ## Example output
 
 ```
-#   verdict            ok  fail%     min  median     p90  Mbit/s  exit IP         cc  node
-2   GOOD            30/30    0.0   0.182   0.231   0.310    87.4  185.x.x.x       DE  Germany-1
-4   OK              29/30    3.3   0.201   0.264   0.402    54.0  45.x.x.x        NL  Netherlands
-1   FLAKY           26/30   13.3   0.340   0.512   1.920    12.9  91.x.x.x        FI  Finland
-3   DEAD             0/30  100.0       -       -       -       -  -               -   USA
+  #   verdict            ok  fail%     min  median     p90  Mbit/s  exit IP         cc  node
+* 44  GOOD            40/40    0.0   0.154   0.278   0.409    97.1  212.x.x.x       LT  🇱🇹 Литва GRPC
+* 35  GOOD            40/40    0.0   0.180   0.255   0.447    74.3  213.x.x.x       FR  🇫🇷 Франция GRPC
+* 2   GOOD            40/40    0.0   0.182   0.231   0.310    87.4  185.x.x.x       DE  Germany-1
+  1   GOOD            40/40    0.0   0.301   0.539   2.466    68.6  185.x.x.x       DE  Germany-1 TCP
+  4   OK              39/40    2.5   0.201   0.264   0.402    54.0  45.x.x.x        NL  Netherlands
+  5   BAD              9/20   55.0   0.269   0.474   0.883       -  77.x.x.x        DE  Germany via RU
+  3   DEAD              0/4  100.0       -       -       -       -  -               -   USA
 
-Summary: 1 good, 2 usable, 1 not working — 41s total
+Summary: 4 good, 1 usable, 2 not working — 95s total
 Best node: Germany-1 (#2, median 0.231s, 87.4 Mbit/s)
 
 Problems:
-  #3   USA: all 30 requests failed: node unreachable, blocked, or wrong credentials
+  #3   USA: all 4 requests failed: node unreachable, blocked, or wrong credentials
 ```
 
 | verdict        | meaning                                                         |
@@ -192,16 +208,17 @@ Sources:
                     europe, all (default), or codes like DE,NL,FI
 
 Test:
-  -n N              requests per node               (default 30)
-  -c N              requests in flight per node     (default 5)
-  -j N              nodes tested at the same time   (default: by free RAM, max 4)
-  -t SEC            timeout per request, seconds    (default 10)
+  -n N              requests per node               (default 40)
+  -c N              requests in flight per node     (default 4)
+  -j N              nodes tested at the same time   (default 1: one at a time,
+                    so tests don't share the line; speed tests always are)
+  -t SEC            timeout per request, seconds    (default 8)
   -u URL            target URL                      (default https://www.gstatic.com/generate_204)
-  -q                quick run:    -n 10
-  -F                thorough run: -n 100 -c 10
+  -q                quick run:    -n 12, 4 s speed test
+  -F                thorough run: -n 100, 15 s speed test
   -p PORT           first local SOCKS port          (default 39000)
   --no-speed        skip the download speed test
-  --speed-url URL   file for the speed test (default: 10 MB from Cloudflare)
+  --speed-url URL   file for the speed test (default: Cloudflare, 8 s download)
 
 Podkop (for link sources: -s, -f, links):
   --top N           how many best nodes to offer for podkop   (default 10)

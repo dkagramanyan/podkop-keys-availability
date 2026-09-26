@@ -12,7 +12,7 @@
 #
 # https://github.com/dkagramanyan/podkop-keys-availability-
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 REPO_URL="https://github.com/dkagramanyan/podkop-keys-availability-"
 SELF_URLS="$REPO_URL/releases/latest/download/probe.sh
 https://raw.githubusercontent.com/dkagramanyan/podkop-keys-availability-/main/probe.sh"
@@ -24,13 +24,13 @@ PODKOP_INSTALL="sh <(wget -O - https://raw.githubusercontent.com/itdoginfo/podko
 set -u
 export LC_ALL=C
 
-N=30; C=5; J=""; T=10
+N=40; C=4; J=""; T=8
 URL="https://www.gstatic.com/generate_204"
 BASEPORT=39000
 FILE=""; SUBS=""; CONFIG=""; CSV=""
 VERBOSE=0; ASSUME_YES=0; COLOR=auto; SOURCE=""
 TOP=10; APPLY=ask; SECTION=main
-SPEED=1; SPEED_URL="https://speed.cloudflare.com/__down?bytes=10000000"; SPEED_T=10
+SPEED=1; SPEED_URL="https://speed.cloudflare.com/__down?bytes=100000000"; SPEED_T=8
 NIGHTLY=""; NIGHTLY_OFF=0; CRON=0
 COUNTRIES=all
 # Subscription panels (Remnawave, Marzban, 3x-ui...) only hand the real server
@@ -73,14 +73,15 @@ Sources:
 Test:
   -n N              requests per node               (default $N)
   -c N              requests in flight per node     (default $C)
-  -j N              nodes tested at the same time   (default: by free RAM, max 4)
+  -j N              nodes tested at the same time   (default 1: one at a time,
+                    so tests don't share the line; speed tests always are)
   -t SEC            timeout per request, seconds    (default $T)
   -u URL            target URL                      (default $URL)
-  -q                quick run:    -n 10
-  -F                thorough run: -n 100 -c 10
+  -q                quick run:    -n 12, 4 s speed test
+  -F                thorough run: -n 100, 15 s speed test
   -p PORT           first local SOCKS port          (default $BASEPORT)
   --no-speed        skip the download speed test
-  --speed-url URL   file for the speed test (default: 10 MB from Cloudflare)
+  --speed-url URL   file for the speed test (default: Cloudflare, ${SPEED_T}s download)
 
 Podkop (for link sources: -s, -f, links):
   --top N           how many best nodes to offer for podkop   (default $TOP)
@@ -160,8 +161,8 @@ while [ $# -gt 0 ]; do
         --countries) COUNTRIES="$2" ;;
       esac
       shift 2 ;;
-    -q) N=10; shift ;;
-    -F) N=100; C=10; shift ;;
+    -q) N=12; SPEED_T=4; shift ;;
+    -F) N=100; SPEED_T=15; shift ;;
     -v) VERBOSE=1; shift ;;
     -y) ASSUME_YES=1; shift ;;
     --apply) APPLY=yes; shift ;;
@@ -754,17 +755,16 @@ sb_start() {
 
 sb_stop() { kill "$_pid" 2>/dev/null; rm -f "$WORK/pids/$1"; }
 
-# speed_node <idx>: download SPEED_URL through the node -> <dir>/speed (Mbit/s)
-speed_node() {
-  _si=$1; _d="$WORK/n/$_si"
-  if sb_start "$_si"; then
-    set -- $(curl -s -o /dev/null --noproxy '' -x "socks5h://127.0.0.1:$_port" --max-time "$SPEED_T" \
-      -w '%{size_download} %{speed_download}' "$SPEED_URL" 2>/dev/null)
-    awk -v b="${1:-0}" -v s="${2:-0}" 'BEGIN { if (b < 100000) print "0.0"; else printf "%.1f\n", s * 8 / 1000000 }' > "$_d/speed"
-  else
-    echo "0.0" > "$_d/speed"
-  fi
-  sb_stop "$_si"
+# speed_measure <dir>: download through the running node for SPEED_T seconds
+# -> <dir>/speed in Mbit/s. Only one download runs at a time (lock on fd 4),
+# so tests never share the router's bandwidth.
+speed_measure() {
+  _sf="$1/speed"
+  read -r _ <&4
+  set -- $(curl -s -o /dev/null --noproxy '' -x "$_px" --max-time "$SPEED_T" \
+    -w '%{size_download} %{speed_download}' "$SPEED_URL" 2>/dev/null)
+  echo >&4
+  awk -v b="${1:-0}" -v s="${2:-0}" 'BEGIN { if (b < 100000) print "0.0"; else printf "%.1f\n", s * 8 / 1000000 }' > "$_sf"
 }
 
 # fire <curl-config> <times-file>: the requests of one stage
@@ -792,10 +792,21 @@ run_node() {
     exit_ip "$_px" > "$_d/exit" &                  # runs alongside the requests
     _epid=$!
 
-    # a few requests first: a node where none of them gets through is dead,
-    # no need to wait for the whole series to time out
+    # stage 0: a few requests; if none gets through the node is dead
+    # stage 1: up to half the series; a node losing >30% by then is bad
+    #          enough, no need to wait for the rest to time out
+    # stage 2: the rest
     fire "$WORK/req0.cfg" "$_d/times"
-    grep -qv '^000' "$_d/times" && [ -s "$WORK/req1.cfg" ] && fire "$WORK/req1.cfg" "$_d/times"
+    if grep -qv '^000' "$_d/times"; then
+      [ -s "$WORK/req1.cfg" ] && fire "$WORK/req1.cfg" "$_d/times"
+      if [ -s "$WORK/req2.cfg" ] && awk '$1 == "000" { f++ } END { exit !(f * 10 <= NR * 3) }' "$_d/times"; then
+        fire "$WORK/req2.cfg" "$_d/times"
+      fi
+    fi
+    # speed test for nodes that lost at most 20% of the requests
+    if [ "$SPEED" = 1 ] && awk '$1 == "000" { f++ } END { exit !(NR > 0 && f * 5 <= NR) }' "$_d/times"; then
+      speed_measure "$_d"
+    fi
     wait "$_epid" 2>/dev/null
     set -- $(cat "$_d/exit")
     _ip=${1:-}; _cc=${2:-}
@@ -809,8 +820,8 @@ run_node() {
     sb_stop "$_i"
   fi
 
-  # status ok total min median p90
-  set -- $(awk '$1 != "000" {print $2}' "$_d/times" | sort -n | awk -v tot="$N" -v st="$_st" '
+  # status ok total min median p90 (total = requests actually sent)
+  set -- $(awk '$1 != "000" {print $2}' "$_d/times" | sort -n | awk -v tot="$(wc -l < "$_d/times")" -v st="$_st" '
     { a[++k] = $1 }
     END {
       if (st == "skip" || st == "start") { print st, 0, 0, "-", "-", "-"; exit }
@@ -819,7 +830,8 @@ run_node() {
       p = int(k * 0.9); if (p < k * 0.9) p++; if (p < 1) p = 1
       printf "%s %d %d %.3f %.3f %.3f\n", st, k, tot, a[1], med, a[p]
     }')
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "${_ip:--}" "${_cc:--}" "$(cat "$_d/name")" > "$_d/result"
+  _sp=$(cat "$_d/speed" 2>/dev/null); [ -n "$_sp" ] || _sp=-
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "${_ip:--}" "${_cc:--}" "$_sp" "$(cat "$_d/name")" > "$_d/result"
   print_progress "$_i" "$_d/result"
 }
 
@@ -864,10 +876,10 @@ vcolor() {
 }
 
 print_progress() {
-  IFS="$TAB" read -r _s _ok _tot _mn _md _p9 _xi _xc _nm < "$2"
+  IFS="$TAB" read -r _s _ok _tot _mn _md _p9 _xi _xc _sp _nm < "$2"
   _v=$(verdict "$_s" "$_ok" "$_tot")
-  printf '  [%*d/%d] %s%-12s%s %4s  med %-7s %-15s %-3s %s\n' \
-    "${#COUNT}" "$1" "$COUNT" "$(vcolor "$_v")" "$_v" "$R0" "$_ok/$_tot" "$_md" "$_xi" "$_xc" "$_nm"
+  printf '  [%*d/%d] %s%-12s%s %5s  med %-6s %6s Mbit/s  %-15s %-3s %s\n' \
+    "${#COUNT}" "$1" "$COUNT" "$(vcolor "$_v")" "$_v" "$R0" "$_ok/$_tot" "$_md" "$_sp" "$_xi" "$_xc" "$_nm"
 }
 
 
@@ -1080,10 +1092,14 @@ if [ "$COUNT" -eq 0 ]; then
   exit 1
 fi
 
-# parallelism: ~40 MB per sing-box + curl, keep 1..4 unless -j given
+# one node at a time by default: parallel tests would share the router's
+# line and memory and skew each other; -j N allows more (~40 MB each)
 if [ -z "$J" ]; then
+  J=1
+else
   _mem=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null)
-  J=$(( ${_mem:-160} / 40 )); [ "$J" -gt 4 ] && J=4; [ "$J" -lt 1 ] && J=1
+  _max=$(( ${_mem:-160} / 40 )); [ "$_max" -lt 1 ] && _max=1
+  [ "$J" -gt "$_max" ] && { warn "-j $J needs more free RAM, using $_max"; J=$_max; }
 fi
 [ "$J" -gt "$COUNT" ] && J=$COUNT
 
@@ -1099,8 +1115,10 @@ req_cfg() {
   _k=0; while [ "$_k" -lt "$1" ]; do printf 'url = "%s"\noutput = "/dev/null"\n' "$URL"; _k=$((_k + 1)); done
 }
 N0=$C; [ "$N0" -gt "$N" ] && N0=$N
+N1=$(( N / 2 - N0 )); [ "$N1" -lt 0 ] && N1=0
 req_cfg "$N0" > "$WORK/req0.cfg"
-req_cfg $((N - N0)) > "$WORK/req1.cfg"
+req_cfg "$N1" > "$WORK/req1.cfg"
+req_cfg $(( N - N0 - N1 )) > "$WORK/req2.cfg"
 
 if sleep 0.1 2>/dev/null; then NAP=0.2; WAIT_TICKS=75; else NAP=1; WAIT_TICKS=15; fi
 
@@ -1112,12 +1130,14 @@ info "source:    ${SOURCE:-?}"
 info "nodes:     $COUNT, $J at a time$( [ "$OUT_REGION" -gt 0 ] && echo " ($OUT_REGION outside $(countries_label) skipped by name)")"
 info "countries: $(countries_label)"
 info "test:      $N requests per node, $C in flight, timeout ${T}s -> $URL"
+[ "$SPEED" = 1 ] && info "speed:     ${SPEED_T}s download per node (nodes losing >20% are not speed-tested)"
 info "router IP: $DIRECT_IP ($DIRECT_CC)   sing-box $SB_VER"
 echo
 
 START=$(date +%s)
-mkfifo "$WORK/sem" || die "mkfifo failed"
-exec 3<>"$WORK/sem"
+mkfifo "$WORK/sem" "$WORK/slock" || die "mkfifo failed"
+exec 3<>"$WORK/sem" 4<>"$WORK/slock"
+echo >&4
 _k=0; while [ "$_k" -lt "$J" ]; do echo >&3; _k=$((_k + 1)); done
 
 _i=0
@@ -1127,9 +1147,9 @@ while [ "$_i" -lt "$COUNT" ]; do
   ( run_node "$_i"; echo >&3 ) &
 done
 wait
-exec 3>&-
+exec 3>&- 4>&-
 
-# --- speed test --------------------------------------------------------------
+# --- ranking -----------------------------------------------------------------
 
 # all rows: n status ok total min median p90 ip cc speed name
 _i=0
@@ -1138,74 +1158,73 @@ while [ "$_i" -lt "$COUNT" ]; do
   _i=$((_i + 1))
   [ -f "$WORK/n/$_i/result" ] && printf '%s\t%s\n' "$_i" "$(cat "$WORK/n/$_i/result")" >> "$WORK/all"
 done
-
-# the fastest-answering working nodes get a download test, one at a time so
-# they don't share the router's bandwidth
-if [ "$SPEED" = 1 ]; then
-  awk -F "$TAB" -v OFS="$TAB" '($2 == "ok" || $2 == "noexit") && $3 > 0 && ($4 - $3) * 5 <= $4 {
-    print int(($4 - $3) * 100000 / $4), $6, $1 }' "$WORK/all" |
-    sort -t "$TAB" -k1,1n -k2,2g | head -n $((TOP * 2)) | cut -f 3 > "$WORK/speedlist"
-  _ns=$(wc -l < "$WORK/speedlist" | tr -d ' ')
-  if [ "$_ns" -gt 0 ]; then
-    echo
-    info "speed test: $_ns best node(s), one at a time, up to ${SPEED_T}s each"
-    _k=0
-    while IFS= read -r _n; do
-      _k=$((_k + 1))
-      speed_node "$_n"
-      printf '  [%*d/%d] %7s Mbit/s  %s\n' "${#_ns}" "$_k" "$_ns" "$(cat "$WORK/n/$_n/speed")" "$(cat "$WORK/n/$_n/name")"
-    done < "$WORK/speedlist"
-  fi
-fi
 ELAPSED=$(( $(date +%s) - START ))
 
-awk -F "$TAB" -v OFS="$TAB" -v w="$WORK" '{
-  f = w "/n/" $1 "/speed"; sp = "-"
-  if ((getline v < f) > 0) sp = v
-  close(f)
-  $10 = sp "\t" $10
-  print
-}' "$WORK/all" > "$WORK/all.s" && mv "$WORK/all.s" "$WORK/all"
-
-# ranking:
-#  1. class: <=5% failed, <=20% failed, worse, not via node, not started/skipped
-#  2. inside the usable classes: rank by median latency + rank by speed
-#     (nodes without a speed result come after the measured ones)
-#  3. then failure rate, then median
-awk -F "$TAB" -v OFS="$TAB" '
+# classes: 0 = lost <=5% (and speed test passed), 1 = lost <=20% or speed test
+# failed, 2 = worse, 3 = wrong country / not via node, 4 = skipped / no start.
+# Inside classes 0-1 the score is  median / best median  +  best speed / speed
+# (1 + 1 = 2 for a node that is best at both; lower is better), so 20% more
+# latency weighs the same as 20% less speed.
+awk -F "$TAB" -v OFS="$TAB" -v speed="$SPEED" '
 { row[NR] = $0
   st = $2; ok = $3 + 0; tot = $4 + 0
   fail = tot > 0 ? (tot - ok) / tot : 1
-  if ((st == "ok" || st == "noexit") && ok > 0) cls = (fail <= 0.05) ? 0 : (fail <= 0.2 ? 1 : 2)
+  M[NR] = ($6 == "-") ? 0 : $6 + 0; S[NR] = ($10 == "-") ? 0 : $10 + 0
+  if ((st == "ok" || st == "noexit") && ok > 0) {
+    cls = (fail <= 0.05) ? 0 : (fail <= 0.2 ? 1 : 2)
+    if (cls == 0 && speed == 1 && S[NR] <= 0) cls = 1
+  }
   else if (st == "direct" || st == "region") cls = 3
   else if (st == "ok" || st == "noexit") cls = 2
   else cls = 4
   C[NR] = cls; F[NR] = fail
-  M[NR] = ($6 == "-") ? 1e9 : $6 + 0
-  S[NR] = ($10 == "-") ? -1 : $10 + 0
+  if (cls <= 1 && M[NR] > 0 && (bm == 0 || M[NR] < bm)) bm = M[NR]
+  if (cls <= 1 && S[NR] > bs) bs = S[NR]
 }
 END {
-  n = 0
-  for (i = 1; i <= NR; i++) if (C[i] <= 1) { a[++n] = i; b[n] = i }
-  for (x = 2; x <= n; x++) { t = a[x]; y = x - 1; while (y > 0 && M[a[y]] > M[t]) { a[y + 1] = a[y]; y-- } a[y + 1] = t }
-  for (x = 2; x <= n; x++) { t = b[x]; y = x - 1; while (y > 0 && S[b[y]] < S[t]) { b[y + 1] = b[y]; y-- } b[y + 1] = t }
-  for (x = 1; x <= n; x++) { LR[a[x]] = x; SR[b[x]] = (S[b[x]] > 0) ? x : n + 1 }
   for (i = 1; i <= NR; i++) {
-    score = (C[i] <= 1) ? LR[i] + SR[i] : 0
-    printf "%d\t%d\t%.6f\t%.6f\t%s\n", C[i], score, F[i], M[i], row[i]
+    sc = 99
+    if (C[i] <= 1 && M[i] > 0) sc = M[i] / bm + ((speed == 1 && bs > 0) ? ((S[i] > 0) ? bs / S[i] : 10) : 0)
+    printf "%d\t%.4f\t%.6f\t%s\n", C[i], sc, F[i], row[i]
   }
-}' "$WORK/all" | sort -t "$TAB" -k1,1n -k2,2n -k3,3g -k4,4g | cut -f 5- > "$WORK/sorted"
+}' "$WORK/all" | sort -t "$TAB" -k1,1n -k2,2g -k3,3g | cut -f 4- > "$WORK/sorted"
+
+# pick the best TOP nodes that came from links (config outbounds have no
+# link): usable classes only, and one link per exit IP, since several links
+# to the same server add nothing to a URLTest group
+: > "$WORK/best"; : > "$WORK/best.names"; : > "$WORK/best.ips"
+pick() { # <n>: add node n to the pick list
+  cat "$WORK/n/$1/link" >> "$WORK/best"
+  IFS="$TAB" read -r _s _ok _tot _mn _md _p9 _xi _xc _sp _nm < "$WORK/n/$1/result"
+  printf '#%-3s median %6ss %7s Mbit/s  %s\n' "$1" "$_md" "$_sp" "$_nm" >> "$WORK/best.names"
+  echo "$_xi" >> "$WORK/best.ips"
+}
+while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
+  [ "$(wc -l < "$WORK/best")" -ge "$TOP" ] && break
+  [ -f "$WORK/n/$_n/link" ] || continue
+  case "$(verdict "$_s" "$_ok" "$_tot")" in GOOD|OK|FLAKY) ;; *) continue ;; esac
+  [ "$_xi" != "-" ] && grep -qxF "$_xi" "$WORK/best.ips" && continue
+  pick "$_n"
+done < "$WORK/sorted"
+# not enough different servers: fill up with the next best links anyway
+while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
+  [ "$(wc -l < "$WORK/best")" -ge "$TOP" ] && break
+  [ -f "$WORK/n/$_n/link" ] || continue
+  case "$(verdict "$_s" "$_ok" "$_tot")" in GOOD|OK|FLAKY) ;; *) continue ;; esac
+  grep -q "^#$_n " "$WORK/best.names" || pick "$_n"
+done < "$WORK/sorted"
 
 # --- report ------------------------------------------------------------------
 
 echo
-printf '%s%-3s %-12s %8s %6s %7s %7s %7s %7s  %-15s %-3s %s%s\n' "$BD" "#" "verdict" "ok" "fail%" "min" "median" "p90" "Mbit/s" "exit IP" "cc" "node" "$R0"
+printf '%s  %-3s %-12s %8s %6s %7s %7s %7s %7s  %-15s %-3s %s%s\n' "$BD" "#" "verdict" "ok" "fail%" "min" "median" "p90" "Mbit/s" "exit IP" "cc" "node" "$R0"
 _good=0; _okn=0; _bad=0; _skp=0; BEST=""
 while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
   _v=$(verdict "$_s" "$_ok" "$_tot")
   _fp="-"; [ "$_tot" -gt 0 ] && _fp=$(awk -v o="$_ok" -v t="$_tot" 'BEGIN {printf "%.1f", (t - o) * 100 / t}')
-  printf '%-3s %s%-12s%s %8s %6s %7s %7s %7s %7s  %-15s %-3s %s\n' \
-    "$_n" "$(vcolor "$_v")" "$_v" "$R0" "$_ok/$_tot" "$_fp" "$_mn" "$_md" "$_p9" "$_sp" "$_xi" "$_xc" "$_nm"
+  _mk=" "; grep -q "^#$_n " "$WORK/best.names" && _mk="*"
+  printf '%s %-3s %s%-12s%s %8s %6s %7s %7s %7s %7s  %-15s %-3s %s\n' \
+    "$_mk" "$_n" "$(vcolor "$_v")" "$_v" "$R0" "$_ok/$_tot" "$_fp" "$_mn" "$_md" "$_p9" "$_sp" "$_xi" "$_xc" "$_nm"
   case "$_v" in GOOD) _good=$((_good + 1)) ;; OK|FLAKY) _okn=$((_okn + 1)) ;; SKIPPED) _skp=$((_skp + 1)) ;; *) _bad=$((_bad + 1)) ;; esac
   [ -z "$BEST" ] && case "$_v" in GOOD|OK|FLAKY) BEST="$_nm (#$_n, median ${_md}s, $_sp Mbit/s)" ;; esac
 done < "$WORK/sorted"
@@ -1230,7 +1249,7 @@ while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
   case "$_s" in ok|noexit)
     [ "$_ok" -eq 0 ] && _why="all $_tot requests failed: node unreachable, blocked, or wrong credentials" ;;
   esac
-  [ "$_sp" = "0.0" ] && _why="${_why:+$_why; }speed test download failed"
+  [ "$_sp" = "0.0" ] && _why="${_why:+$_why; }speed test download failed (Cloudflare blocked through this node?)"
   [ -n "$_why" ] || continue
   [ "$_hdr" = 0 ] && { echo; printf '%sProblems:%s\n' "$BD" "$R0"; _hdr=1; }
   printf '  #%-3s %s: %s\n' "$_n" "$_nm" "$_why"
@@ -1267,9 +1286,9 @@ fi
 echo
 printf '%sLegend:%s ok = successful requests; min/median/p90 = seconds per request\n' "$DM" "$R0"
 printf '%s        (new connection through the node + HTTPS to the target each time);%s\n' "$DM" "$R0"
-printf '%s        Mbit/s = download speed, measured for the %s best-answering nodes.%s\n' "$DM" "$((TOP * 2))" "$R0"
+printf '%s        Mbit/s = download speed during %ss, one node at a time.%s\n' "$DM" "$SPEED_T" "$R0"
 printf '%s        GOOD 0%% fail, OK <=5%%, FLAKY <=20%%, BAD >20%%, DEAD = nothing got through.%s\n' "$DM" "$R0"
-printf '%s        Order: fewest failures, then best ping + speed together.%s\n' "$DM" "$R0"
+printf '%s        Order: fewest failures, then latency and speed together; * = picked.%s\n' "$DM" "$R0"
 
 # --- put the best nodes into podkop ------------------------------------------
 
@@ -1301,17 +1320,6 @@ apply_podkop() {
   fi
 }
 
-# best working nodes that came from links (config outbounds have no link)
-: > "$WORK/best"; : > "$WORK/best.names"
-while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
-  [ "$(wc -l < "$WORK/best")" -ge "$TOP" ] && break
-  [ -f "$WORK/n/$_n/link" ] || continue
-  case "$(verdict "$_s" "$_ok" "$_tot")" in GOOD|OK|FLAKY)
-    cat "$WORK/n/$_n/link" >> "$WORK/best"
-    printf '#%-3s median %6ss %7s Mbit/s  %s\n' "$_n" "$_md" "$_sp" "$_nm" >> "$WORK/best.names" ;;
-  esac
-done < "$WORK/sorted"
-
 if [ "$APPLY" != no ] && [ -s "$WORK/best" ] && case "$SOURCE" in podkop*) false ;; *) true ;; esac; then
   _nb=$(wc -l < "$WORK/best" | tr -d ' ')
   cp "$WORK/best" "/tmp/podkop-probe-best.txt" 2>/dev/null &&
@@ -1319,8 +1327,28 @@ if [ "$APPLY" != no ] && [ -s "$WORK/best" ] && case "$SOURCE" in podkop*) false
   if [ -f /etc/config/podkop ] && command -v uci >/dev/null 2>&1; then
     uci -q get "podkop.$SECTION" >/dev/null || die "podkop has no section '$SECTION' (use --section)"
     echo
-    printf '%sBest %s node(s) to put into podkop:%s\n' "$BD" "$_nb" "$R0"
+    printf '%sBest %s node(s) to put into podkop (lowest latency + fastest, one per server where possible):%s\n' "$BD" "$_nb" "$R0"
     sed 's/^/  /' "$WORK/best.names"
+    if [ "$APPLY" != yes ] && [ -n "$TTY" ]; then
+      printf 'Press Enter to take these, or type the # numbers you want instead (e.g. 35 41 44): '
+      read -r _sel < "$TTY" || _sel=""
+      _sel=$(printf '%s' "$_sel" | tr -c '0-9\n' ' ')
+      if [ -n "$(printf '%s' "$_sel" | tr -d ' ')" ]; then
+        : > "$WORK/best"; : > "$WORK/best.names"; : > "$WORK/best.ips"
+        for _n in $_sel; do
+          if [ -f "$WORK/n/$_n/link" ] && [ -f "$WORK/n/$_n/result" ]; then
+            grep -q "^#$_n " "$WORK/best.names" || pick "$_n"
+          else
+            warn "#$_n is not a tested node with a link, ignored"
+          fi
+        done
+        _nb=$(wc -l < "$WORK/best" | tr -d ' ')
+        [ "$_nb" -gt 0 ] || { info "nothing chosen, podkop settings left unchanged"; exit 0; }
+        cp "$WORK/best" "/tmp/podkop-probe-best.txt" 2>/dev/null
+        printf '%sYour choice:%s\n' "$BD" "$R0"
+        sed 's/^/  /' "$WORK/best.names"
+      fi
+    fi
     if [ "$APPLY" = yes ] || ask_yn "Replace podkop '$SECTION' proxy with a URLTest of these $_nb node(s) and restart podkop"; then
       apply_podkop
     else
