@@ -12,12 +12,12 @@
 #
 # https://github.com/dkagramanyan/podkop-keys-availability-
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 REPO_URL="https://github.com/dkagramanyan/podkop-keys-availability-"
-SELF_URLS="$REPO_URL/releases/latest/download/probe.sh
-https://raw.githubusercontent.com/dkagramanyan/podkop-keys-availability-/main/probe.sh"
-BIN=/usr/bin/podkop-probe
-CONF=/etc/podkop-probe.conf
+RELEASE_URL="$REPO_URL/releases/latest/download/probe.sh"
+BIN=/usr/bin/podkop-probe            # installed copy, used by the nightly run
+CONF=/etc/podkop-probe.conf          # saved keys and settings
+LOG=/tmp/podkop-probe.log            # log of the last --cron run
 CRONTAB=/etc/crontabs/root
 PODKOP_INSTALL="sh <(wget -O - https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh)"
 
@@ -30,7 +30,7 @@ BASEPORT=39000
 FILE=""; SUBS=""; CONFIG=""; CSV=""
 VERBOSE=0; ASSUME_YES=0; COLOR=auto; SOURCE=""
 TOP=10; APPLY=ask; SECTION=main
-SPEED=1; SPEED_URL=""; SPEED_T=8; SPEED_J=""; ENTRY_CHECK=1
+SPEED=1; SPEED_URL=""; SPEED_T=8; SPEED_J=""; SPEED_J_USER=""; ENTRY_CHECK=1
 # direct download used to measure the router's own line (not Cloudflare,
 # which some providers block without a VPN)
 LINE_URL="https://fsn1-speed.hetzner.com/100MB.bin"
@@ -38,8 +38,8 @@ LINE_URL="https://fsn1-speed.hetzner.com/100MB.bin"
 # until SPEED_T is used up (Cloudflare refuses single requests of 100 MB)
 SPEED_URLS="https://speed.cloudflare.com/__down?bytes=25000000
 https://fsn1-speed.hetzner.com/100MB.bin"
-NIGHTLY=""; NIGHTLY_OFF=0; CRON=0
-COUNTRIES=all
+CRON=0; CRON_TIME=""; INSTALL=0; UNINSTALL=0; UPDATE=0; NO_UPDATE=0
+COUNTRIES=""                         # "" = all; europe; or DE,NL,...
 # Subscription panels (Remnawave, Marzban, 3x-ui...) only hand the real server
 # list to client apps they know, so we introduce ourselves like those apps.
 UA="Happ/3.9.0"
@@ -102,11 +102,15 @@ Podkop (for link sources: -s, -f, links):
   --no-apply        never offer to change podkop settings
   --section NAME    podkop section to write to                (default $SECTION)
 
-Nightly auto-update (OpenWrt cron):
-  --nightly HH:MM   every night re-test the -s subscriptions and put the best
-                    --top nodes into podkop; installs $BIN
-                    and saves the settings to $CONF
-  --nightly-off     turn the nightly job off
+Nightly run:
+  --install         install as $BIN and save the -s keys
+                    and options in $CONF
+  --cron            run with the saved settings, no questions: update podkop
+                    and restart it (log: $LOG). In LuCI ->
+                    System -> Scheduled Tasks:  30 4 * * * podkop-probe --cron
+  --cron-line HH:MM print the Scheduled Tasks line for another time
+  --update          update the installed copy to the latest release
+  --uninstall       remove the installed copy and the saved settings
 
 Output:
   -o FILE           also save results as CSV
@@ -121,7 +125,7 @@ Examples:
   sh probe.sh -q                           # fast check, 10 requests per node
   sh probe.sh -s https://example.com/sub   # test a subscription, offer best 10
   sh probe.sh -s https://a.example/sub -s https://b.example/sub --top 5 --apply -y
-  sh probe.sh -s https://a.example/sub -s https://b.example/sub --nightly 04:00
+  sh probe.sh -s https://a.example/sub -s https://b.example/sub --countries europe --install
   sh probe.sh 'vless://...#de' 'trojan://...#nl'
 EOF
   exit "${1:-0}"
@@ -161,7 +165,7 @@ is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -gt 0 ]; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    -f|-s|-C|--config|-n|-c|-j|-t|-u|-p|-o|--top|--section|--speed-url|--nightly|--countries|--speed-jobs)
+    -f|-s|-C|--config|-n|-c|-j|-t|-u|-p|-o|--top|--section|--speed-url|--cron-line|--countries|--speed-jobs)
       [ $# -ge 2 ] || { echo "option $1 needs a value" >&2; usage 1; }
       case "$1" in
         -f) FILE="$2" ;; -s) SUBS="$SUBS$2
@@ -169,8 +173,8 @@ while [ $# -gt 0 ]; do
         -n) N="$2" ;; -c) C="$2" ;; -j) J="$2" ;; -t) T="$2" ;;
         -u) URL="$2" ;; -p) BASEPORT="$2" ;; -o) CSV="$2" ;;
         --top) TOP="$2" ;; --section) SECTION="$2" ;;
-        --speed-url) SPEED_URL="$2" ;; --nightly) NIGHTLY="$2" ;;
-        --speed-jobs) SPEED_J="$2" ;;
+        --speed-url) SPEED_URL="$2" ;; --cron-line) CRON_TIME="$2" ;;
+        --speed-jobs) SPEED_J="$2"; SPEED_J_USER=$2 ;;
         --countries) COUNTRIES="$2" ;;
       esac
       shift 2 ;;
@@ -182,7 +186,10 @@ while [ $# -gt 0 ]; do
     --no-apply) APPLY=no; shift ;;
     --no-speed) SPEED=0; shift ;;
     --no-entry-check) ENTRY_CHECK=0; shift ;;
-    --nightly-off) NIGHTLY_OFF=1; shift ;;
+    --install) INSTALL=1; shift ;;
+    --uninstall|--nightly-off) UNINSTALL=1; shift ;;
+    --update) UPDATE=1; shift ;;
+    --no-update) NO_UPDATE=1; shift ;;
     --cron) CRON=1; shift ;;
     --no-color) COLOR=0; shift ;;
     -V|--version) echo "podkop-probe $VERSION"; exit 0 ;;
@@ -193,12 +200,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# nightly run from cron: settings come from the saved config
+# unattended run from cron: saved settings, no questions, log to $LOG
 if [ "$CRON" = 1 ]; then
-  [ -f "$CONF" ] || { echo "no $CONF, nothing to do" >&2; exit 1; }
-  . "$CONF"
+  [ -t 1 ] || exec > "$LOG" 2>&1
+  echo "=== $(date)"
+  if [ -z "$SUBS$ARGLINKS$FILE" ] && [ -f "$CONF" ]; then . "$CONF"; fi
+  [ -n "$SUBS$ARGLINKS$FILE" ] || { echo "no keys: run 'podkop-probe' and set up the nightly run first" >&2; exit 1; }
   ASSUME_YES=1; APPLY=yes; COLOR=0; TTY=""
-  case "$SPEED_URL" in *speed.cloudflare.com/__down*) SPEED_URL="" ;; esac   # old defaults
 fi
 
 for _v in N C T BASEPORT TOP; do
@@ -679,18 +687,19 @@ from_sub() {
     return 1
   fi
   awk -v t="$TAB" '{print "L" t $0}' "$_raw.real" >> "$NODES"
-  info "$2 ($_host): $(wc -l < "$_raw.real" | tr -d ' ') server(s) (fetched as $_app)"
-  _si=$(sub_info "$_raw.h" 2>/dev/null); [ -n "$_si" ] && info "    $_si"
+  _si=$(sub_info "$_raw.h" 2>/dev/null)
+  printf '  %s  %-24s %3s servers%s\n' "$2" "$_host" "$(wc -l < "$_raw.real" | tr -d ' ')" "${_si:+  · $_si}"
+  [ "$VERBOSE" = 1 ] && info "    fetched as $_app"
   return 0
 }
 
 from_subs() {
-  _total=$(printf '%s' "$SUBS" | grep -c .); _k=0; _oks=0
+  _k=0; _oks=0
   set -f
   for _u in $SUBS; do
     _k=$((_k + 1))
     _u=$(printf '%s' "$_u" | sed 's/^\[//; s/[])]*$//')
-    from_sub "$_u" "subscription $_k/$_total" && _oks=$((_oks + 1))
+    from_sub "$_u" "key $_k" && _oks=$((_oks + 1))
   done
   set +f
   [ "$_oks" -gt 0 ] || die "none of the subscriptions gave any links"
@@ -699,8 +708,12 @@ from_subs() {
 
 # read one or more subscription URLs from the terminal into SUBS
 ask_subs() {
-  echo "Paste subscription URLs (main keys), one per line or space separated."
-  echo "Finish with an empty line:"
+  if [ -n "$SAVED_SUBS" ]; then
+    echo "Paste your keys (subscription URLs), then an empty line."
+    echo "Just Enter = your $(printf '%s' "$SAVED_SUBS" | grep -c .) saved key(s):"
+  else
+    echo "Paste your keys (subscription URLs), then an empty line:"
+  fi
   _got=""
   while IFS= read -r _l < "$TTY"; do
     [ -n "$(printf '%s' "$_l" | tr -d ' \r\t')" ] || break
@@ -709,15 +722,18 @@ ask_subs() {
     _got="$_got$_u
 "
   done
-  [ -n "$_got" ] || return 1
+  if [ -z "$_got" ]; then
+    [ -n "$SAVED_SUBS" ] || return 1
+    SUBS=$SAVED_SUBS; return 0
+  fi
   SUBS=$_got
 }
 
 ask_countries() {
-  echo "Which servers should be tested and chosen?"
-  echo "  1) Europe only   2) all countries   3) let me list country codes (e.g. DE,NL,FI)"
-  printf '> [1] '
+  _def=1; case "$COUNTRIES" in all) _def=2 ;; europe|""|Europe|EU|eu) ;; *) _def=3 ;; esac
+  printf 'Servers: 1) Europe only  2) all countries  3) country codes  [%s]: ' "$_def"
   read -r _c < "$TTY" || return
+  [ -z "$_c" ] && [ "$_def" != 1 ] && return
   case "$_c" in
     ""|1) COUNTRIES=europe ;;
     2) COUNTRIES=all ;;
@@ -729,19 +745,20 @@ ask_countries() {
 menu() {
   echo
   printf '%sWhat do you want to do?%s\n' "$BD" "$R0"
-  echo "  1) Test the nodes podkop uses now"
-  echo "  2) Enter one or more subscription URLs (main keys), test all their"
-  echo "     nodes and put the best $TOP by ping and speed into podkop (URLTest)"
-  echo "  3) Paste links to test"
-  echo "  4) Nightly auto-update: $(nightly_status)"
+  echo "  1) Test my keys and put the best $TOP servers into podkop"
+  echo "  2) Test the servers podkop uses now"
+  echo "  3) Test pasted links"
+  echo "  4) Nightly run: $(nightly_status)"
   echo "  q) Quit"
   printf '> '
   read -r _m < "$TTY" || exit 1
   case "$_m" in
-    1|"") MODE=podkop ;;
-    2) ask_subs || die "no subscription URL given"; ask_countries; MODE=sub ;;
+    1|"") ask_subs || die "no key given"
+          [ -z "$COUNTRIES" ] && COUNTRIES=$SAVED_C
+          ask_countries; MODE=sub ;;
+    2) MODE=podkop ;;
     3) MODE="paste" ;;
-    4) nightly_menu; exit 0 ;;
+    4) nightly_setup; exit 0 ;;
     *) exit 0 ;;
   esac
 }
@@ -1019,7 +1036,12 @@ vcolor() {
   case "$1" in GOOD) echo "$GR" ;; OK) echo "$GR" ;; FLAKY) echo "$YL" ;; *) echo "$RD" ;; esac
 }
 
+# progress: a single updating line on a terminal, per-node lines with -v
+progress() { [ "$PROG" = 1 ] && printf '\r  %s ' "$*"; return 0; }
+
 print_progress() {
+  echo "$1" >> "$WORK/lat.done"
+  if [ "$VERBOSE" != 1 ]; then progress "testing  $(wc -l < "$WORK/lat.done")/$COUNT"; return; fi
   IFS="$TAB" read -r _s _ok _tot _mn _md _p9 _xi _xc _sp _nm < "$2"
   _v=$(verdict "$_s" "$_ok" "$_tot")
   printf '  [%*d/%d] %s%-12s%s %5s  med %-6s  %-15s %-3s %s\n' \
@@ -1027,124 +1049,118 @@ print_progress() {
 }
 
 
-# --- nightly auto-update -----------------------------------------------------
+# --- nightly run -------------------------------------------------------------
 
 shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
-nightly_on() { [ -f "$CONF" ] && grep -q 'podkop-probe --cron' "$CRONTAB" 2>/dev/null; }
-
 nightly_status() {
-  if nightly_on; then
-    ( . "$CONF"; printf 'ON at %s, %s subscription(s), best %s, %s' "${NIGHTLY:-?}" "$(printf '%s' "$SUBS" | grep -c .)" "$TOP" "$(countries_label)" )
+  if [ -f "$CONF" ] && [ -x "$BIN" ]; then
+    ( . "$CONF"; printf 'set up, %s key(s), %s' "$(printf '%s' "$SUBS" | grep -c .)" "$(countries_label)" )
   else
-    echo "off"
+    echo "not set up"
   fi
 }
 
-# copy this script to $BIN (download it when we run from a pipe)
+ask_time() {
+  printf 'Time, HH:MM [%s]: ' "${CRON_TIME:-04:30}"
+  read -r _t < "$TTY" || _t=""
+  CRON_TIME=${_t:-${CRON_TIME:-04:30}}
+}
+
+# cron_line: the line for LuCI -> System -> Scheduled Tasks
+cron_line() {
+  case "${CRON_TIME:=04:30}" in [0-9]:[0-5][0-9]|[01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;;
+    *) die "time must be HH:MM, got '$CRON_TIME'" ;; esac
+  _h=$(echo "${CRON_TIME%%:*}" | sed 's/^0\(.\)/\1/'); _mi=$(echo "${CRON_TIME#*:}" | sed 's/^0\(.\)/\1/')
+  echo
+  printf '%sNightly run: paste this into LuCI -> System -> Scheduled Tasks and Save:%s\n\n' "$BD" "$R0"
+  printf '    %s %s * * * podkop-probe --cron\n\n' "$_mi" "$_h"
+}
+
+# install_self: copy this script to $BIN (download it when run from a pipe)
 install_self() {
   _src=""
-  case "$0" in /dev/*|/proc/*|sh|-sh|ash|-ash) ;; *) [ -f "$0" ] && _src=$0 ;; esac
+  case "$0" in /dev/*|/proc/*|sh|-sh|ash|-ash|bash) ;; *) [ -f "$0" ] && _src=$0 ;; esac
   if [ -n "$_src" ] && grep -q '^VERSION=' "$_src"; then
     [ "$_src" -ef "$BIN" ] && return 0
     cp "$_src" "$BIN.new" || return 1
   else
-    set -f
-    for _u in $SELF_URLS; do
-      fetch "$_u" > "$BIN.new" 2>/dev/null && grep -q '^VERSION=' "$BIN.new" && break
-      rm -f "$BIN.new"
-    done
-    set +f
+    fetch "$RELEASE_URL" > "$BIN.new" 2>/dev/null
   fi
-  [ -s "$BIN.new" ] || return 1
+  grep -q '^VERSION=' "$BIN.new" 2>/dev/null || { rm -f "$BIN.new"; return 1; }
   chmod +x "$BIN.new" && mv "$BIN.new" "$BIN"
+  grep -qxF "$BIN" /etc/sysupgrade.conf 2>/dev/null || echo "$BIN" >> /etc/sysupgrade.conf
 }
 
-nightly_install() {
-  case "$NIGHTLY" in [0-9]:[0-5][0-9]|[01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;;
-    *) die "time must be HH:MM, got '$NIGHTLY'" ;; esac
-  [ -n "$SUBS" ] || die "nightly auto-update needs at least one subscription URL (-s)"
-  [ -d "${CRONTAB%/*}" ] || die "no ${CRONTAB%/*}: cron is not available here"
-  install_self || die "could not install $BIN"
+# save_conf: keys and options for the nightly run
+save_conf() {
   {
-    echo "# podkop-probe nightly settings. Edit freely, or re-run: podkop-probe"
+    echo "# podkop-probe settings for the nightly run (podkop-probe --cron)"
     echo "SUBS=$(shq "$SUBS")"
-    echo "TOP=$TOP"; echo "N=$N"; echo "C=$C"; echo "T=$T"
-    echo "SECTION=$(shq "$SECTION")"
-    echo "URL=$(shq "$URL")"
-    echo "SPEED=$SPEED"
-    [ -n "$SPEED_J" ] && echo "SPEED_J=$SPEED_J"
     echo "COUNTRIES=$(shq "$COUNTRIES")"
-    [ -n "$SPEED_URL" ] && echo "SPEED_URL=$(shq "$SPEED_URL")"
-    echo "NIGHTLY=$(shq "$NIGHTLY")"
-  } > "$CONF" || die "cannot write $CONF"
-  chmod 600 "$CONF"
-  _h=$(( $(echo "${NIGHTLY%%:*}" | sed 's/^0//') + 0 )); _mi=$(( $(echo "${NIGHTLY#*:}" | sed 's/^0//') + 0 ))
-  touch "$CRONTAB"
-  sed -i '/podkop-probe --cron/d' "$CRONTAB"
-  echo "$_mi $_h * * * $BIN --cron >/tmp/podkop-probe.log 2>&1" >> "$CRONTAB"
-  /etc/init.d/cron enable 2>/dev/null; /etc/init.d/cron restart >/dev/null 2>&1
-  for _f in "$BIN" "$CONF"; do
-    grep -qxF "$_f" /etc/sysupgrade.conf 2>/dev/null || echo "$_f" >> /etc/sysupgrade.conf
-  done
-  info "nightly auto-update is ON: every day at $NIGHTLY"
-  info "  subscriptions: $(printf '%s' "$SUBS" | grep -c .), $(countries_label), best $TOP node(s) go to podkop section '$SECTION'"
-  info "  settings: $CONF   last run log: /tmp/podkop-probe.log"
-  info "  run it now: $BIN --cron    turn off: $BIN --nightly-off"
+    echo "TOP=$TOP"
+    echo "SECTION=$(shq "$SECTION")"
+    [ -n "$SPEED_J_USER" ] && echo "SPEED_J=$SPEED_J_USER"
+    [ "$ENTRY_CHECK" = 0 ] && echo "ENTRY_CHECK=0"
+  } > "$CONF" && chmod 600 "$CONF"
+  grep -qxF "$CONF" /etc/sysupgrade.conf 2>/dev/null || echo "$CONF" >> /etc/sysupgrade.conf
 }
 
-nightly_remove() {
-  [ -f "$CRONTAB" ] && sed -i '/podkop-probe --cron/d' "$CRONTAB"
-  rm -f "$CONF"
-  /etc/init.d/cron restart >/dev/null 2>&1
-  info "nightly auto-update is OFF ($BIN is kept, delete it if you like)"
+# install + save + show the cron line
+nightly_install() {
+  [ -n "$SUBS" ] || die "no keys to save (-s URL)"
+  install_self || die "could not install $BIN"
+  save_conf || die "could not write $CONF"
+  info "installed $BIN, keys saved in $CONF"
+  cron_line
+  grep -qs 'podkop-probe --cron' "$CRONTAB" && echo "(a podkop-probe line is already in Scheduled Tasks; keep just one)"
+  return 0
 }
 
-ask_time() {
-  printf 'Time to run every night, HH:MM [%s]: ' "${NIGHTLY:-04:00}"
-  read -r _t < "$TTY" || return 1
-  NIGHTLY=${_t:-${NIGHTLY:-04:00}}
-}
-
-nightly_menu() {
-  echo
-  if nightly_on; then
-    printf 'Nightly auto-update: %s\n' "$(nightly_status)"
-    ( . "$CONF"; printf '%s' "$SUBS" | sed 's/^/  /' )
-    echo "  1) change it   2) turn it off   Enter) back"
-    printf '> '; read -r _m < "$TTY" || return
-    case "$_m" in
-      1) ;;
-      2) nightly_remove; return ;;
-      *) return ;;
-    esac
-    _old=$( . "$CONF"; printf '%s' "$SUBS" ); _oldt=$( . "$CONF"; printf '%s' "$NIGHTLY" )
-    echo "(empty line right away keeps the current subscriptions)"
-    ask_subs || SUBS=$_old
-    NIGHTLY=$_oldt
-    ask_countries
-  else
-    echo "Every night the router re-tests your subscriptions and puts the best"
-    echo "$TOP nodes (by ping and speed) into podkop as URLTest, then restarts podkop."
-    ask_subs || die "no subscription URL given"
-    ask_countries
-  fi
-  ask_time || return
+nightly_setup() {
+  ask_subs || die "no key given"
+  [ -z "$COUNTRIES" ] && COUNTRIES=$SAVED_C
+  ask_countries
+  ask_time
   nightly_install
+}
+
+# self_update: replace $BIN with the latest release if it differs
+self_update() {
+  [ -f "$BIN" ] || return 1
+  fetch "$RELEASE_URL" > "$BIN.new" 2>/dev/null
+  _nv=$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$BIN.new" 2>/dev/null)
+  if [ -n "$_nv" ] && awk -v a="$_nv" -v b="$VERSION" 'BEGIN { n = split(a, x, "."); split(b, y, ".")
+       for (i = 1; i <= n; i++) if (x[i] + 0 != y[i] + 0) exit !(x[i] + 0 > y[i] + 0); exit 1 }'; then
+    chmod +x "$BIN.new" && mv "$BIN.new" "$BIN" && { info "updated $VERSION -> $_nv"; return 0; }
+  fi
+  rm -f "$BIN.new"; return 1
+}
+
+uninstall() {
+  rm -f "$BIN" "$CONF"
+  [ -f "$CRONTAB" ] && sed -i '/podkop-probe --cron/d' "$CRONTAB" && /etc/init.d/cron restart >/dev/null 2>&1
+  [ -f /etc/sysupgrade.conf ] && sed -i "\\|^$BIN\$|d; \\|^$CONF\$|d" /etc/sysupgrade.conf
+  info "removed $BIN, $CONF and the Scheduled Tasks line"
 }
 
 # --- main --------------------------------------------------------------------
 
-if [ "$NIGHTLY_OFF" = 1 ]; then nightly_remove; exit 0; fi
-if [ -n "$NIGHTLY" ] && [ "$CRON" = 0 ]; then
-  # fetch needs curl or wget only; no test run here
-  nightly_install; exit 0
+SAVED_SUBS=""; SAVED_C=""
+if [ -f "$CONF" ]; then
+  SAVED_SUBS=$( . "$CONF"; printf '%s' "$SUBS" ); SAVED_C=$( . "$CONF"; printf '%s' "${COUNTRIES:-}" )
+fi
+if [ "$UNINSTALL" = 1 ]; then uninstall; exit 0; fi
+if [ "$UPDATE" = 1 ]; then self_update || info "already the latest version ($VERSION)"; exit 0; fi
+if [ "$INSTALL" = 1 ]; then nightly_install; exit 0; fi
+if [ -n "$CRON_TIME" ]; then cron_line; exit 0; fi
+if [ "$CRON" = 1 ] && [ "$NO_UPDATE" = 0 ] && [ "$0" -ef "$BIN" ] && self_update; then
+  exec sh "$BIN" --cron --no-update
 fi
 
 if [ "$CRON" = 1 ]; then
   mkdir /tmp/podkop-probe.lock 2>/dev/null || { echo "another run is in progress" >&2; exit 1; }
   trap 'rmdir /tmp/podkop-probe.lock 2>/dev/null' EXIT
-  echo "=== $(date) nightly run"
 fi
 
 cleanup() {
@@ -1157,10 +1173,10 @@ trap cleanup EXIT
 trap 'echo; warn "interrupted"; exit 130' INT TERM
 : > "$NODES"
 
-printf '%spodkop-probe %s%s  %s%s%s\n' "$BD" "$VERSION" "$R0" "$DM" "$REPO_URL" "$R0"
 _model=$(cat /tmp/sysinfo/model 2>/dev/null)
 _os=$(sed -n "s/^DISTRIB_DESCRIPTION='\(.*\)'/\1/p" /etc/openwrt_release 2>/dev/null)
-[ -n "$_model$_os" ] && printf '%s%s %s%s\n' "$DM" "$_model" "$_os" "$R0"
+_sys="${_model:+ · $_model}${_os:+ · $_os}"
+printf '%spodkop-probe %s%s%s\n' "$BD" "$VERSION" "$R0" "${_sys:+$DM$_sys$R0}"
 
 # sing-box is the one hard requirement
 if ! command -v sing-box >/dev/null 2>&1; then
@@ -1241,7 +1257,6 @@ curl --help all 2>/dev/null | grep -q -- '--parallel-immediate' && HAS_PARALLEL=
 OUT_ENTRY=0
 case "$COUNTRIES" in all|"") ;; *)
   if [ "$ENTRY_CHECK" = 1 ] && [ "$COUNT" -gt 0 ]; then
-    info "checking where the $COUNT server(s) are ..."
     entry_countries
     _i=0; _j=0
     while [ "$_i" -lt "$COUNT" ]; do
@@ -1292,18 +1307,19 @@ if sleep 0.1 2>/dev/null; then NAP=0.2; WAIT_TICKS=75; else NAP=1; WAIT_TICKS=15
 
 set -- $(exit_ip)
 DIRECT_IP=${1:-none}; DIRECT_CC=${2:--}
+: > "$WORK/lat.done"
 
+PROG=0; [ -t 1 ] && [ "$VERBOSE" != 1 ] && PROG=1
+_sk=$(( OUT_REGION + OUT_ENTRY ))
 echo
-info "source:    ${SOURCE:-?}"
-_sk=""
-[ "$OUT_REGION" -gt 0 ] && _sk="$OUT_REGION by name"
-[ "$OUT_ENTRY" -gt 0 ] && _sk="${_sk:+$_sk, }$OUT_ENTRY by server IP"
-info "nodes:     $COUNT, $J at a time${_sk:+ (skipped outside $(countries_label): $_sk)}"
-info "countries: $(countries_label)"
-info "test:      $N requests per node, $C in flight, timeout ${T}s -> $URL"
-[ "$SPEED" = 1 ] && info "speed:     up to ${SPEED_T}s download per node (nodes losing >20% are skipped)"
-info "router IP: $DIRECT_IP ($DIRECT_CC)   sing-box $SB_VER"
-echo
+printf 'Testing %s%s server(s)%s%s ...\n' "$BD" "$COUNT" "$R0" \
+  "$(case "$COUNTRIES" in all|"") ;; *) printf ' in %s' "$(countries_label | sed 's/ only//')"
+     [ "$_sk" -gt 0 ] && printf ' (%s outside skipped)' "$_sk" ;; esac)"
+if [ "$VERBOSE" = 1 ]; then
+  info "source: ${SOURCE:-?}; outside the countries: $OUT_REGION by name, $OUT_ENTRY by server IP"
+  info "test: $N requests per node, $C in flight, $J nodes at a time, timeout ${T}s -> $URL"
+  info "router IP: $DIRECT_IP ($DIRECT_CC)   sing-box $SB_VER"
+fi
 
 START=$(date +%s)
 mkfifo "$WORK/sem" || die "mkfifo failed"
@@ -1338,7 +1354,7 @@ if [ "$SPEED" = 1 ]; then
   awk -F "$TAB" '!seen[$3]++ { print $2 }' "$WORK/speedlist" > "$WORK/speed.uniq"
   _ns=$(wc -l < "$WORK/speed.uniq" | tr -d ' ')
   if [ "$_ns" -gt 0 ]; then
-    echo
+    [ "$VERBOSE" = 1 ] && echo
     if [ -z "$SPEED_J" ]; then
       # how many tests fit on the line at once: measure it directly, then
       # allow one test per ~200 Mbit/s (a node rarely gives more than ~150)
@@ -1348,12 +1364,12 @@ if [ "$SPEED" = 1 ]; then
           awk '$2 > 0 && $1 > 1000000 { printf "%.0f", $1 * 8 / $2 / 1000000 }')
         if [ -n "$_line" ]; then
           SPEED_J=$(( _line / 200 )); [ "$SPEED_J" -lt 1 ] && SPEED_J=1; [ "$SPEED_J" -gt 3 ] && SPEED_J=3
-          info "your line (direct): ~$_line Mbit/s"
+          [ "$VERBOSE" = 1 ] && info "your line (direct): ~$_line Mbit/s"
         fi
       fi
     fi
     [ "$SPEED_J" -gt "$_ns" ] && SPEED_J=$_ns
-    info "speed test: $_ns server(s), $SPEED_J at a time, until the result is stable (max ${SPEED_T}s)"
+    [ "$VERBOSE" = 1 ] && info "speed test: $_ns server(s), $SPEED_J at a time, until the result is stable (max ${SPEED_T}s)"
     mkfifo "$WORK/ssem" && exec 5<>"$WORK/ssem"
     _k=0; while [ "$_k" -lt "$SPEED_J" ]; do echo >&5; _k=$((_k + 1)); done
     : > "$WORK/speed.done"
@@ -1362,8 +1378,12 @@ if [ "$SPEED" = 1 ]; then
       (
         speed_node "$_n"
         echo "$_n" >> "$WORK/speed.done"
-        printf '  [%*d/%d] %7s Mbit/s  %s\n' "${#_ns}" "$(wc -l < "$WORK/speed.done")" "$_ns" \
-          "$(cat "$WORK/n/$_n/speed")" "$(cat "$WORK/n/$_n/name")"
+        if [ "$VERBOSE" = 1 ]; then
+          printf '  [%*d/%d] %7s Mbit/s  %s\n' "${#_ns}" "$(wc -l < "$WORK/speed.done")" "$_ns" \
+            "$(cat "$WORK/n/$_n/speed")" "$(cat "$WORK/n/$_n/name")"
+        else
+          progress "speed    $(wc -l < "$WORK/speed.done")/$_ns"
+        fi
         echo >&5
       ) &
     done < "$WORK/speed.uniq"
@@ -1449,60 +1469,74 @@ done < "$WORK/sorted"
 
 # --- report ------------------------------------------------------------------
 
-echo
-printf '%s  %-3s %-12s %8s %6s %7s %7s %7s %7s  %-15s %-3s %s%s\n' "$BD" "#" "verdict" "ok" "fail%" "min" "median" "p90" "Mbit/s" "exit IP" "cc" "node" "$R0"
-_good=0; _okn=0; _bad=0; _skp=0; BEST=""
-while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
-  _v=$(verdict "$_s" "$_ok" "$_tot")
-  _fp="-"; [ "$_tot" -gt 0 ] && _fp=$(awk -v o="$_ok" -v t="$_tot" 'BEGIN {printf "%.1f", (t - o) * 100 / t}')
-  _mk=" "; grep -q "^#$_n " "$WORK/best.names" && _mk="*"
-  printf '%s %-3s %s%-12s%s %8s %6s %7s %7s %7s %7s  %-15s %-3s %s\n' \
-    "$_mk" "$_n" "$(vcolor "$_v")" "$_v" "$R0" "$_ok/$_tot" "$_fp" "$_mn" "$_md" "$_p9" "$_sp" "$_xi" "$_xc" "$_nm"
-  case "$_v" in GOOD) _good=$((_good + 1)) ;; OK|FLAKY) _okn=$((_okn + 1)) ;; SKIPPED) _skp=$((_skp + 1)) ;; *) _bad=$((_bad + 1)) ;; esac
-  [ -z "$BEST" ] && case "$_v" in GOOD|OK|FLAKY) BEST="$_nm (#$_n, median ${_md}s, $_sp Mbit/s)" ;; esac
+[ "$PROG" = 1 ] && printf '\r%40s\r' ""
+_good=0; _okn=0; _bad=0; _skp=0
+while IFS="$TAB" read -r _n _s _ok _tot _rest; do
+  case "$(verdict "$_s" "$_ok" "$_tot")" in GOOD) _good=$((_good + 1)) ;; OK|FLAKY) _okn=$((_okn + 1)) ;;
+    SKIPPED) _skp=$((_skp + 1)) ;; *) _bad=$((_bad + 1)) ;; esac
 done < "$WORK/sorted"
-
-echo
-printf 'Summary: %s%d good%s, %s%d usable%s, %s%d not working%s%s — %ds total\n' \
+printf 'Done in %dm%02ds: %s%d good%s, %s%d unstable%s, %s%d bad%s%s\n' $((ELAPSED / 60)) $((ELAPSED % 60)) \
   "$GR" "$_good" "$R0" "$YL" "$_okn" "$R0" "$RD" "$_bad" "$R0" \
-  "$( [ "$_skp" -gt 0 ] && echo ", $_skp skipped (can't run in sing-box/podkop)")" "$ELAPSED"
-[ -n "$BEST" ] && printf 'Best node: %s%s%s\n' "$BD" "$BEST" "$R0"
+  "$( [ "$_skp" -gt 0 ] && echo ", $_skp can't run in podkop (xhttp)")"
 
-# explain problems in plain words
-_hdr=0
-while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
-  _why=""
-  case "$_s" in
-    skip)   cat "$WORK/n/$_n/skip" >> "$WORK/skipped"; continue ;;
-    start)  _why="sing-box did not start: $(grep -v '^[[:space:]]*$' "$WORK/n/$_n/sb.log" 2>/dev/null | tail -n 1 | cut -c 1-200)" ;;
-    direct) _why="exit IP equals the router's own IP: traffic did not go through the node, results are void" ;;
-    region) _why="exit country $_xc is outside $(countries_label), not chosen" ;;
-    noexit) _why="could not learn the exit IP through the node (ipinfo.io / ipify blocked or node down)" ;;
-  esac
-  case "$_s" in ok|noexit)
-    [ "$_ok" -eq 0 ] && _why="all $_tot requests failed: node unreachable, blocked, or wrong credentials" ;;
-  esac
-  [ "$_sp" = "0.0" ] && _why="${_why:+$_why; }speed test failed: $(cat "$WORK/n/$_n/speed.why" 2>/dev/null || echo "no data")"
-  [ -n "$_why" ] || continue
-  [ "$_hdr" = 0 ] && { echo; printf '%sProblems:%s\n' "$BD" "$R0"; _hdr=1; }
-  printf '  #%-3s %s: %s\n' "$_n" "$_nm" "$_why"
-done < "$WORK/sorted"
+# lost%, latency in ms
+row_fmt() { awk -v o="$1" -v t="$2" -v m="$3" 'BEGIN { printf "%s %s", (t > 0 ? sprintf("%d%%", (t - o) * 100 / t + 0.5) : "-"), (m == "-" ? "-" : sprintf("%d", m * 1000 + 0.5)) }'; }
 
-# skipped links, one line per reason
-if [ -s "$WORK/skipped" ]; then
-  [ "$_hdr" = 0 ] && { echo; printf '%sProblems:%s\n' "$BD" "$R0"; }
-  sort "$WORK/skipped" | uniq -c | while read -r _c _why; do
-    printf '  %s link(s) skipped: %s\n' "$_c" "$_why"
-  done
+echo
+if [ "$VERBOSE" = 1 ]; then
+  printf '%s  %-3s %-12s %8s %6s %7s %7s %7s %7s  %-15s %-3s %s%s\n' "$BD" "#" "verdict" "ok" "fail%" "min" "median" "p90" "Mbit/s" "exit IP" "cc" "node" "$R0"
+  while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
+    _v=$(verdict "$_s" "$_ok" "$_tot")
+    _fp="-"; [ "$_tot" -gt 0 ] && _fp=$(awk -v o="$_ok" -v t="$_tot" 'BEGIN {printf "%.1f", (t - o) * 100 / t}')
+    _mk=" "; grep -q "^#$_n " "$WORK/best.names" && _mk="*"
+    printf '%s %-3s %s%-12s%s %8s %6s %7s %7s %7s %7s  %-15s %-3s %s\n' \
+      "$_mk" "$_n" "$(vcolor "$_v")" "$_v" "$R0" "$_ok/$_tot" "$_fp" "$_mn" "$_md" "$_p9" "$_sp" "$_xi" "$_xc" "$_nm"
+  done < "$WORK/sorted"
+else
+  # the picks (*) and a few runners-up
+  printf '%s  %-3s %7s %7s %5s  %-3s %s%s\n' "$BD" "#" "ping ms" "Mbit/s" "lost" "cc" "server" "$R0"
+  _extra=0; _more=0
+  while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
+    _v=$(verdict "$_s" "$_ok" "$_tot")
+    case "$_v" in GOOD|OK|FLAKY) ;; *) continue ;; esac
+    _mk=" "
+    if grep -q "^#$_n " "$WORK/best.names"; then _mk="*"
+    elif [ "$_extra" -lt 5 ]; then _extra=$((_extra + 1))
+    else _more=$((_more + 1)); continue; fi
+    set -- $(row_fmt "$_ok" "$_tot" "$_md")
+    printf '%s %-3s %7s %7s %s%5s%s  %-3s %s\n' "$_mk" "$_n" "$2" "$_sp" "$(vcolor "$_v")" "$1" "$R0" "$_xc" "$_nm"
+  done < "$WORK/sorted"
+  [ "$_more" -gt 0 ] && printf '  %s+%d more (-v shows all servers and why the others failed)%s\n' "$DM" "$_more" "$R0"
+fi
+
+# speed tests that all failed deserve one line even without -v
+if [ "$SPEED" = 1 ] && [ -s "$WORK/speedlist" ] && ! grep -qv '^0\.0$' "$WORK"/n/*/speed 2>/dev/null; then
+  warn "all speed tests failed: $(cat "$WORK"/n/*/speed.why 2>/dev/null | sort | uniq -c | sort -rn | head -n 1 | sed 's/^ *[0-9]* //')"
 fi
 
 if [ "$VERBOSE" = 1 ]; then
+  echo
+  printf '%sProblems:%s\n' "$BD" "$R0"
+  while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
+    _why=""
+    case "$_s" in
+      skip)   _why=$(cat "$WORK/n/$_n/skip") ;;
+      start)  _why="sing-box did not start: $(grep -v '^[[:space:]]*$' "$WORK/n/$_n/sb.log" 2>/dev/null | tail -n 1 | cut -c 1-200)" ;;
+      direct) _why="exit IP equals the router's own IP: traffic did not go through the node" ;;
+      region) _why="exit country $_xc is outside $(countries_label)" ;;
+      noexit) _why="could not learn the exit IP through the node" ;;
+    esac
+    case "$_s" in ok|noexit)
+      [ "$_ok" -eq 0 ] && _why="all $_tot requests failed: unreachable, blocked, or wrong credentials" ;;
+    esac
+    [ "$(cat "$WORK/n/$_n/speed" 2>/dev/null)" = "0.0" ] && _why="${_why:+$_why; }speed test failed: $(cat "$WORK/n/$_n/speed.why" 2>/dev/null || echo "no data")"
+    [ -n "$_why" ] && printf '  #%-3s %s: %s\n' "$_n" "$_nm" "$_why"
+  done < "$WORK/sorted"
   echo
   printf '%sPer-request results (http_code seconds, 000 = failed):%s\n' "$BD" "$R0"
   while IFS="$TAB" read -r _n _s _ok _tot _rest; do
     printf -- '--- #%s %s\n' "$_n" "$(cat "$WORK/n/$_n/name")"
     awk '{ c[$1]++ } END { for (k in c) printf "  http %s x%d\n", (k == "000" ? "000 (failed)" : k), c[k] }' "$WORK/n/$_n/times"
-    awk '$1 != "000" { print $2 }' "$WORK/n/$_n/times" | sort -n | tr '\n' ' ' | fold -w 78 | sed 's/^/  /'; echo
     [ -s "$WORK/n/$_n/sb.log" ] && { echo "sing-box log:"; tail -n 5 "$WORK/n/$_n/sb.log"; }
   done < "$WORK/sorted"
 fi
@@ -1516,91 +1550,75 @@ if [ -n "$CSV" ]; then
   } > "$CSV" && info "saved $CSV"
 fi
 
-echo
-printf '%sLegend:%s ok = successful requests; min/median/p90 = seconds per request\n' "$DM" "$R0"
-printf '%s        (new connection through the node + HTTPS to the target each time);%s\n' "$DM" "$R0"
-printf '%s        Mbit/s = download speed through the node (up to %ss, one node at a time).%s\n' "$DM" "$SPEED_T" "$R0"
-printf '%s        GOOD 0%% fail, OK <=5%%, FLAKY <=20%%, BAD >20%%, DEAD = nothing got through.%s\n' "$DM" "$R0"
-printf '%s        Order: fewest failures, then latency and speed together; * = picked.%s\n' "$DM" "$R0"
-
 # --- put the best nodes into podkop ------------------------------------------
 
+# apply_podkop: URLTest with the picked links in section $SECTION, restart
 apply_podkop() {
-  _cur=$(uci -q get "podkop.$SECTION.urltest_proxy_links" | tr ' ' '\n' | sort)
-  if [ "$(uci -q get "podkop.$SECTION.proxy_config_type")" = urltest ] && [ "$_cur" = "$(sort "$WORK/best")" ]; then
-    info "podkop already uses exactly these nodes, nothing to change"
-    return 0
-  fi
   _cfg=/etc/config/podkop
   _bak="$_cfg.probe-backup.$(date +%Y%m%d-%H%M%S)"
   cp "$_cfg" "$_bak" || die "cannot back up $_cfg"
-  # keep only the 3 newest backups
   ls -1t "$_cfg".probe-backup.* 2>/dev/null | tail -n +4 | while IFS= read -r _f; do rm -f "$_f"; done
   uci -q delete "podkop.$SECTION.urltest_proxy_links"
   uci set "podkop.$SECTION.connection_type=proxy"
   uci set "podkop.$SECTION.proxy_config_type=urltest"
   while IFS= read -r _l; do uci add_list "podkop.$SECTION.urltest_proxy_links=$_l"; done < "$WORK/best"
-  uci commit podkop || die "uci commit failed, your old config is in $_bak"
-  _msg="podkop.$SECTION: URLTest with $(wc -l < "$WORK/best" | tr -d ' ') node(s); old config saved to $_bak"
-  info "$_msg"
-  info "restarting podkop ..."
-  if /etc/init.d/podkop restart; then
-    info "done. Check the state in LuCI -> Services -> Podkop."
-    [ "$CRON" = 1 ] && logger -t podkop-probe "$_msg" 2>/dev/null
+  uci commit podkop || die "uci commit failed, your old settings are in $_bak"
+  _nb=$(wc -l < "$WORK/best" | tr -d ' ')
+  if /etc/init.d/podkop restart >/dev/null 2>&1; then
+    info "podkop updated: URLTest with $_nb server(s), restarted"
+    [ "$CRON" = 1 ] && logger -t podkop-probe "podkop updated: URLTest with $_nb server(s), restarted" 2>/dev/null
   else
-    warn "podkop restart failed. Restore with: cp $_bak $_cfg && /etc/init.d/podkop restart"
+    warn "podkop restart failed. Undo: cp $_bak $_cfg && /etc/init.d/podkop restart"
     [ "$CRON" = 1 ] && logger -t podkop-probe "podkop restart failed after update, backup: $_bak" 2>/dev/null
   fi
+  [ "$VERBOSE" = 1 ] && info "old settings saved in $_bak"
+  return 0
 }
 
+HAVE_PODKOP=0
+[ -f /etc/config/podkop ] && command -v uci >/dev/null 2>&1 && HAVE_PODKOP=1
+cp "$WORK/best" /tmp/podkop-probe-best.txt 2>/dev/null
+
 if [ "$APPLY" != no ] && [ -s "$WORK/best" ] && case "$SOURCE" in podkop*) false ;; *) true ;; esac; then
-  _nb=$(wc -l < "$WORK/best" | tr -d ' ')
-  cp "$WORK/best" "/tmp/podkop-probe-best.txt" 2>/dev/null &&
-    info "best $_nb link(s) saved to /tmp/podkop-probe-best.txt"
-  if [ -f /etc/config/podkop ] && command -v uci >/dev/null 2>&1; then
+  if [ "$HAVE_PODKOP" = 0 ]; then
+    info "podkop not found; the best links are in /tmp/podkop-probe-best.txt"
+  else
     uci -q get "podkop.$SECTION" >/dev/null || die "podkop has no section '$SECTION' (use --section)"
-    echo
-    printf '%sBest %s node(s) to put into podkop (lowest latency + fastest, one per server where possible):%s\n' "$BD" "$_nb" "$R0"
-    sed 's/^/  /' "$WORK/best.names"
+    _go=1
     if [ "$APPLY" != yes ] && [ -n "$TTY" ]; then
-      printf 'Press Enter to take these, or type the # numbers you want instead (e.g. 35 41 44): '
-      read -r _sel < "$TTY" || _sel=""
-      _sel=$(printf '%s' "$_sel" | tr -c '0-9\n' ' ')
-      if [ -n "$(printf '%s' "$_sel" | tr -d ' ')" ]; then
-        : > "$WORK/best"; : > "$WORK/best.names"; : > "$WORK/best.ips"
-        for _n in $_sel; do
-          if [ -f "$WORK/n/$_n/link" ] && [ -f "$WORK/n/$_n/result" ]; then
-            grep -q "^#$_n " "$WORK/best.names" || pick "$_n"
-          else
-            warn "#$_n is not a tested node with a link, ignored"
-          fi
-        done
-        _nb=$(wc -l < "$WORK/best" | tr -d ' ')
-        [ "$_nb" -gt 0 ] || { info "nothing chosen, podkop settings left unchanged"; exit 0; }
-        cp "$WORK/best" "/tmp/podkop-probe-best.txt" 2>/dev/null
-        printf '%sYour choice:%s\n' "$BD" "$R0"
-        sed 's/^/  /' "$WORK/best.names"
-      fi
+      _nb=$(wc -l < "$WORK/best" | tr -d ' ')
+      echo
+      printf '%sPut the %s marked (*) server(s) into podkop and restart it?%s\n' "$BD" "$_nb" "$R0"
+      printf 'Enter = yes, n = no, or type other numbers (e.g. 50 41 35): '
+      read -r _sel < "$TTY" || _sel=n
+      case "$_sel" in
+        n|N|no|No|н|Н|нет) _go=0 ;;
+        *[0-9]*)
+          : > "$WORK/best"; : > "$WORK/best.names"; : > "$WORK/best.ips"
+          for _n in $(printf '%s' "$_sel" | tr -c '0-9\n' ' '); do
+            if [ -f "$WORK/n/$_n/link" ] && [ -f "$WORK/n/$_n/result" ]; then
+              grep -q "^#$_n " "$WORK/best.names" || pick "$_n"
+            else
+              warn "#$_n is not a tested server, ignored"
+            fi
+          done
+          [ -s "$WORK/best" ] || _go=0 ;;
+      esac
     fi
-    if [ "$APPLY" = yes ] || ask_yn "Replace podkop '$SECTION' proxy with a URLTest of these $_nb node(s) and restart podkop"; then
-      apply_podkop
-    else
-      info "podkop settings left unchanged"
-    fi
+    if [ "$_go" = 1 ]; then apply_podkop; else info "podkop not changed"; fi
   fi
 elif [ "$CRON" = 1 ]; then
-  warn "no working nodes found, podkop settings left unchanged"
-  logger -t podkop-probe "no working nodes found, podkop left unchanged" 2>/dev/null
+  warn "no working servers found, podkop not changed"
+  logger -t podkop-probe "no working servers found, podkop not changed" 2>/dev/null
 fi
 
-# offer to repeat this every night
-if [ -n "$SUBS" ] && [ "$CRON" = 0 ] && [ -n "$TTY" ] && [ "$ASSUME_YES" = 0 ] && [ -d "${CRONTAB%/*}" ]; then
-  _same=0
-  nightly_on && [ "$( . "$CONF"; printf '%s' "$SUBS" )" = "$(printf '%s' "$SUBS")" ] && _same=1
-  if [ "$_same" = 0 ]; then
+# offer the nightly run (install + saved keys) once, or when the keys changed
+if [ -n "$SUBS" ] && [ "$CRON" = 0 ] && [ -n "$TTY" ] && [ "$ASSUME_YES" = 0 ] && [ "$HAVE_PODKOP" = 1 ]; then
+  _saved_c=$( [ -f "$CONF" ] && . "$CONF" && printf '%s' "$COUNTRIES" )
+  if [ ! -x "$BIN" ] || [ "$SUBS" != "$SAVED_SUBS" ] || [ "$COUNTRIES" != "$_saved_c" ]; then
     echo
-    if ask_yn "Do this automatically every night (re-test these subscriptions, update podkop)"; then
-      ask_time && nightly_install
+    if ask_yn "Repeat this every night? (installs podkop-probe and saves these keys)"; then
+      nightly_install
     fi
   fi
 fi
