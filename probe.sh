@@ -1428,7 +1428,8 @@ END {
 pick() { # <n>: add node n to the pick list
   cat "$WORK/n/$1/link" >> "$WORK/best"
   IFS="$TAB" read -r _s _ok _tot _mn _md _p9 _xi _xc _sp _nm < "$WORK/n/$1/result"
-  printf '#%-3s median %6ss %7s Mbit/s  %s\n' "$1" "$_md" "$_sp" "$_nm" >> "$WORK/best.names"
+  _sp=$(cat "$WORK/n/$1/speed" 2>/dev/null); [ -n "$_sp" ] || _sp=-   # measured after the result line
+  printf '#%-3s median %6ss %7s Mbit/s  %-3s %s\n' "$1" "$_md" "$_sp" "$_xc" "$_nm" >> "$WORK/best.names"
   echo "$_xi" >> "$WORK/best.ips"
 }
 while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
