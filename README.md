@@ -16,6 +16,12 @@ On the router (SSH), same style as the podkop installer:
 sh <(wget -O - https://github.com/dkagramanyan/podkop-keys-availability-/releases/latest/download/probe.sh)
 ```
 
+Or straight from the `main` branch (no release needed):
+
+```sh
+sh <(wget -O - https://raw.githubusercontent.com/dkagramanyan/podkop-keys-availability-/main/probe.sh)
+```
+
 You get a menu:
 
 ```
@@ -177,6 +183,14 @@ and falls back to the links stored in `/etc/config/podkop`.
   - `-j` is chosen from free RAM.
 - Better report: verdicts, fail %, min/median/p90, exit country, sorted
   table, a *Problems* section in plain words, the best node, and CSV export.
+
+## Making a release
+
+Bump `VERSION=` in `probe.sh`, merge to `main`, then either push a tag
+(`git tag v1.0.1 && git push origin v1.0.1`) or run the **release** workflow
+from the Actions tab with the tag name. The workflow lints the script, checks
+that the version matches the tag, and publishes `probe.sh` as a release
+asset. The `releases/latest/download/probe.sh` link always points to it.
 
 ## Русский (кратко)
 
