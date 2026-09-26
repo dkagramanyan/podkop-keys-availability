@@ -12,12 +12,12 @@
 #
 # https://github.com/dkagramanyan/podkop-keys-availability-
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 REPO_URL="https://github.com/dkagramanyan/podkop-keys-availability-"
-SELF_URLS="$REPO_URL/releases/latest/download/probe.sh
-https://raw.githubusercontent.com/dkagramanyan/podkop-keys-availability-/main/probe.sh"
-BIN=/usr/bin/podkop-probe
-CONF=/etc/podkop-probe.conf
+RELEASE_URL="$REPO_URL/releases/latest/download/probe.sh"
+# left over by versions <= 1.5 that installed their own nightly job
+OLD_BIN=/usr/bin/podkop-probe
+OLD_CONF=/etc/podkop-probe.conf
 CRONTAB=/etc/crontabs/root
 PODKOP_INSTALL="sh <(wget -O - https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh)"
 
@@ -38,7 +38,7 @@ LINE_URL="https://fsn1-speed.hetzner.com/100MB.bin"
 # until SPEED_T is used up (Cloudflare refuses single requests of 100 MB)
 SPEED_URLS="https://speed.cloudflare.com/__down?bytes=25000000
 https://fsn1-speed.hetzner.com/100MB.bin"
-NIGHTLY=""; NIGHTLY_OFF=0; CRON=0
+CRON=0; CRON_TIME=""; NIGHTLY_OFF=0
 COUNTRIES=all
 # Subscription panels (Remnawave, Marzban, 3x-ui...) only hand the real server
 # list to client apps they know, so we introduce ourselves like those apps.
@@ -102,11 +102,12 @@ Podkop (for link sources: -s, -f, links):
   --no-apply        never offer to change podkop settings
   --section NAME    podkop section to write to                (default $SECTION)
 
-Nightly auto-update (OpenWrt cron):
-  --nightly HH:MM   every night re-test the -s subscriptions and put the best
-                    --top nodes into podkop; installs $BIN
-                    and saves the settings to $CONF
-  --nightly-off     turn the nightly job off
+Nightly run (paste a line into LuCI -> System -> Scheduled Tasks):
+  --cron-line HH:MM print that line for the -s subscriptions and options
+                    given, e.g. --cron-line 04:30
+  --cron            unattended run, used by that line: no questions, puts
+                    the best nodes into podkop, logs to syslog
+  --nightly-off     remove the nightly job installed by versions <= 1.5
 
 Output:
   -o FILE           also save results as CSV
@@ -121,7 +122,7 @@ Examples:
   sh probe.sh -q                           # fast check, 10 requests per node
   sh probe.sh -s https://example.com/sub   # test a subscription, offer best 10
   sh probe.sh -s https://a.example/sub -s https://b.example/sub --top 5 --apply -y
-  sh probe.sh -s https://a.example/sub -s https://b.example/sub --nightly 04:00
+  sh probe.sh -s https://a.example/sub -s https://b.example/sub --countries europe --cron-line 04:30
   sh probe.sh 'vless://...#de' 'trojan://...#nl'
 EOF
   exit "${1:-0}"
@@ -161,7 +162,7 @@ is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -gt 0 ]; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    -f|-s|-C|--config|-n|-c|-j|-t|-u|-p|-o|--top|--section|--speed-url|--nightly|--countries|--speed-jobs)
+    -f|-s|-C|--config|-n|-c|-j|-t|-u|-p|-o|--top|--section|--speed-url|--cron-line|--countries|--speed-jobs)
       [ $# -ge 2 ] || { echo "option $1 needs a value" >&2; usage 1; }
       case "$1" in
         -f) FILE="$2" ;; -s) SUBS="$SUBS$2
@@ -169,7 +170,7 @@ while [ $# -gt 0 ]; do
         -n) N="$2" ;; -c) C="$2" ;; -j) J="$2" ;; -t) T="$2" ;;
         -u) URL="$2" ;; -p) BASEPORT="$2" ;; -o) CSV="$2" ;;
         --top) TOP="$2" ;; --section) SECTION="$2" ;;
-        --speed-url) SPEED_URL="$2" ;; --nightly) NIGHTLY="$2" ;;
+        --speed-url) SPEED_URL="$2" ;; --cron-line) CRON_TIME="$2" ;;
         --speed-jobs) SPEED_J="$2" ;;
         --countries) COUNTRIES="$2" ;;
       esac
@@ -193,12 +194,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# nightly run from cron: settings come from the saved config
+# unattended run from cron: everything comes from the command line
 if [ "$CRON" = 1 ]; then
-  [ -f "$CONF" ] || { echo "no $CONF, nothing to do" >&2; exit 1; }
-  . "$CONF"
+  [ -n "$SUBS$ARGLINKS$FILE" ] || { echo "--cron needs subscriptions (-s URL) or links" >&2; exit 1; }
   ASSUME_YES=1; APPLY=yes; COLOR=0; TTY=""
-  case "$SPEED_URL" in *speed.cloudflare.com/__down*) SPEED_URL="" ;; esac   # old defaults
 fi
 
 for _v in N C T BASEPORT TOP; do
@@ -733,7 +732,7 @@ menu() {
   echo "  2) Enter one or more subscription URLs (main keys), test all their"
   echo "     nodes and put the best $TOP by ping and speed into podkop (URLTest)"
   echo "  3) Paste links to test"
-  echo "  4) Nightly auto-update: $(nightly_status)"
+  echo "  4) Get a line for a nightly run (LuCI -> System -> Scheduled Tasks)"
   echo "  q) Quit"
   printf '> '
   read -r _m < "$TTY" || exit 1
@@ -741,7 +740,7 @@ menu() {
     1|"") MODE=podkop ;;
     2) ask_subs || die "no subscription URL given"; ask_countries; MODE=sub ;;
     3) MODE="paste" ;;
-    4) nightly_menu; exit 0 ;;
+    4) ask_subs || die "no subscription URL given"; ask_countries; ask_time; cron_line; exit 0 ;;
     *) exit 0 ;;
   esac
 }
@@ -1027,118 +1026,59 @@ print_progress() {
 }
 
 
-# --- nightly auto-update -----------------------------------------------------
+# --- nightly run -------------------------------------------------------------
 
 shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
-nightly_on() { [ -f "$CONF" ] && grep -q 'podkop-probe --cron' "$CRONTAB" 2>/dev/null; }
-
-nightly_status() {
-  if nightly_on; then
-    ( . "$CONF"; printf 'ON at %s, %s subscription(s), best %s, %s' "${NIGHTLY:-?}" "$(printf '%s' "$SUBS" | grep -c .)" "$TOP" "$(countries_label)" )
-  else
-    echo "off"
-  fi
+ask_time() {
+  printf 'Time to run every night, HH:MM [%s]: ' "${CRON_TIME:-04:30}"
+  read -r _t < "$TTY" || _t=""
+  CRON_TIME=${_t:-${CRON_TIME:-04:30}}
 }
 
-# copy this script to $BIN (download it when we run from a pipe)
-install_self() {
-  _src=""
-  case "$0" in /dev/*|/proc/*|sh|-sh|ash|-ash) ;; *) [ -f "$0" ] && _src=$0 ;; esac
-  if [ -n "$_src" ] && grep -q '^VERSION=' "$_src"; then
-    [ "$_src" -ef "$BIN" ] && return 0
-    cp "$_src" "$BIN.new" || return 1
-  else
-    set -f
-    for _u in $SELF_URLS; do
-      fetch "$_u" > "$BIN.new" 2>/dev/null && grep -q '^VERSION=' "$BIN.new" && break
-      rm -f "$BIN.new"
-    done
-    set +f
-  fi
-  [ -s "$BIN.new" ] || return 1
-  chmod +x "$BIN.new" && mv "$BIN.new" "$BIN"
+# cron_line: print the crontab line for LuCI -> System -> Scheduled Tasks.
+# It downloads the latest release each night and runs it with --cron and
+# the subscriptions/options of this run.
+cron_line() {
+  case "$CRON_TIME" in [0-9]:[0-5][0-9]|[01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;;
+    *) die "time must be HH:MM, got '$CRON_TIME'" ;; esac
+  _h=$(echo "${CRON_TIME%%:*}" | sed 's/^0\(.\)/\1/'); _mi=$(echo "${CRON_TIME#*:}" | sed 's/^0\(.\)/\1/')
+  _args=""
+  set -f
+  for _u in $SUBS; do _args="$_args -s $(shq "$_u")"; done
+  set +f
+  case "$COUNTRIES" in all|"") ;; *) _args="$_args --countries $(shq "$COUNTRIES")" ;; esac
+  [ "$TOP" != 10 ] && _args="$_args --top $TOP"
+  [ "$SECTION" != main ] && _args="$_args --section $(shq "$SECTION")"
+  [ -n "$SPEED_J" ] && _args="$_args --speed-jobs $SPEED_J"
+  [ "$ENTRY_CHECK" = 0 ] && _args="$_args --no-entry-check"
+  # "%" means "new line" in crontab, so it has to be escaped
+  _cmd=$(printf 'wget -q -O /tmp/podkop-probe.sh %s && sh /tmp/podkop-probe.sh --cron%s > /tmp/podkop-probe.log 2>&1' \
+    "$RELEASE_URL" "$_args" | sed 's/%/\\%/g')
+  echo
+  printf '%sTo run this every night at %s, paste this line into LuCI -> System -> Scheduled Tasks%s\n' "$BD" "$CRON_TIME" "$R0"
+  printf '%s(or add it to %s), then Save:%s\n\n' "$BD" "$CRONTAB" "$R0"
+  printf '%s %s * * * %s\n\n' "$_mi" "$_h" "$_cmd"
+  echo "It downloads the latest podkop-probe, tests your subscriptions, puts the best"
+  echo "servers into podkop and restarts it (only if the list changed). Last run:"
+  echo "/tmp/podkop-probe.log; changes also go to the system log (logread -e podkop-probe)."
+  echo "The time is the router's local time (LuCI -> System -> System -> Timezone)."
 }
 
-nightly_install() {
-  case "$NIGHTLY" in [0-9]:[0-5][0-9]|[01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;;
-    *) die "time must be HH:MM, got '$NIGHTLY'" ;; esac
-  [ -n "$SUBS" ] || die "nightly auto-update needs at least one subscription URL (-s)"
-  [ -d "${CRONTAB%/*}" ] || die "no ${CRONTAB%/*}: cron is not available here"
-  install_self || die "could not install $BIN"
-  {
-    echo "# podkop-probe nightly settings. Edit freely, or re-run: podkop-probe"
-    echo "SUBS=$(shq "$SUBS")"
-    echo "TOP=$TOP"; echo "N=$N"; echo "C=$C"; echo "T=$T"
-    echo "SECTION=$(shq "$SECTION")"
-    echo "URL=$(shq "$URL")"
-    echo "SPEED=$SPEED"
-    [ -n "$SPEED_J" ] && echo "SPEED_J=$SPEED_J"
-    echo "COUNTRIES=$(shq "$COUNTRIES")"
-    [ -n "$SPEED_URL" ] && echo "SPEED_URL=$(shq "$SPEED_URL")"
-    echo "NIGHTLY=$(shq "$NIGHTLY")"
-  } > "$CONF" || die "cannot write $CONF"
-  chmod 600 "$CONF"
-  _h=$(( $(echo "${NIGHTLY%%:*}" | sed 's/^0//') + 0 )); _mi=$(( $(echo "${NIGHTLY#*:}" | sed 's/^0//') + 0 ))
-  touch "$CRONTAB"
-  sed -i '/podkop-probe --cron/d' "$CRONTAB"
-  echo "$_mi $_h * * * $BIN --cron >/tmp/podkop-probe.log 2>&1" >> "$CRONTAB"
-  /etc/init.d/cron enable 2>/dev/null; /etc/init.d/cron restart >/dev/null 2>&1
-  for _f in "$BIN" "$CONF"; do
-    grep -qxF "$_f" /etc/sysupgrade.conf 2>/dev/null || echo "$_f" >> /etc/sysupgrade.conf
-  done
-  info "nightly auto-update is ON: every day at $NIGHTLY"
-  info "  subscriptions: $(printf '%s' "$SUBS" | grep -c .), $(countries_label), best $TOP node(s) go to podkop section '$SECTION'"
-  info "  settings: $CONF   last run log: /tmp/podkop-probe.log"
-  info "  run it now: $BIN --cron    turn off: $BIN --nightly-off"
-}
-
+# remove the nightly job that versions <= 1.5 installed themselves
 nightly_remove() {
   [ -f "$CRONTAB" ] && sed -i '/podkop-probe --cron/d' "$CRONTAB"
-  rm -f "$CONF"
+  rm -f "$OLD_CONF" "$OLD_BIN"
   /etc/init.d/cron restart >/dev/null 2>&1
-  info "nightly auto-update is OFF ($BIN is kept, delete it if you like)"
-}
-
-ask_time() {
-  printf 'Time to run every night, HH:MM [%s]: ' "${NIGHTLY:-04:00}"
-  read -r _t < "$TTY" || return 1
-  NIGHTLY=${_t:-${NIGHTLY:-04:00}}
-}
-
-nightly_menu() {
-  echo
-  if nightly_on; then
-    printf 'Nightly auto-update: %s\n' "$(nightly_status)"
-    ( . "$CONF"; printf '%s' "$SUBS" | sed 's/^/  /' )
-    echo "  1) change it   2) turn it off   Enter) back"
-    printf '> '; read -r _m < "$TTY" || return
-    case "$_m" in
-      1) ;;
-      2) nightly_remove; return ;;
-      *) return ;;
-    esac
-    _old=$( . "$CONF"; printf '%s' "$SUBS" ); _oldt=$( . "$CONF"; printf '%s' "$NIGHTLY" )
-    echo "(empty line right away keeps the current subscriptions)"
-    ask_subs || SUBS=$_old
-    NIGHTLY=$_oldt
-    ask_countries
-  else
-    echo "Every night the router re-tests your subscriptions and puts the best"
-    echo "$TOP nodes (by ping and speed) into podkop as URLTest, then restarts podkop."
-    ask_subs || die "no subscription URL given"
-    ask_countries
-  fi
-  ask_time || return
-  nightly_install
+  info "old nightly job removed ($OLD_CONF, $OLD_BIN and its crontab line)"
 }
 
 # --- main --------------------------------------------------------------------
 
 if [ "$NIGHTLY_OFF" = 1 ]; then nightly_remove; exit 0; fi
-if [ -n "$NIGHTLY" ] && [ "$CRON" = 0 ]; then
-  # fetch needs curl or wget only; no test run here
-  nightly_install; exit 0
+if [ -n "$CRON_TIME" ]; then
+  [ -n "$SUBS" ] || die "--cron-line needs the subscriptions: -s URL [-s URL ...]"
+  cron_line; exit 0
 fi
 
 if [ "$CRON" = 1 ]; then
@@ -1593,15 +1533,12 @@ elif [ "$CRON" = 1 ]; then
   logger -t podkop-probe "no working nodes found, podkop left unchanged" 2>/dev/null
 fi
 
-# offer to repeat this every night
-if [ -n "$SUBS" ] && [ "$CRON" = 0 ] && [ -n "$TTY" ] && [ "$ASSUME_YES" = 0 ] && [ -d "${CRONTAB%/*}" ]; then
-  _same=0
-  nightly_on && [ "$( . "$CONF"; printf '%s' "$SUBS" )" = "$(printf '%s' "$SUBS")" ] && _same=1
-  if [ "$_same" = 0 ]; then
-    echo
-    if ask_yn "Do this automatically every night (re-test these subscriptions, update podkop)"; then
-      ask_time && nightly_install
-    fi
+# how to repeat this every night
+if [ -n "$SUBS" ] && [ "$CRON" = 0 ] && [ -n "$TTY" ] && [ "$ASSUME_YES" = 0 ]; then
+  if grep -qs 'podkop-probe --cron' "$CRONTAB" && [ -f "$OLD_CONF" ]; then
+    warn "an old nightly job (from podkop-probe <= 1.5) is still installed; remove it with: sh probe.sh --nightly-off"
   fi
+  CRON_TIME=${CRON_TIME:-04:30}
+  cron_line
 fi
 exit 0
