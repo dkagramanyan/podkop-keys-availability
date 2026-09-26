@@ -235,11 +235,12 @@ and falls back to the links stored in `/etc/config/podkop`.
 
 ## Making a release
 
-Bump `VERSION=` in `probe.sh`, merge to `main`, then either push a tag
-(`git tag v1.1.1 && git push origin v1.1.1`) or run the **release** workflow
-from the Actions tab with the tag name. The workflow lints the script, checks
-that the version matches the tag, and publishes `probe.sh` as a release
-asset. The `releases/latest/download/probe.sh` link always points to it.
+Bump `VERSION=` in `probe.sh` and merge to `main`. The **release** workflow
+lints the script and publishes `probe.sh` as release `v<VERSION>`. It does
+this automatically whenever a push to `main` changes `probe.sh` and that
+version has no release yet. It can also run from a pushed `v*` tag, or by
+hand from the Actions tab. The
+`releases/latest/download/probe.sh` link always points to the newest one.
 
 ## Русский (кратко)
 
