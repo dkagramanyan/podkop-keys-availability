@@ -1,9 +1,10 @@
 # podkop-probe
 
 Tests all servers from your VPN subscriptions ("keys") on your OpenWrt
-router and puts the 10 best ones (fewest lost requests, lowest ping,
-highest speed, working YouTube) into [podkop](https://github.com/itdoginfo/podkop),
-once or every night. Needs podkop to be installed.
+router and puts the best ones into [podkop](https://github.com/itdoginfo/podkop),
+once or every night: the 10 fastest into the main section, and the 10 best
+for YouTube (no ads when possible) into a separate `youtube` section.
+Needs podkop to be installed.
 
 ## Run
 
@@ -16,9 +17,10 @@ sh <(wget -O - https://github.com/dkagramanyan/podkop-keys-availability-/release
 1. Press **Enter** (test my keys). Paste your keys, one per line, then
    press Enter on an empty line.
 2. Press **Enter** for "Europe only".
-3. Wait 2–7 minutes. The best 10 servers are marked `*` in the table.
+3. Wait 2–7 minutes. You get two tables: **Main** (picks marked `*`)
+   and **YouTube** (picks marked `y`).
 4. Press **Enter** to put them into podkop and restart it (`n` = no;
-   numbers = pick other servers).
+   numbers = pick other servers for main).
 5. At "Repeat this every night?" press **Enter**. This installs the
    `podkop-probe` command and saves your keys.
 
@@ -51,19 +53,23 @@ into podkop and restarts podkop. If nothing works, podkop is left alone.
 - **Run it now:** `podkop-probe --cron`
 - **Remove everything:** `podkop-probe --uninstall`
 
-## YouTube
+## What gets picked
 
-Every server is also checked with YouTube:
-
-- **`yt` column** = the country YouTube thinks you are in (the small code
-  next to the YouTube logo). `no` = YouTube doesn't play through this
-  server ("video unavailable" or "confirm you're not a bot"). Such servers
-  are never picked.
-- **No ads.** YouTube shows no ads when it thinks you are in Russia. If at
-  least 2 good servers show `RU`, only those are put into podkop. Otherwise
-  the normal top 10 is used.
-- Turn it off: `--no-youtube`. Other ad-free countries:
-  `--youtube-noads RU,BY` (`none` = don't prefer any).
+- **Main section** (`main`, all your lists): fewest lost requests, lowest
+  ping, highest speed. Servers with ping of 700 ms or more, or speed under
+  30 Mbit/s, are never picked (`--max-ping 500`, `--min-speed 50` to change).
+- **YouTube section** (`youtube`): the fast servers are also checked with
+  YouTube, and ranked by ping to YouTube and speed.
+  - The `yt` column shows the country YouTube thinks you are in (the small
+    code next to the YouTube logo). `no` means YouTube doesn't play there
+    ("video unavailable" or "confirm you're not a bot"), so it isn't picked.
+  - YouTube shows no ads in Russia, so if at least 2 servers show `RU`,
+    only those are used.
+  - On the first run the script creates this section with podkop's
+    **YouTube** list and puts it **above** `main`. That order matters: lists
+    like "Russia inside" also contain YouTube, and the first section wins.
+    You don't need to add any domains yourself.
+  - `--no-youtube` leaves the YouTube section alone.
 
 ## Undo
 
@@ -101,8 +107,9 @@ cp /etc/config/podkop.probe-backup.<date> /etc/config/podkop && /etc/init.d/podk
 3. Каждую ночь: в LuCI откройте **Система → Планировщик**, добавьте
    строку `30 4 * * * podkop-probe --cron` и нажмите «Сохранить». `cron`
    должен быть включён (**Система → Загрузка**).
-4. YouTube: колонка `yt` показывает страну, которую видит YouTube, а `no`
-   значит, что видео не открываются (такие серверы не выбираются). Если
-   есть хотя бы 2 хороших сервера с `RU` (там нет рекламы), в podkop
-   попадут только они.
+4. Серверы с пингом от 700 мс или скоростью меньше 30 Мбит/с не
+   выбираются. Для YouTube скрипт сам создаёт в podkop секцию `youtube`
+   (список YouTube, выше `main`) и кладёт туда серверы, где YouTube
+   работает; если есть хотя бы 2 сервера, где YouTube видит `RU`
+   (без рекламы), только их.
 5. Лог: `/tmp/podkop-probe.log`. Удалить всё: `podkop-probe --uninstall`.
