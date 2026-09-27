@@ -1,9 +1,11 @@
 # podkop-probe
 
 Tests all servers from your VPN subscriptions ("keys") on your OpenWrt
-router and puts the 10 best ones (fewest lost requests, lowest ping,
-highest speed, working YouTube) into [podkop](https://github.com/itdoginfo/podkop),
-once or every night. Needs podkop to be installed.
+router and puts the best ones into [podkop](https://github.com/itdoginfo/podkop),
+once or every night, as two lists: the 10 fastest servers for the main
+section, and the 10 fastest where YouTube sees Russia (no ads) for a
+separate `youtube` section.
+Needs podkop to be installed.
 
 ## Run
 
@@ -16,9 +18,11 @@ sh <(wget -O - https://github.com/dkagramanyan/podkop-keys-availability-/release
 1. Press **Enter** (test my keys). Paste your keys, one per line, then
    press Enter on an empty line.
 2. Press **Enter** for "Europe only".
-3. Wait 2–7 minutes. The best 10 servers are marked `*` in the table.
-4. Press **Enter** to put them into podkop and restart it (`n` = no;
-   numbers = pick other servers).
+3. Wait 2–7 minutes. You get two tables: **Main** (picks marked `*`)
+   and **YouTube** (picks marked `y`).
+4. Choose what goes into podkop (then it restarts):
+   **Enter** = both lists, `1` = only main, `2` = only YouTube,
+   `3` = other sections (you type their names), `n` = nothing.
 5. At "Repeat this every night?" press **Enter**. This installs the
    `podkop-probe` command and saves your keys.
 
@@ -51,19 +55,23 @@ into podkop and restarts podkop. If nothing works, podkop is left alone.
 - **Run it now:** `podkop-probe --cron`
 - **Remove everything:** `podkop-probe --uninstall`
 
-## YouTube
+## What gets picked
 
-Every server is also checked with YouTube:
-
-- **`yt` column** = the country YouTube thinks you are in (the small code
-  next to the YouTube logo). `no` = YouTube doesn't play through this
-  server ("video unavailable" or "confirm you're not a bot"). Such servers
-  are never picked.
-- **No ads.** YouTube shows no ads when it thinks you are in Russia. If at
-  least 2 good servers show `RU`, only those are put into podkop. Otherwise
-  the normal top 10 is used.
-- Turn it off: `--no-youtube`. Other ad-free countries:
-  `--youtube-noads RU,BY` (`none` = don't prefer any).
+- **Both lists:** servers with ping of 700 ms or more, or speed of 40 Mbit/s
+  or less, are never picked (`--max-ping 500`, `--min-speed 60` to change).
+- **Main list → section `main`:** fewest lost requests, lowest ping, highest
+  speed.
+- **YouTube list → section `youtube`:** only servers where YouTube sees
+  **RU** (the small code next to the YouTube logo; Russia gets no ads),
+  ranked by ping to YouTube and speed. If there are none, the section is
+  left alone. `yt` = the country YouTube sees, `no` = YouTube doesn't play.
+- The first time, the script creates the `youtube` section with podkop's
+  **YouTube** list and puts it **above** `main`. That order matters: lists
+  like "Russia inside" also contain YouTube, and the first section wins.
+  You don't need to add any domains yourself.
+- Nightly run: both lists by default; `--apply-to main` or
+  `--apply-to youtube` (saved with `--install`). `--no-youtube` skips the
+  YouTube list.
 
 ## Undo
 
@@ -101,8 +109,10 @@ cp /etc/config/podkop.probe-backup.<date> /etc/config/podkop && /etc/init.d/podk
 3. Каждую ночь: в LuCI откройте **Система → Планировщик**, добавьте
    строку `30 4 * * * podkop-probe --cron` и нажмите «Сохранить». `cron`
    должен быть включён (**Система → Загрузка**).
-4. YouTube: колонка `yt` показывает страну, которую видит YouTube, а `no`
-   значит, что видео не открываются (такие серверы не выбираются). Если
-   есть хотя бы 2 хороших сервера с `RU` (там нет рекламы), в podkop
-   попадут только они.
+4. Получаются два списка: быстрые серверы для `main` и быстрые серверы,
+   где YouTube видит `RU` (без рекламы), для секции `youtube` (скрипт
+   сам создаёт её со списком YouTube выше `main`). Серверы с пингом от
+   700 мс или скоростью до 40 Мбит/с не берутся. В конце: Enter = оба
+   списка, 1 = только main, 2 = только YouTube, 3 = другие секции,
+   n = ничего.
 5. Лог: `/tmp/podkop-probe.log`. Удалить всё: `podkop-probe --uninstall`.
