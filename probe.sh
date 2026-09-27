@@ -40,13 +40,14 @@ SPEED_URLS="https://speed.cloudflare.com/__down?bytes=25000000
 https://fsn1-speed.hetzner.com/100MB.bin"
 # servers slower than this are never picked
 MAX_PING=700                         # ms, median
-MIN_SPEED=30                         # Mbit/s
+MIN_SPEED=40                         # Mbit/s: this or less is too slow
 # YouTube part: the servers that pass are checked with YouTube (does a video
 # play, which country YouTube thinks it is in, ping to YouTube itself) and
 # the best go into their own podkop section YT_SECTION (the "youtube" list,
 # placed before the main section). No ads are sold in YT_NOADS countries, so
 # servers YouTube places there are preferred.
 YOUTUBE=1; YT_NOADS=RU; YT_SECTION=youtube
+APPLY_TO=both                        # both, main or youtube: which lists go into podkop
 YT_PING_URL="https://www.youtube.com/generate_204"
 YT_VIDEO=jNQXAC9IVRw                 # "Me at the zoo": public everywhere, never removed
 YT_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
@@ -95,8 +96,8 @@ Sources:
 Test:
   -n N              requests per node               (default $N)
   -c N              requests in flight per node     (default $C)
-  -j N              nodes tested at the same time   (default 1: one at a time,
-                    so tests don't share the line; speed tests always are)
+  -j N              nodes tested at the same time   (default 6, fewer if
+                    RAM is short; speed tests use --speed-jobs)
   -t SEC            timeout per request, seconds    (default $T)
   -u URL            target URL                      (default $URL)
   -q                quick run:    -n 12, 4 s speed test
@@ -107,7 +108,7 @@ Test:
                     speed, 1 per ~200 Mbit/s, max 3)
   --speed-url URL   file for the speed test (default: Cloudflare, then Hetzner)
   --max-ping MS     never pick servers with a higher median ping (default $MAX_PING)
-  --min-speed MBIT  never pick servers slower than this (default $MIN_SPEED, 0 = off)
+  --min-speed MBIT  never pick servers at or below this speed (default $MIN_SPEED)
 
 YouTube (a separate podkop section for YouTube traffic):
   --no-youtube      skip the YouTube part, leave that section alone
@@ -115,6 +116,8 @@ YouTube (a separate podkop section for YouTube traffic):
                     servers YouTube places there are picked first ('none' = off)
   --yt-section NAME podkop section for YouTube (default $YT_SECTION; created
                     with the YouTube list and placed before --section)
+  --apply-to WHAT   both (default), main or youtube: which list goes into
+                    podkop with --apply and in the nightly run
 
 Podkop (for link sources: -s, -f, links):
   --top N           how many best nodes to offer for podkop   (default $TOP)
@@ -186,7 +189,7 @@ is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -gt 0 ]; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    -f|-s|-C|--config|-n|-c|-j|-t|-u|-p|-o|--top|--section|--speed-url|--cron-line|--countries|--speed-jobs|--youtube-noads|--max-ping|--min-speed|--yt-section)
+    -f|-s|-C|--config|-n|-c|-j|-t|-u|-p|-o|--top|--section|--speed-url|--cron-line|--countries|--speed-jobs|--youtube-noads|--max-ping|--min-speed|--yt-section|--apply-to)
       [ $# -ge 2 ] || { echo "option $1 needs a value" >&2; usage 1; }
       case "$1" in
         -f) FILE="$2" ;; -s) SUBS="$SUBS$2
@@ -198,6 +201,7 @@ while [ $# -gt 0 ]; do
         --speed-jobs) SPEED_J="$2"; SPEED_J_USER=$2 ;;
         --countries) COUNTRIES="$2" ;;
         --max-ping) MAX_PING="$2" ;; --min-speed) MIN_SPEED="$2" ;; --yt-section) YT_SECTION="$2" ;;
+        --apply-to) APPLY_TO="$2" ;;
         --youtube-noads) YT_NOADS=$(printf '%s' "$2" | tr 'a-z,' 'A-Z ' | sed 's/\bNONE\b//g; s/^ *//; s/ *$//') ;;
       esac
       shift 2 ;;
@@ -233,6 +237,7 @@ if [ "$CRON" = 1 ]; then
   ASSUME_YES=1; APPLY=yes; COLOR=0; TTY=""
 fi
 
+case "$APPLY_TO" in both|main|youtube) ;; *) die "--apply-to must be both, main or youtube" ;; esac
 case "$MIN_SPEED" in ''|*[!0-9]*) die "--min-speed must be a number, got '$MIN_SPEED'" ;; esac
 for _v in N C T BASEPORT TOP MAX_PING; do
   eval "_x=\$$_v"; is_uint "$_x" || die "$_v must be a positive number, got '$_x'"
@@ -943,12 +948,17 @@ fire() {
   fi
 }
 
-# speed_node <idx>: start the node again and measure its speed
+# speed_node <idx>: start the node again, measure its speed and, if fast
+# enough, check YouTube through it
 speed_node() {
   _sn=$1
   if sb_start "$_sn"; then
     _px="socks5h://127.0.0.1:$_port"
     speed_measure "$WORK/n/$_sn"
+    # fast enough: check YouTube now, while the node is up
+    if [ "$YOUTUBE" = 1 ] && awk -v s="$(cat "$WORK/n/$_sn/speed")" -v y="$MIN_SPEED" 'BEGIN { exit !(s + 0 > y) }'; then
+      yt_measure "$_sn"
+    fi
   else
     echo "0.0" > "$WORK/n/$_sn/speed"; echo "sing-box did not start" > "$WORK/n/$_sn/speed.why"
   fi
@@ -1090,27 +1100,37 @@ fast_enough() {
   case "$(verdict "$_fs" "$_fok" "$_ftot")" in GOOD|OK|FLAKY) ;; *) return 1 ;; esac
   awk -v m="$_fmd" -v s="$(cat "$WORK/n/$1/speed" 2>/dev/null)" -v x="$MAX_PING" -v y="$MIN_SPEED" -v sp="$SPEED" 'BEGIN {
     if (m == "-" || m * 1000 >= x) exit 1
-    if (sp == 1 && y > 0 && (s == "" || s + 0 < y)) exit 1 }'
+    if (sp == 1 && (s == "" || s + 0 <= y)) exit 1 }'
 }
 
-# yt_node <n>: start node n again: YouTube check -> yt, and if YouTube
-# plays, the median ping to YouTube itself -> yt.ms
-yt_node() {
+# yt_measure <n>: through the running node ($_px): YouTube check -> yt,
+# and if YouTube plays, the median ping to YouTube itself -> yt.ms
+yt_measure() {
   _yd="$WORK/n/$1"
+  yt_check > "$_yd/yt"
+  read -r _ys _yc < "$_yd/yt"
+  [ "$_ys" = ok ] || return 0
+  # only servers YouTube places in a YT_NOADS country go into the YouTube
+  # list, so the others need no YouTube ping
+  [ -n "$YT_NOADS" ] && case " $YT_NOADS " in *" $_yc "*) ;; *) return 0 ;; esac
+  : > "$_yd/yt.times"
+  fire "$WORK/ytreq.cfg" "$_yd/yt.times"
+  # at least half must get through, or YouTube is too unreliable here
+  awk '$1 != "000" { print $2 }' "$_yd/yt.times" | sort -n | awk -v tot="$(wc -l < "$_yd/yt.times")" '
+    { a[++k] = $1 }
+    END { if (k * 2 < tot || !k) exit 1; printf "%.3f\n", (k % 2) ? a[(k + 1) / 2] : (a[k / 2] + a[k / 2 + 1]) / 2 }' > "$_yd/yt.ms" ||
+    { rm -f "$_yd/yt.ms"; sed -i 's/^ok /no /' "$_yd/yt"; }
+  return 0
+}
+
+# yt_node <n>: start node n again for yt_measure (only needed without the
+# speed test, which otherwise does it while the node runs)
+yt_node() {
   if sb_start "$1"; then
     _px="socks5h://127.0.0.1:$_port"
-    yt_check > "$_yd/yt"
-    if [ "$(cut -d ' ' -f 1 "$_yd/yt")" = ok ]; then
-      : > "$_yd/yt.times"
-      fire "$WORK/ytreq.cfg" "$_yd/yt.times"
-      # at least half must get through, or YouTube is too unreliable here
-      awk '$1 != "000" { print $2 }' "$_yd/yt.times" | sort -n | awk -v tot="$(wc -l < "$_yd/yt.times")" '
-        { a[++k] = $1 }
-        END { if (k * 2 < tot || !k) exit 1; printf "%.3f\n", (k % 2) ? a[(k + 1) / 2] : (a[k / 2] + a[k / 2 + 1]) / 2 }' > "$_yd/yt.ms" ||
-        { rm -f "$_yd/yt.ms"; sed -i 's/^ok /no /' "$_yd/yt"; }
-    fi
+    yt_measure "$1"
   else
-    echo "fail -" > "$_yd/yt"
+    echo "fail -" > "$WORK/n/$1/yt"
   fi
   sb_stop "$1"
 }
@@ -1203,8 +1223,9 @@ save_conf() {
     [ "$YOUTUBE" = 0 ] && echo "YOUTUBE=0"
     [ "$YT_NOADS" != RU ] && echo "YT_NOADS=$(shq "$YT_NOADS")"
     [ "$YT_SECTION" != youtube ] && echo "YT_SECTION=$(shq "$YT_SECTION")"
+    [ "$APPLY_TO" != both ] && echo "APPLY_TO=$APPLY_TO"
     [ "$MAX_PING" != 700 ] && echo "MAX_PING=$MAX_PING"
-    [ "$MIN_SPEED" != 30 ] && echo "MIN_SPEED=$MIN_SPEED"
+    [ "$MIN_SPEED" != 40 ] && echo "MIN_SPEED=$MIN_SPEED"
     :
   } > "$CONF" || return 1
   chmod 600 "$CONF"
@@ -1396,13 +1417,13 @@ if [ "$COUNT" -eq 0 ]; then
   exit 1
 fi
 
-# latency tests of up to 4 nodes run side by side: they are small requests
+# latency tests of up to 6 nodes run side by side: they are small requests
 # that don't disturb each other (~40 MB of RAM per node). Speed tests always
 # run one at a time afterwards, with nothing else going on.
 _mem=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null)
 _max=$(( ${_mem:-160} / 40 )); [ "$_max" -lt 1 ] && _max=1
 if [ -z "$J" ]; then
-  J=4; [ "$J" -gt "$_max" ] && J=$_max
+  J=6; [ "$J" -gt "$_max" ] && J=$_max
 elif [ "$J" -gt "$_max" ]; then
   warn "-j $J needs more free RAM, using $_max"; J=$_max
 fi
@@ -1517,19 +1538,22 @@ if [ "$SPEED" = 1 ]; then
       [ "$_n" = "$_src" ] && continue
       [ -f "$WORK/n/$_src/speed" ] && cp "$WORK/n/$_src/speed" "$WORK/n/$_n/speed"
       [ -f "$WORK/n/$_src/speed.why" ] && cp "$WORK/n/$_src/speed.why" "$WORK/n/$_n/speed.why"
+      for _f in yt yt.ms; do [ -f "$WORK/n/$_src/$_f" ] && cp "$WORK/n/$_src/$_f" "$WORK/n/$_n/$_f"; done
     done < "$WORK/speed.map"
   fi
 fi
 
 # --- YouTube -----------------------------------------------------------------
 
-# the servers fast enough to be picked, checked with YouTube, 4 at a time
-# (one check per server/port/transport, like the speed test)
+# normally the speed test has already checked YouTube on the fast servers;
+# the rest (e.g. with --no-speed) are checked here, 4 at a time, one check
+# per server/port/transport
 : > "$WORK/ytlist"
 if [ "$YOUTUBE" = 1 ]; then
   _i=0
   while [ "$_i" -lt "$COUNT" ]; do
     _i=$((_i + 1))
+    [ -f "$WORK/n/$_i/yt" ] && continue
     fast_enough "$_i" && printf '%s\t%s\n' "$_i" "$(same_key "$_i")" >> "$WORK/ytlist"
   done
 fi
@@ -1591,7 +1615,7 @@ awk -F "$TAB" -v OFS="$TAB" -v speed="$SPEED" -v maxp="$MAX_PING" -v mins="$MIN_
   if ((st == "ok" || st == "noexit") && ok > 0) {
     cls = (fail <= 0.05) ? 0 : (fail <= 0.2 ? 1 : 2)
     if (cls == 0 && speed == 1 && S[NR] <= 0) cls = 1
-    if (M[NR] * 1000 >= maxp || (speed == 1 && mins > 0 && S[NR] < mins)) cls = 2
+    if (M[NR] * 1000 >= maxp || (speed == 1 && S[NR] <= mins)) cls = 2
   }
   else if (st == "direct" || st == "region") cls = 3
   else if (st == "ok" || st == "noexit") cls = 2
@@ -1636,9 +1660,9 @@ while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
   grep -q "^#$_n " "$WORK/best.names" || pick "$_n"
 done < "$WORK/sorted"
 
-# YouTube: nodes where YouTube plays, ranked by  YouTube ping / best  +
-# best speed / speed. If at least 2 are ones YouTube places in a YT_NOADS
-# country (no ads), only those; otherwise all, ad-free first.
+# YouTube: nodes where YouTube plays and places us in a YT_NOADS country (no
+# ads; any country with --youtube-noads none), ranked by
+# YouTube ping / best  +  best speed / speed
 # -> ytsorted: n ad-free yt-ms speed exit-ip
 : > "$WORK/ytcand"
 while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
@@ -1647,17 +1671,13 @@ while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
   _af=0; case " $YT_NOADS " in *" $(yt_col "$_n") "*) _af=1 ;; esac
   printf '%s\t%s\t%s\t%s\t%s\n' "$_n" "$_af" "$(cat "$WORK/n/$_n/yt.ms")" "$(cat "$WORK/n/$_n/speed" 2>/dev/null || echo 0)" "$_xi" >> "$WORK/ytcand"
 done < "$WORK/sorted"
-awk -F "$TAB" -v OFS="$TAB" '
-{ r[NR] = $0; A[NR] = $2; M[NR] = $3 + 0; S[NR] = $4 + 0; na += $2
-  if (M[NR] > 0 && (bm == 0 || M[NR] < bm)) bm = M[NR]; if (S[NR] > bs) bs = S[NR] }
+awk -F "$TAB" -v OFS="$TAB" -v any="$( [ -z "$YT_NOADS" ] && echo 1)" '
+any || $2 == 1 { r[++k] = $0; M[k] = $3 + 0; S[k] = $4 + 0
+  if (M[k] > 0 && (bm == 0 || M[k] < bm)) bm = M[k]; if (S[k] > bs) bs = S[k] }
 END {
-  for (i = 1; i <= NR; i++) {
-    if (na >= 2 && !A[i]) continue
-    sc = (bm > 0 ? M[i] / bm : 1) + (bs > 0 ? (S[i] > 0 ? bs / S[i] : 10) : 0)
-    printf "%d\t%.4f\t%s\n", !A[i], sc, r[i]
-  }
-}' "$WORK/ytcand" | sort -t "$TAB" -k1,1n -k2,2g | cut -f 3- > "$WORK/ytsorted"
-YT_ADFREE=$(awk -F "$TAB" '$2 == 1' "$WORK/ytcand" | wc -l | tr -d ' ')
+  for (i = 1; i <= k; i++)
+    printf "%.4f\t%s\n", (bm > 0 ? M[i] / bm : 1) + (bs > 0 ? (S[i] > 0 ? bs / S[i] : 10) : 0), r[i]
+}' "$WORK/ytcand" | sort -t "$TAB" -k1,1g | cut -f 2- > "$WORK/ytsorted"
 
 : > "$WORK/ytbest"; : > "$WORK/ytbest.names"; : > "$WORK/ytbest.ips"
 ytpick() { # <n> <exit ip>
@@ -1686,7 +1706,7 @@ done < "$WORK/sorted"
 printf 'Done in %dm%02ds: %s%d good%s, %s%d unstable%s, %s%d bad%s%s%s\n' $((ELAPSED / 60)) $((ELAPSED % 60)) \
   "$GR" "$_good" "$R0" "$YL" "$_okn" "$R0" "$RD" "$_bad" "$R0" \
   "$( [ "$_skp" -gt 0 ] && echo ", $_skp can't run in podkop (xhttp)")" \
-  "$( [ "$_slow" -gt 0 ] && echo "; $_slow too slow to pick (ping >= $MAX_PING ms$( [ "$SPEED" = 1 ] && [ "$MIN_SPEED" -gt 0 ] && echo " or < $MIN_SPEED Mbit/s"))")"
+  "$( [ "$_slow" -gt 0 ] && echo "; $_slow too slow (ping >= $MAX_PING ms$( [ "$SPEED" = 1 ] && echo " or <= $MIN_SPEED Mbit/s"))")"
 
 # lost%, latency in ms
 row_fmt() { awk -v o="$1" -v t="$2" -v m="$3" 'BEGIN { printf "%s %s", (t > 0 ? sprintf("%d%%", (t - o) * 100 / t + 0.5) : "-"), (m == "-" ? "-" : sprintf("%d", m * 1000 + 0.5)) }'; }
@@ -1725,10 +1745,12 @@ else
 fi
 
 # YouTube part
-if [ "$YOUTUBE" = 1 ] && [ "$_ny" -gt 0 ]; then
+_ytn=$(ls "$WORK"/n/*/yt 2>/dev/null | wc -l | tr -d ' ')
+if [ "$YOUTUBE" = 1 ] && [ "$_ytn" -gt 0 ]; then
   echo
+  _ytno=0; for _f in "$WORK"/n/*/yt; do case "$(cut -d ' ' -f 1 "$_f")" in ok) ;; *) _ytno=$((_ytno + 1)) ;; esac; done
   if [ ! -s "$WORK/ytsorted" ]; then
-    warn "YouTube did not play through any server; the '$YT_SECTION' section will not be changed"
+    warn "no fast server where YouTube sees ${YT_NOADS:-any country}$( [ "$_ytno" -gt 0 ] && echo " (on $_ytno of $_ytn YouTube does not play)"); the '$YT_SECTION' section will not be changed"
   else
     if [ "$VERBOSE" != 1 ]; then
       printf '%sYouTube%s %s(section %s: YouTube only)%s\n' "$BD" "$R0" "$DM" "$YT_SECTION" "$R0"
@@ -1739,19 +1761,14 @@ if [ "$YOUTUBE" = 1 ] && [ "$_ny" -gt 0 ]; then
         if grep -q "^#$_n " "$WORK/ytbest.names"; then _mk="y"
         elif [ "$_extra" -lt 3 ]; then _extra=$((_extra + 1))
         else _more=$((_more + 1)); continue; fi
-        printf '%s %-3s %7s %7s  %s%s\n' "$_mk" "$_n" "$(ms "$_ym")" "$_sp" "$(yt_fmt "$_n")" "$(cat "$WORK/n/$_n/name")"
+        printf '%s %-3s %7s %7s  %s%s\n' "$_mk" "$_n" "$(ms "$_ym")" "$(cat "$WORK/n/$_n/speed" 2>/dev/null || echo -)" \
+          "$(yt_fmt "$_n")" "$(cat "$WORK/n/$_n/name")"
       done < "$WORK/ytsorted"
       [ "$_more" -gt 0 ] && printf '  %s+%d more%s\n' "$DM" "$_more" "$R0"
       printf '  %syt = the country YouTube sees; yt ms = ping to YouTube%s\n' "$DM" "$R0"
     fi
-    _ytno=0; while IFS= read -r _n; do yt_bad "$_n" && _ytno=$((_ytno + 1)); done < "$WORK/yt.uniq"
-    if [ "$YT_ADFREE" -ge 2 ]; then
-      printf 'YouTube: %s%s server(s) without ads%s (%s)%s\n' "$GR" "$YT_ADFREE" "$R0" "$YT_NOADS" \
-        "$( [ "$_ytno" -gt 0 ] && echo ", $_ytno where YouTube does not play")"
-    else
-      printf 'YouTube: %s%s server(s) without ads%s%s: using the best ones with ads%s\n' "$YL" "$YT_ADFREE" "$R0" \
-        "${YT_NOADS:+ ($YT_NOADS)}" "$( [ "$_ytno" -gt 0 ] && echo "; $_ytno where YouTube does not play")"
-    fi
+    printf 'YouTube: %s%s fast server(s) where YouTube sees %s%s%s\n' "$GR" "$(wc -l < "$WORK/ytsorted" | tr -d ' ')" \
+      "${YT_NOADS:-any country}" "$R0" "$( [ "$_ytno" -gt 0 ] && echo "; on $_ytno YouTube does not play")"
   fi
 fi
 
@@ -1781,7 +1798,7 @@ if [ "$VERBOSE" = 1 ]; then
       [ "$_ok" -eq 0 ] && _why="all $_tot requests failed: unreachable, blocked, or wrong credentials" ;;
     esac
     case "$(verdict "$_s" "$_ok" "$_tot")" in GOOD|OK|FLAKY)
-      fast_enough "$_n" || _why="${_why:+$_why; }too slow to pick (ping ${_md}s, $_sp Mbit/s; limits: < $MAX_PING ms, >= $MIN_SPEED Mbit/s)" ;;
+      fast_enough "$_n" || _why="${_why:+$_why; }too slow to pick (ping ${_md}s, $_sp Mbit/s; needed: < $MAX_PING ms, > $MIN_SPEED Mbit/s)" ;;
     esac
     [ "$(cat "$WORK/n/$_n/speed" 2>/dev/null)" = "0.0" ] && _why="${_why:+$_why; }speed test failed: $(cat "$WORK/n/$_n/speed.why" 2>/dev/null || echo "no data")"
     [ -n "$_why" ] && printf '  #%-3s %s: %s\n' "$_n" "$_nm" "$_why"
@@ -1819,28 +1836,40 @@ set_urltest() {
 # sec_pos <section>: its position among podkop's sections (0 = first)
 sec_pos() { uci show podkop 2>/dev/null | sed -n 's/^podkop\.\([^.=]*\)=.*/\1/p' | grep -nxF "$1" | cut -d: -f1 | awk '{ print $1 - 1; exit }'; }
 
-# apply_podkop: URLTest with the picks in section $SECTION and, if there are
-# YouTube picks, in $YT_SECTION (created with the "youtube" list if missing,
-# and moved before $SECTION: podkop routes by the first section that matches,
-# and lists like "Russia inside" contain YouTube too); then restart podkop
+# ensure_section <name>: create podkop section <name> if missing
+ensure_section() {
+  uci -q get "podkop.$1" >/dev/null && return 0
+  uci set "podkop.$1=section"
+  _msg="${_msg:+$_msg, }new section $1"
+}
+
+# apply_podkop: the main list (DO_MAIN) into section $SECTION and the YouTube
+# list (DO_YT) into $YT_SECTION, each as a URLTest; then restart podkop.
+# A new YouTube section gets podkop's "youtube" list and is moved before
+# $SECTION: podkop routes by the first section that matches, and lists like
+# "Russia inside" contain YouTube too.
 apply_podkop() {
   _cfg=/etc/config/podkop
   _bak="$_cfg.probe-backup.$(date +%Y%m%d-%H%M%S)"
   cp "$_cfg" "$_bak" || die "cannot back up $_cfg"
   ls -1t "$_cfg".probe-backup.* 2>/dev/null | tail -n +4 | while IFS= read -r _f; do rm -f "$_f"; done
-  set_urltest "$SECTION" "$WORK/best"
-  _msg="$SECTION: $(wc -l < "$WORK/best" | tr -d ' ') server(s)"
-  if [ "$YOUTUBE" = 1 ] && [ -s "$WORK/ytbest" ] && [ "$YT_SECTION" != "$SECTION" ]; then
+  _msg=""
+  if [ "$DO_MAIN" = 1 ]; then
+    uci -q get "podkop.$SECTION" >/dev/null || _new_main=1
+    ensure_section "$SECTION"
+    set_urltest "$SECTION" "$WORK/best"
+    _msg="${_msg:+$_msg, }$SECTION: $(wc -l < "$WORK/best" | tr -d ' ') server(s)"
+  fi
+  if [ "$DO_YT" = 1 ]; then
     if ! uci -q get "podkop.$YT_SECTION" >/dev/null; then
-      uci set "podkop.$YT_SECTION=section"
+      ensure_section "$YT_SECTION"
       uci add_list "podkop.$YT_SECTION.community_lists=youtube"
-      _msg="$_msg, new section $YT_SECTION"
     fi
     set_urltest "$YT_SECTION" "$WORK/ytbest"
     uci set "podkop.$YT_SECTION.urltest_testing_url=$YT_PING_URL"
     _pm=$(sec_pos "$SECTION"); _py=$(sec_pos "$YT_SECTION")
     [ -n "$_pm" ] && [ -n "$_py" ] && [ "$_py" -gt "$_pm" ] && uci reorder "podkop.$YT_SECTION=$_pm"
-    _msg="$_msg, $YT_SECTION: $(wc -l < "$WORK/ytbest" | tr -d ' ') server(s)"
+    _msg="${_msg:+$_msg, }$YT_SECTION: $(wc -l < "$WORK/ytbest" | tr -d ' ') server(s)"
   fi
   uci commit podkop || die "uci commit failed, your old settings are in $_bak"
   if /etc/init.d/podkop restart >/dev/null 2>&1; then
@@ -1850,7 +1879,20 @@ apply_podkop() {
     warn "podkop restart failed. Undo: cp $_bak $_cfg && /etc/init.d/podkop restart"
     [ "$CRON" = 1 ] && logger -t podkop-probe "podkop restart failed after update, backup: $_bak" 2>/dev/null
   fi
+  [ "${_new_main:-0}" = 1 ] && warn "section '$SECTION' is new and has no lists yet: add them in LuCI -> Services -> Podkop"
   [ "$VERBOSE" = 1 ] && info "old settings saved in $_bak"
+  return 0
+}
+
+# ask_sections: section names for both lists ("-" = don't use that list)
+ask_sections() {
+  printf 'Section for the main list [%s, - = skip]: ' "$SECTION"
+  read -r _a < "$TTY" || _a=-; case "$_a" in -) DO_MAIN=0 ;; "") ;; *) SECTION=$_a ;; esac
+  if [ "$DO_YT" = 1 ]; then
+    printf 'Section for the YouTube list [%s, - = skip]: ' "$YT_SECTION"
+    read -r _a < "$TTY" || _a=-; case "$_a" in -) DO_YT=0 ;; "") ;; *) YT_SECTION=$_a ;; esac
+  fi
+  [ "$DO_MAIN" = 1 ] && [ "$DO_YT" = 1 ] && [ "$SECTION" = "$YT_SECTION" ] && { warn "both lists can't go into one section"; DO_YT=0; }
   return 0
 }
 
@@ -1859,44 +1901,46 @@ HAVE_PODKOP=0
 cp "$WORK/best" /tmp/podkop-probe-best.txt 2>/dev/null
 cp "$WORK/ytbest" /tmp/podkop-probe-youtube.txt 2>/dev/null
 
-if [ "$APPLY" != no ] && [ -s "$WORK/best" ] && case "$SOURCE" in podkop*) false ;; *) true ;; esac; then
+DO_MAIN=0; DO_YT=0
+[ -s "$WORK/best" ] && DO_MAIN=1
+[ "$YOUTUBE" = 1 ] && [ -s "$WORK/ytbest" ] && DO_YT=1
+if [ "$APPLY" != no ] && [ "$DO_MAIN" = 1 ] && case "$SOURCE" in podkop*) false ;; *) true ;; esac; then
   if [ "$HAVE_PODKOP" = 0 ]; then
-    info "podkop not found; the best links are in /tmp/podkop-probe-best.txt (YouTube: /tmp/podkop-probe-youtube.txt)"
+    info "podkop not found; the lists are in /tmp/podkop-probe-best.txt and /tmp/podkop-probe-youtube.txt"
   else
-    uci -q get "podkop.$SECTION" >/dev/null || die "podkop has no section '$SECTION' (use --section)"
-    _go=1
     if [ "$APPLY" != yes ] && [ -n "$TTY" ]; then
       _nb=$(wc -l < "$WORK/best" | tr -d ' ')
-      _ny=$(wc -l < "$WORK/ytbest" | tr -d ' ')
       echo
-      if [ "$YOUTUBE" = 1 ] && [ "$_ny" -gt 0 ]; then
-        printf '%sPut the servers into podkop and restart it?%s  %s: %s marked *,  %s: %s marked y\n' \
-          "$BD" "$R0" "$SECTION" "$_nb" "$YT_SECTION" "$_ny"
-        printf 'Enter = yes, n = no, or type other numbers for %s (e.g. 50 41 35): ' "$SECTION"
+      if [ "$DO_YT" = 1 ]; then
+        printf '%sPut into podkop and restart it?%s\n' "$BD" "$R0"
+        printf '  Enter) both:  %s <- %s server(s) (*),  %s <- %s server(s) (y)\n' "$SECTION" "$_nb" "$YT_SECTION" "$(wc -l < "$WORK/ytbest" | tr -d ' ')"
+        printf '  1) only %s   2) only %s   3) other sections   n) nothing\n> ' "$SECTION" "$YT_SECTION"
+        read -r _sel < "$TTY" || _sel=n
+        case "$_sel" in
+          "") ;;
+          1) DO_YT=0 ;;
+          2) DO_MAIN=0 ;;
+          3) ask_sections ;;
+          *) DO_MAIN=0; DO_YT=0 ;;
+        esac
       else
-        printf '%sPut the %s marked (*) server(s) into podkop and restart it?%s\n' "$BD" "$_nb" "$R0"
-        printf 'Enter = yes, n = no, or type other numbers (e.g. 50 41 35): '
+        printf '%sPut the %s marked (*) server(s) into podkop (%s) and restart it?%s\n' "$BD" "$_nb" "$SECTION" "$R0"
+        printf '  Enter) yes   3) other section   n) nothing\n> '
+        read -r _sel < "$TTY" || _sel=n
+        case "$_sel" in "") ;; 3) ask_sections ;; *) DO_MAIN=0 ;; esac
       fi
-      read -r _sel < "$TTY" || _sel=n
-      case "$_sel" in
-        n|N|no|No|н|Н|нет) _go=0 ;;
-        *[0-9]*)
-          : > "$WORK/best"; : > "$WORK/best.names"; : > "$WORK/best.ips"
-          for _n in $(printf '%s' "$_sel" | tr -c '0-9\n' ' '); do
-            if [ -f "$WORK/n/$_n/link" ] && [ -f "$WORK/n/$_n/result" ]; then
-              grep -q "^#$_n " "$WORK/best.names" || pick "$_n"
-            else
-              warn "#$_n is not a tested server, ignored"
-            fi
-          done
-          [ -s "$WORK/best" ] || _go=0 ;;
-      esac
+    else
+      [ "$APPLY_TO" = youtube ] && DO_MAIN=0
+      [ "$APPLY_TO" = main ] && DO_YT=0
     fi
-    if [ "$_go" = 1 ]; then apply_podkop; else info "podkop not changed"; fi
+    if [ "$DO_MAIN" = 1 ] && [ "$SECTION" = main ] && ! uci -q get "podkop.$SECTION" >/dev/null; then
+      die "podkop has no section '$SECTION' (use --section)"
+    fi
+    if [ "$DO_MAIN$DO_YT" != 00 ]; then apply_podkop; else info "podkop not changed (lists: /tmp/podkop-probe-best.txt, /tmp/podkop-probe-youtube.txt)"; fi
   fi
-elif [ "$APPLY" != no ] && [ ! -s "$WORK/best" ] && case "$SOURCE" in podkop*) false ;; *) true ;; esac; then
+elif [ "$APPLY" != no ] && [ "$DO_MAIN" = 0 ] && case "$SOURCE" in podkop*) false ;; *) true ;; esac; then
   _why="no working servers found"
-  [ "$_slow" -gt 0 ] && _why="no server is fast enough (ping < $MAX_PING ms, >= $MIN_SPEED Mbit/s; see --max-ping, --min-speed)"
+  [ "$_slow" -gt 0 ] && _why="no server is fast enough (ping < $MAX_PING ms, > $MIN_SPEED Mbit/s; see --max-ping, --min-speed)"
   warn "$_why, podkop not changed"
   [ "$CRON" = 1 ] && logger -t podkop-probe "$_why, podkop not changed" 2>/dev/null
 fi
