@@ -12,7 +12,7 @@
 #
 # https://github.com/dkagramanyan/podkop-keys-availability-
 
-VERSION="1.7.0"
+VERSION="1.8.0"
 REPO_URL="https://github.com/dkagramanyan/podkop-keys-availability-"
 RELEASE_URL="$REPO_URL/releases/latest/download/probe.sh"
 BIN=/usr/bin/podkop-probe            # installed copy, used by the nightly run
@@ -38,6 +38,12 @@ LINE_URL="https://fsn1-speed.hetzner.com/100MB.bin"
 # until SPEED_T is used up (Cloudflare refuses single requests of 100 MB)
 SPEED_URLS="https://speed.cloudflare.com/__down?bytes=25000000
 https://fsn1-speed.hetzner.com/100MB.bin"
+# YouTube check: can a video be played through the node, and which country
+# does YouTube think it is in (the code next to its logo). No ads are sold
+# in YT_NOADS countries, so servers YouTube places there are preferred.
+YOUTUBE=1; YT_NOADS=RU
+YT_VIDEO=jNQXAC9IVRw                 # "Me at the zoo": public everywhere, never removed
+YT_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 CRON=0; CRON_TIME=""; INSTALL=0; UNINSTALL=0; UPDATE=0; NO_UPDATE=0
 COUNTRIES=""                         # "" = all; europe; or DE,NL,...
 # Subscription panels (Remnawave, Marzban, 3x-ui...) only hand the real server
@@ -94,6 +100,9 @@ Test:
   --speed-jobs N    speed tests at the same time (default: from the line
                     speed, 1 per ~200 Mbit/s, max 3)
   --speed-url URL   file for the speed test (default: Cloudflare, then Hetzner)
+  --no-youtube      skip the YouTube check
+  --youtube-noads LIST  countries where YouTube shows no ads (default $YT_NOADS);
+                    servers YouTube places there are picked first ('none' = off)
 
 Podkop (for link sources: -s, -f, links):
   --top N           how many best nodes to offer for podkop   (default $TOP)
@@ -165,7 +174,7 @@ is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -gt 0 ]; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    -f|-s|-C|--config|-n|-c|-j|-t|-u|-p|-o|--top|--section|--speed-url|--cron-line|--countries|--speed-jobs)
+    -f|-s|-C|--config|-n|-c|-j|-t|-u|-p|-o|--top|--section|--speed-url|--cron-line|--countries|--speed-jobs|--youtube-noads)
       [ $# -ge 2 ] || { echo "option $1 needs a value" >&2; usage 1; }
       case "$1" in
         -f) FILE="$2" ;; -s) SUBS="$SUBS$2
@@ -176,6 +185,7 @@ while [ $# -gt 0 ]; do
         --speed-url) SPEED_URL="$2" ;; --cron-line) CRON_TIME="$2" ;;
         --speed-jobs) SPEED_J="$2"; SPEED_J_USER=$2 ;;
         --countries) COUNTRIES="$2" ;;
+        --youtube-noads) YT_NOADS=$(printf '%s' "$2" | tr 'a-z,' 'A-Z ' | sed 's/\bNONE\b//g; s/^ *//; s/ *$//') ;;
       esac
       shift 2 ;;
     -q) N=12; SPEED_T=4; shift ;;
@@ -186,6 +196,7 @@ while [ $# -gt 0 ]; do
     --no-apply) APPLY=no; shift ;;
     --no-speed) SPEED=0; shift ;;
     --no-entry-check) ENTRY_CHECK=0; shift ;;
+    --no-youtube) YOUTUBE=0; shift ;;
     --install) INSTALL=1; shift ;;
     --uninstall|--nightly-off) UNINSTALL=1; shift ;;
     --update) UPDATE=1; shift ;;
@@ -968,6 +979,9 @@ run_node() {
         fire "$WORK/req2.cfg" "$_d/times"
       fi
     fi
+    if [ "$YOUTUBE" = 1 ] && grep -qv '^000' "$_d/times"; then
+      yt_check > "$_d/yt"
+    fi
     wait "$_epid" 2>/dev/null
     set -- $(cat "$_d/exit")
     _ip=${1:-}; _cc=${2:-}
@@ -1013,6 +1027,52 @@ exit_ip() {
     [ -n "$_ip" ] && { echo "$_ip ${_cc:--}"; return; }
     _r=$((_r + 1))
   done
+}
+
+# yt_check -> "state country": YouTube through the node ($_px). country is
+# where YouTube thinks we are (the code next to its logo); state is
+#   ok    a video plays and the video servers (googlevideo) answer
+#   bot   "Sign in to confirm you're not a bot": YouTube flagged the IP
+#   no    "Video unavailable", or the video servers are blocked
+#   fail  YouTube did not load at all
+yt_check() {
+  _yp=$(pcurl -s -L --max-time 12 -A "$YT_UA" -H 'Accept-Language: en-US,en;q=0.9' \
+      -b 'SOCS=CAI; CONSENT=YES+' "https://www.youtube.com/watch?v=$YT_VIDEO&hl=en" 2>/dev/null |
+    grep -oE '"(GL|INNERTUBE_CONTEXT_GL)":"[A-Z]{2}"|"playabilityStatus":[{]"status":"[A-Z_]+"' | head -n 20)
+  _gl=$(printf '%s\n' "$_yp" | sed -n 's/.*GL":"\([A-Z][A-Z]\)"$/\1/p' | head -n 1)
+  _ps=$(printf '%s\n' "$_yp" | sed -n 's/.*"status":"\([A-Z_]*\)"$/\1/p' | head -n 1)
+  [ -n "$_gl$_ps" ] || { echo "fail -"; return; }
+  case "$_ps" in
+    OK|"") ;;
+    LOGIN_REQUIRED) echo "bot ${_gl:--}"; return ;;
+    *) echo "no ${_gl:--}"; return ;;
+  esac
+  case "$(pcurl -s -o /dev/null --max-time 6 -w '%{http_code}' https://redirector.googlevideo.com/generate_204 2>/dev/null)" in
+    ""|000) echo "no ${_gl:--}" ;;
+    *) echo "ok ${_gl:--}" ;;
+  esac
+}
+
+# yt_bad <n>: YouTube was checked and does not work through node n
+yt_bad() { [ "$YT_USE" = 1 ] || return 1; case "$(cut -d ' ' -f 1 "$WORK/n/$1/yt" 2>/dev/null)" in bot|no|fail) return 0 ;; esac; return 1; }
+
+# yt_col <n>: the "yt" column: YouTube's country, "no" if it doesn't work
+yt_col() {
+  if [ ! -f "$WORK/n/$1/yt" ] || [ "$YT_USE" != 1 ]; then echo "-"; return; fi
+  read -r _ys _yc < "$WORK/n/$1/yt"
+  if yt_bad "$1"; then echo "no"; else echo "$_yc"; fi
+}
+
+# yt_fmt <n>: the yt column cell (green for an ad-free country, red for
+# "no"); nothing with --no-youtube. YTH is its header.
+YTH="yt  "; [ "$YOUTUBE" = 1 ] || YTH=""
+yt_fmt() {
+  [ "$YOUTUBE" = 1 ] || return 0
+  _yv=$(yt_col "$1")
+  case "$_yv" in
+    no) printf '%s%-3s%s ' "$RD" no "$R0" ;;
+    *) case " $YT_NOADS " in *" $_yv "*) printf '%s%-3s%s ' "$GR" "$_yv" "$R0" ;; *) printf '%-3s ' "$_yv" ;; esac ;;
+  esac
 }
 
 # verdict <status> <ok> <total> -> "LABEL<TAB>color"
@@ -1100,7 +1160,11 @@ save_conf() {
     echo "SECTION=$(shq "$SECTION")"
     [ -n "$SPEED_J_USER" ] && echo "SPEED_J=$SPEED_J_USER"
     [ "$ENTRY_CHECK" = 0 ] && echo "ENTRY_CHECK=0"
-  } > "$CONF" && chmod 600 "$CONF"
+    [ "$YOUTUBE" = 0 ] && echo "YOUTUBE=0"
+    [ "$YT_NOADS" != RU ] && echo "YT_NOADS=$(shq "$YT_NOADS")"
+    :
+  } > "$CONF" || return 1
+  chmod 600 "$CONF"
   grep -qxF "$CONF" /etc/sysupgrade.conf 2>/dev/null || echo "$CONF" >> /etc/sysupgrade.conf
 }
 
@@ -1157,6 +1221,7 @@ uninstall() {
 
 SAVED_SUBS=""; SAVED_C=""
 if [ -f "$CONF" ]; then
+  chmod 600 "$CONF" 2>/dev/null        # older versions left it readable to all
   SAVED_SUBS=$( . "$CONF"; printf '%s' "$SUBS" ); SAVED_C=$( . "$CONF"; printf '%s' "${COUNTRIES:-}" )
 fi
 if [ "$UNINSTALL" = 1 ]; then uninstall; exit 0; fi
@@ -1347,6 +1412,21 @@ done
 wait
 exec 3>&-
 
+# YouTube results: n state country. If YouTube worked through none of the
+# servers, the check itself is broken (YouTube changed its page?): ignore it
+: > "$WORK/ytmap"
+_i=0
+while [ "$_i" -lt "$COUNT" ]; do
+  _i=$((_i + 1))
+  [ -f "$WORK/n/$_i/yt" ] && printf '%s %s\n' "$_i" "$(cat "$WORK/n/$_i/yt")" >> "$WORK/ytmap"
+done
+YT_USE=1
+if [ -s "$WORK/ytmap" ] && ! awk '$2 == "ok" { f = 1 } END { exit !f }' "$WORK/ytmap"; then
+  YT_USE=0; : > "$WORK/ytmap"
+  [ "$PROG" = 1 ] && printf '\r%40s\r' ""
+  warn "YouTube did not work through any server; the YouTube check is ignored"
+fi
+
 # --- speed test --------------------------------------------------------------
 
 # nodes that lost at most 20%, best latency first; one download at a time
@@ -1359,6 +1439,7 @@ if [ "$SPEED" = 1 ]; then
     case "$_s" in ok|noexit) ;; *) continue ;; esac
     [ "$_ok" -gt 0 ] || continue
     [ $(( (_tot - _ok) * 5 )) -le "$_tot" ] || continue
+    yt_bad "$_i" && continue               # won't be picked anyway
     printf '%s\t%s\t%s\n' "$_md" "$_i" "$(same_key "$_i")" >> "$WORK/speedlist"
   done
   sort -t "$TAB" -k1,1g "$WORK/speedlist" -o "$WORK/speedlist"
@@ -1425,33 +1506,41 @@ done
 ELAPSED=$(( $(date +%s) - START ))
 
 # classes: 0 = lost <=5% (and speed test passed), 1 = lost <=20% or speed test
-# failed, 2 = worse, 3 = wrong country / not via node, 4 = skipped / no start.
+# failed, 2 = worse or YouTube doesn't work, 3 = wrong country / not via node,
+# 4 = skipped / no start.
 # Inside classes 0-1 the score is  median / best median  +  best speed / speed
 # (1 + 1 = 2 for a node that is best at both; lower is better), so 20% more
 # latency weighs the same as 20% less speed.
-awk -F "$TAB" -v OFS="$TAB" -v speed="$SPEED" '
-{ row[NR] = $0
+# When at least 2 nodes of classes 0-1 are ones YouTube places in a YT_NOADS
+# country, they go first (ad-free rank 0) and only they are picked.
+awk -F "$TAB" -v OFS="$TAB" -v speed="$SPEED" -v noads=" $YT_NOADS " -v ym="$WORK/ytmap" '
+FILENAME == ym { split($0, y, " "); ys[y[1]] = y[2]; yc[y[1]] = y[3]; next }
+{ row[++k] = $0
   st = $2; ok = $3 + 0; tot = $4 + 0
   fail = tot > 0 ? (tot - ok) / tot : 1
-  M[NR] = ($6 == "-") ? 0 : $6 + 0; S[NR] = ($10 == "-") ? 0 : $10 + 0
+  M[k] = ($6 == "-") ? 0 : $6 + 0; S[k] = ($10 == "-") ? 0 : $10 + 0
   if ((st == "ok" || st == "noexit") && ok > 0) {
     cls = (fail <= 0.05) ? 0 : (fail <= 0.2 ? 1 : 2)
-    if (cls == 0 && speed == 1 && S[NR] <= 0) cls = 1
+    if (cls == 0 && speed == 1 && S[k] <= 0) cls = 1
   }
   else if (st == "direct" || st == "region") cls = 3
   else if (st == "ok" || st == "noexit") cls = 2
   else cls = 4
-  C[NR] = cls; F[NR] = fail
-  if (cls <= 1 && M[NR] > 0 && (bm == 0 || M[NR] < bm)) bm = M[NR]
-  if (cls <= 1 && S[NR] > bs) bs = S[NR]
+  if (cls <= 1 && (ys[$1] == "bot" || ys[$1] == "no" || ys[$1] == "fail")) cls = 2
+  C[k] = cls; F[k] = fail
+  A[k] = (cls <= 1 && ys[$1] == "ok" && index(noads, " " yc[$1] " ")) ? 1 : 0; na += A[k]
+  if (cls <= 1 && M[k] > 0 && (bm == 0 || M[k] < bm)) bm = M[k]
+  if (cls <= 1 && S[k] > bs) bs = S[k]
 }
 END {
-  for (i = 1; i <= NR; i++) {
+  for (i = 1; i <= k; i++) {
     sc = 99
     if (C[i] <= 1 && M[i] > 0) sc = M[i] / bm + ((speed == 1 && bs > 0) ? ((S[i] > 0) ? bs / S[i] : 10) : 0)
-    printf "%d\t%.4f\t%.6f\t%s\n", C[i], sc, F[i], row[i]
+    printf "%d\t%d\t%.4f\t%.6f\t%s\n", C[i], (na >= 2 && A[i]) ? 0 : 1, sc, F[i], row[i]
   }
-}' "$WORK/all" | sort -t "$TAB" -k1,1n -k2,2g -k3,3g | cut -f 4- > "$WORK/sorted"
+}' "$WORK/ytmap" "$WORK/all" | sort -t "$TAB" -k1,1n -k2,2n -k3,3g -k4,4g > "$WORK/ranked"
+cut -f 5- "$WORK/ranked" > "$WORK/sorted"
+awk -F "$TAB" '$2 == 0 { print $5 }' "$WORK/ranked" > "$WORK/adfree"   # empty unless >= 2
 
 # pick the best TOP nodes that came from links (config outbounds have no
 # link): usable classes only, and one link per exit IP, since several links
@@ -1468,6 +1557,8 @@ while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
   [ "$(wc -l < "$WORK/best")" -ge "$TOP" ] && break
   [ -f "$WORK/n/$_n/link" ] || continue
   case "$(verdict "$_s" "$_ok" "$_tot")" in GOOD|OK|FLAKY) ;; *) continue ;; esac
+  yt_bad "$_n" && continue
+  [ -s "$WORK/adfree" ] && ! grep -qx "$_n" "$WORK/adfree" && continue
   [ "$_xi" != "-" ] && grep -qxF "$_xi" "$WORK/best.ips" && continue
   pick "$_n"
 done < "$WORK/sorted"
@@ -1476,6 +1567,8 @@ while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
   [ "$(wc -l < "$WORK/best")" -ge "$TOP" ] && break
   [ -f "$WORK/n/$_n/link" ] || continue
   case "$(verdict "$_s" "$_ok" "$_tot")" in GOOD|OK|FLAKY) ;; *) continue ;; esac
+  yt_bad "$_n" && continue
+  [ -s "$WORK/adfree" ] && ! grep -qx "$_n" "$WORK/adfree" && continue
   grep -q "^#$_n " "$WORK/best.names" || pick "$_n"
 done < "$WORK/sorted"
 
@@ -1490,23 +1583,31 @@ done < "$WORK/sorted"
 printf 'Done in %dm%02ds: %s%d good%s, %s%d unstable%s, %s%d bad%s%s\n' $((ELAPSED / 60)) $((ELAPSED % 60)) \
   "$GR" "$_good" "$R0" "$YL" "$_okn" "$R0" "$RD" "$_bad" "$R0" \
   "$( [ "$_skp" -gt 0 ] && echo ", $_skp can't run in podkop (xhttp)")"
+if [ "$YOUTUBE" = 1 ] && [ -s "$WORK/ytmap" ]; then
+  _ytno=$(awk '$2 != "ok"' "$WORK/ytmap" | wc -l | tr -d ' ')
+  _ytfree=$(awk -v l=" $YT_NOADS " '$2 == "ok" && index(l, " " $3 " ")' "$WORK/ytmap" | wc -l | tr -d ' ')
+  printf 'YouTube: %s%s without ads%s (%s), %s%s blocked%s' "$GR" "$_ytfree" "$R0" "${YT_NOADS:-none}" "$RD" "$_ytno" "$R0"
+  if [ -s "$WORK/adfree" ]; then printf ', only servers without ads are picked\n'
+  elif [ "$_ytfree" -gt 0 ]; then printf ', too few to use them alone\n'
+  else echo; fi
+fi
 
 # lost%, latency in ms
 row_fmt() { awk -v o="$1" -v t="$2" -v m="$3" 'BEGIN { printf "%s %s", (t > 0 ? sprintf("%d%%", (t - o) * 100 / t + 0.5) : "-"), (m == "-" ? "-" : sprintf("%d", m * 1000 + 0.5)) }'; }
 
 echo
 if [ "$VERBOSE" = 1 ]; then
-  printf '%s  %-3s %-12s %8s %6s %7s %7s %7s %7s  %-15s %-3s %s%s\n' "$BD" "#" "verdict" "ok" "fail%" "min" "median" "p90" "Mbit/s" "exit IP" "cc" "node" "$R0"
+  printf '%s  %-3s %-12s %8s %6s %7s %7s %7s %7s  %-15s %-3s %s%s%s\n' "$BD" "#" "verdict" "ok" "fail%" "min" "median" "p90" "Mbit/s" "exit IP" "cc" "$YTH" "node" "$R0"
   while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
     _v=$(verdict "$_s" "$_ok" "$_tot")
     _fp="-"; [ "$_tot" -gt 0 ] && _fp=$(awk -v o="$_ok" -v t="$_tot" 'BEGIN {printf "%.1f", (t - o) * 100 / t}')
     _mk=" "; grep -q "^#$_n " "$WORK/best.names" && _mk="*"
-    printf '%s %-3s %s%-12s%s %8s %6s %7s %7s %7s %7s  %-15s %-3s %s\n' \
-      "$_mk" "$_n" "$(vcolor "$_v")" "$_v" "$R0" "$_ok/$_tot" "$_fp" "$_mn" "$_md" "$_p9" "$_sp" "$_xi" "$_xc" "$_nm"
+    printf '%s %-3s %s%-12s%s %8s %6s %7s %7s %7s %7s  %-15s %-3s %s%s\n' \
+      "$_mk" "$_n" "$(vcolor "$_v")" "$_v" "$R0" "$_ok/$_tot" "$_fp" "$_mn" "$_md" "$_p9" "$_sp" "$_xi" "$_xc" "$(yt_fmt "$_n")" "$_nm"
   done < "$WORK/sorted"
 else
   # the picks (*) and a few runners-up
-  printf '%s  %-3s %7s %7s %5s  %-3s %s%s\n' "$BD" "#" "ping ms" "Mbit/s" "lost" "cc" "server" "$R0"
+  printf '%s  %-3s %7s %7s %5s  %-3s %s%s%s\n' "$BD" "#" "ping ms" "Mbit/s" "lost" "cc" "$YTH" "server" "$R0"
   _extra=0; _more=0
   while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
     _v=$(verdict "$_s" "$_ok" "$_tot")
@@ -1516,9 +1617,10 @@ else
     elif [ "$_extra" -lt 5 ]; then _extra=$((_extra + 1))
     else _more=$((_more + 1)); continue; fi
     set -- $(row_fmt "$_ok" "$_tot" "$_md")
-    printf '%s %-3s %7s %7s %s%5s%s  %-3s %s\n' "$_mk" "$_n" "$2" "$_sp" "$(vcolor "$_v")" "$1" "$R0" "$_xc" "$_nm"
+    printf '%s %-3s %7s %7s %s%5s%s  %-3s %s%s\n' "$_mk" "$_n" "$2" "$_sp" "$(vcolor "$_v")" "$1" "$R0" "$_xc" "$(yt_fmt "$_n")" "$_nm"
   done < "$WORK/sorted"
   [ "$_more" -gt 0 ] && printf '  %s+%d more (-v shows all servers and why the others failed)%s\n' "$DM" "$_more" "$R0"
+  [ "$YOUTUBE" = 1 ] && [ "$YT_USE" = 1 ] && printf '  %syt = the country YouTube sees%s, no = YouTube does not play%s\n' "$DM" "${YT_NOADS:+ ($YT_NOADS: no ads)}" "$R0"
 fi
 
 # speed tests that all failed deserve one line even without -v
@@ -1538,6 +1640,11 @@ if [ "$VERBOSE" = 1 ]; then
       region) _why="exit country $_xc is outside $(countries_label)" ;;
       noexit) _why="could not learn the exit IP through the node" ;;
     esac
+    case "$(cut -d ' ' -f 1 "$WORK/n/$_n/yt" 2>/dev/null)" in
+      bot)  _why="${_why:+$_why; }YouTube: \"sign in to confirm you're not a bot\" (IP flagged by YouTube)" ;;
+      no)   _why="${_why:+$_why; }YouTube: video unavailable or video servers blocked" ;;
+      fail) _why="${_why:+$_why; }YouTube did not load through this server" ;;
+    esac
     case "$_s" in ok|noexit)
       [ "$_ok" -eq 0 ] && _why="all $_tot requests failed: unreachable, blocked, or wrong credentials" ;;
     esac
@@ -1554,10 +1661,11 @@ if [ "$VERBOSE" = 1 ]; then
 fi
 
 if [ -n "$CSV" ]; then
-  { echo "n,verdict,ok,total,min,median,p90,mbit_s,exit_ip,country,node"
+  { echo "n,verdict,ok,total,min,median,p90,mbit_s,exit_ip,country,youtube,node"
     while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
-      printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n' "$_n" "$(verdict "$_s" "$_ok" "$_tot")" \
-        "$_ok" "$_tot" "$_mn" "$_md" "$_p9" "$_sp" "$_xi" "$_xc" "$(printf '%s' "$_nm" | sed 's/"/""/g')"
+      printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n' "$_n" "$(verdict "$_s" "$_ok" "$_tot")" \
+        "$_ok" "$_tot" "$_mn" "$_md" "$_p9" "$_sp" "$_xi" "$_xc" "$(sed 's/ /:/' "$WORK/n/$_n/yt" 2>/dev/null)" \
+        "$(printf '%s' "$_nm" | sed 's/"/""/g')"
     done < "$WORK/sorted"
   } > "$CSV" && info "saved $CSV"
 fi

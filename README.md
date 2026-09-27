@@ -2,8 +2,8 @@
 
 Tests all servers from your VPN subscriptions ("keys") on your OpenWrt
 router and puts the 10 best ones (fewest lost requests, lowest ping,
-highest speed) into [podkop](https://github.com/itdoginfo/podkop), once or
-every night. Needs podkop to be installed.
+highest speed, working YouTube) into [podkop](https://github.com/itdoginfo/podkop),
+once or every night. Needs podkop to be installed.
 
 ## Run
 
@@ -51,6 +51,20 @@ into podkop and restarts podkop. If nothing works, podkop is left alone.
 - **Run it now:** `podkop-probe --cron`
 - **Remove everything:** `podkop-probe --uninstall`
 
+## YouTube
+
+Every server is also checked with YouTube:
+
+- **`yt` column** = the country YouTube thinks you are in (the small code
+  next to the YouTube logo). `no` = YouTube doesn't play through this
+  server ("video unavailable" or "confirm you're not a bot"). Such servers
+  are never picked.
+- **No ads.** YouTube shows no ads when it thinks you are in Russia. If at
+  least 2 good servers show `RU`, only those are put into podkop. Otherwise
+  the normal top 10 is used.
+- Turn it off: `--no-youtube`. Other ad-free countries:
+  `--youtube-noads RU,BY` (`none` = don't prefer any).
+
 ## Undo
 
 Your previous podkop settings are backed up before every change:
@@ -87,4 +101,8 @@ cp /etc/config/podkop.probe-backup.<date> /etc/config/podkop && /etc/init.d/podk
 3. Каждую ночь: в LuCI откройте **Система → Планировщик**, добавьте
    строку `30 4 * * * podkop-probe --cron` и нажмите «Сохранить». `cron`
    должен быть включён (**Система → Загрузка**).
-4. Лог: `/tmp/podkop-probe.log`. Удалить всё: `podkop-probe --uninstall`.
+4. YouTube: колонка `yt` показывает страну, которую видит YouTube, а `no`
+   значит, что видео не открываются (такие серверы не выбираются). Если
+   есть хотя бы 2 хороших сервера с `RU` (там нет рекламы), в podkop
+   попадут только они.
+5. Лог: `/tmp/podkop-probe.log`. Удалить всё: `podkop-probe --uninstall`.
