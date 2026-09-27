@@ -23,6 +23,8 @@ sh <(wget -O - https://github.com/dkagramanyan/podkop-keys-availability-/release
 4. Choose what goes into podkop (then it restarts):
    **Enter** = both lists, `1` = only main, `2` = only YouTube,
    `3` = other sections (you type their names), `n` = nothing.
+   Changed your mind later? `podkop-probe --apply-saved` puts the lists
+   of the last run into podkop without testing again (until a reboot).
 5. At "Repeat this every night?" press **Enter**. This installs the
    `podkop-probe` command and saves your keys.
 

@@ -12,12 +12,14 @@
 #
 # https://github.com/dkagramanyan/podkop-keys-availability-
 
-VERSION="1.9.0"
+VERSION="1.9.1"
 REPO_URL="https://github.com/dkagramanyan/podkop-keys-availability-"
 RELEASE_URL="$REPO_URL/releases/latest/download/probe.sh"
 BIN=/usr/bin/podkop-probe            # installed copy, used by the nightly run
 CONF=/etc/podkop-probe.conf          # saved keys and settings
 LOG=/tmp/podkop-probe.log            # log of the last --cron run
+SAVED_BEST=/tmp/podkop-probe-best.txt     # the lists of the last run
+SAVED_YT=/tmp/podkop-probe-youtube.txt
 CRONTAB=/etc/crontabs/root
 PODKOP_INSTALL="sh <(wget -O - https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh)"
 
@@ -51,6 +53,7 @@ APPLY_TO=both                        # both, main or youtube: which lists go int
 YT_PING_URL="https://www.youtube.com/generate_204"
 YT_VIDEO=jNQXAC9IVRw                 # "Me at the zoo": public everywhere, never removed
 YT_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+APPLY_SAVED=0
 CRON=0; CRON_TIME=""; INSTALL=0; UNINSTALL=0; UPDATE=0; NO_UPDATE=0
 COUNTRIES=""                         # "" = all; europe; or DE,NL,...
 # Subscription panels (Remnawave, Marzban, 3x-ui...) only hand the real server
@@ -118,6 +121,8 @@ YouTube (a separate podkop section for YouTube traffic):
                     with the YouTube list and placed before --section)
   --apply-to WHAT   both (default), main or youtube: which list goes into
                     podkop with --apply and in the nightly run
+  --apply-saved     put the lists of the last run into podkop, no new test
+                    (they are kept in /tmp until the router restarts)
 
 Podkop (for link sources: -s, -f, links):
   --top N           how many best nodes to offer for podkop   (default $TOP)
@@ -217,6 +222,7 @@ while [ $# -gt 0 ]; do
     --install) INSTALL=1; shift ;;
     --uninstall|--nightly-off) UNINSTALL=1; shift ;;
     --update) UPDATE=1; shift ;;
+    --apply-saved) APPLY_SAVED=1; shift ;;
     --no-update) NO_UPDATE=1; shift ;;
     --cron) CRON=1; shift ;;
     --no-color) COLOR=0; shift ;;
@@ -1281,6 +1287,79 @@ uninstall() {
   info "removed $BIN, $CONF and the Scheduled Tasks line"
 }
 
+# --- podkop settings --------------------------------------------------------
+
+# set_urltest <section> <links file>: the section becomes a URLTest of the links
+set_urltest() {
+  uci -q delete "podkop.$1.urltest_proxy_links"
+  uci set "podkop.$1.connection_type=proxy"
+  uci set "podkop.$1.proxy_config_type=urltest"
+  while IFS= read -r _l; do uci add_list "podkop.$1.urltest_proxy_links=$_l"; done < "$2"
+}
+
+# sec_pos <section>: its position among podkop's sections (0 = first)
+sec_pos() { uci show podkop 2>/dev/null | sed -n 's/^podkop\.\([^.=]*\)=.*/\1/p' | grep -nxF "$1" | cut -d: -f1 | awk '{ print $1 - 1; exit }'; }
+
+# ensure_section <name>: create podkop section <name> if missing
+ensure_section() {
+  uci -q get "podkop.$1" >/dev/null && return 0
+  uci set "podkop.$1=section"
+  _msg="${_msg:+$_msg, }new section $1"
+}
+
+# apply_podkop: the main list (DO_MAIN) into section $SECTION and the YouTube
+# list (DO_YT) into $YT_SECTION, each as a URLTest; then restart podkop.
+# A new YouTube section gets podkop's "youtube" list and is moved before
+# $SECTION: podkop routes by the first section that matches, and lists like
+# "Russia inside" contain YouTube too.
+apply_podkop() {
+  _cfg=/etc/config/podkop
+  _bak="$_cfg.probe-backup.$(date +%Y%m%d-%H%M%S)"
+  cp "$_cfg" "$_bak" || die "cannot back up $_cfg"
+  ls -1t "$_cfg".probe-backup.* 2>/dev/null | tail -n +4 | while IFS= read -r _f; do rm -f "$_f"; done
+  _msg=""
+  if [ "$DO_MAIN" = 1 ]; then
+    uci -q get "podkop.$SECTION" >/dev/null || _new_main=1
+    ensure_section "$SECTION"
+    set_urltest "$SECTION" "$WORK/best"
+    _msg="${_msg:+$_msg, }$SECTION: $(wc -l < "$WORK/best" | tr -d ' ') server(s)"
+  fi
+  if [ "$DO_YT" = 1 ]; then
+    if ! uci -q get "podkop.$YT_SECTION" >/dev/null; then
+      ensure_section "$YT_SECTION"
+      uci add_list "podkop.$YT_SECTION.community_lists=youtube"
+    fi
+    set_urltest "$YT_SECTION" "$WORK/ytbest"
+    uci set "podkop.$YT_SECTION.urltest_testing_url=$YT_PING_URL"
+    _pm=$(sec_pos "$SECTION"); _py=$(sec_pos "$YT_SECTION")
+    [ -n "$_pm" ] && [ -n "$_py" ] && [ "$_py" -gt "$_pm" ] && uci reorder "podkop.$YT_SECTION=$_pm"
+    _msg="${_msg:+$_msg, }$YT_SECTION: $(wc -l < "$WORK/ytbest" | tr -d ' ') server(s)"
+  fi
+  uci commit podkop || die "uci commit failed, your old settings are in $_bak"
+  if /etc/init.d/podkop restart >/dev/null 2>&1; then
+    info "podkop updated ($_msg), restarted"
+    [ "$CRON" = 1 ] && logger -t podkop-probe "podkop updated ($_msg), restarted" 2>/dev/null
+  else
+    warn "podkop restart failed. Undo: cp $_bak $_cfg && /etc/init.d/podkop restart"
+    [ "$CRON" = 1 ] && logger -t podkop-probe "podkop restart failed after update, backup: $_bak" 2>/dev/null
+  fi
+  [ "${_new_main:-0}" = 1 ] && warn "section '$SECTION' is new and has no lists yet: add them in LuCI -> Services -> Podkop"
+  [ "$VERBOSE" = 1 ] && info "old settings saved in $_bak"
+  return 0
+}
+
+# ask_sections: section names for both lists ("-" = don't use that list)
+ask_sections() {
+  printf 'Section for the main list [%s, - = skip]: ' "$SECTION"
+  read -r _a < "$TTY" || _a=-; case "$_a" in -) DO_MAIN=0 ;; "") ;; *) SECTION=$_a ;; esac
+  if [ "$DO_YT" = 1 ]; then
+    printf 'Section for the YouTube list [%s, - = skip]: ' "$YT_SECTION"
+    read -r _a < "$TTY" || _a=-; case "$_a" in -) DO_YT=0 ;; "") ;; *) YT_SECTION=$_a ;; esac
+  fi
+  [ "$DO_MAIN" = 1 ] && [ "$DO_YT" = 1 ] && [ "$SECTION" = "$YT_SECTION" ] && { warn "both lists can't go into one section"; DO_YT=0; }
+  return 0
+}
+
 # --- main --------------------------------------------------------------------
 
 SAVED_SUBS=""; SAVED_C=""
@@ -1310,8 +1389,22 @@ cleanup() {
   [ "$CRON" = 1 ] && rmdir /tmp/podkop-probe.lock 2>/dev/null
 }
 mkdir -p "$WORK/n" "$WORK/pids" || die "cannot create $WORK"
+
 trap cleanup EXIT
 trap 'echo; warn "interrupted"; exit 130' INT TERM
+
+# --apply-saved: the lists of the last run into podkop, no test
+if [ "$APPLY_SAVED" = 1 ]; then
+  if [ ! -f /etc/config/podkop ] || ! command -v uci >/dev/null 2>&1; then die "podkop not found"; fi
+  cp "$SAVED_BEST" "$WORK/best" 2>/dev/null || : > "$WORK/best"
+  cp "$SAVED_YT" "$WORK/ytbest" 2>/dev/null || : > "$WORK/ytbest"
+  DO_MAIN=0; DO_YT=0
+  [ -s "$WORK/best" ] && [ "$APPLY_TO" != youtube ] && DO_MAIN=1
+  [ -s "$WORK/ytbest" ] && [ "$APPLY_TO" != main ] && [ "$YOUTUBE" = 1 ] && DO_YT=1
+  [ "$DO_MAIN$DO_YT" != 00 ] || die "no saved lists: run a test first (they are kept in /tmp until the router restarts)"
+  apply_podkop
+  exit 0
+fi
 : > "$NODES"
 
 _model=$(cat /tmp/sysinfo/model 2>/dev/null)
@@ -1825,88 +1918,17 @@ fi
 
 # --- put the best nodes into podkop ------------------------------------------
 
-# set_urltest <section> <links file>: the section becomes a URLTest of the links
-set_urltest() {
-  uci -q delete "podkop.$1.urltest_proxy_links"
-  uci set "podkop.$1.connection_type=proxy"
-  uci set "podkop.$1.proxy_config_type=urltest"
-  while IFS= read -r _l; do uci add_list "podkop.$1.urltest_proxy_links=$_l"; done < "$2"
-}
-
-# sec_pos <section>: its position among podkop's sections (0 = first)
-sec_pos() { uci show podkop 2>/dev/null | sed -n 's/^podkop\.\([^.=]*\)=.*/\1/p' | grep -nxF "$1" | cut -d: -f1 | awk '{ print $1 - 1; exit }'; }
-
-# ensure_section <name>: create podkop section <name> if missing
-ensure_section() {
-  uci -q get "podkop.$1" >/dev/null && return 0
-  uci set "podkop.$1=section"
-  _msg="${_msg:+$_msg, }new section $1"
-}
-
-# apply_podkop: the main list (DO_MAIN) into section $SECTION and the YouTube
-# list (DO_YT) into $YT_SECTION, each as a URLTest; then restart podkop.
-# A new YouTube section gets podkop's "youtube" list and is moved before
-# $SECTION: podkop routes by the first section that matches, and lists like
-# "Russia inside" contain YouTube too.
-apply_podkop() {
-  _cfg=/etc/config/podkop
-  _bak="$_cfg.probe-backup.$(date +%Y%m%d-%H%M%S)"
-  cp "$_cfg" "$_bak" || die "cannot back up $_cfg"
-  ls -1t "$_cfg".probe-backup.* 2>/dev/null | tail -n +4 | while IFS= read -r _f; do rm -f "$_f"; done
-  _msg=""
-  if [ "$DO_MAIN" = 1 ]; then
-    uci -q get "podkop.$SECTION" >/dev/null || _new_main=1
-    ensure_section "$SECTION"
-    set_urltest "$SECTION" "$WORK/best"
-    _msg="${_msg:+$_msg, }$SECTION: $(wc -l < "$WORK/best" | tr -d ' ') server(s)"
-  fi
-  if [ "$DO_YT" = 1 ]; then
-    if ! uci -q get "podkop.$YT_SECTION" >/dev/null; then
-      ensure_section "$YT_SECTION"
-      uci add_list "podkop.$YT_SECTION.community_lists=youtube"
-    fi
-    set_urltest "$YT_SECTION" "$WORK/ytbest"
-    uci set "podkop.$YT_SECTION.urltest_testing_url=$YT_PING_URL"
-    _pm=$(sec_pos "$SECTION"); _py=$(sec_pos "$YT_SECTION")
-    [ -n "$_pm" ] && [ -n "$_py" ] && [ "$_py" -gt "$_pm" ] && uci reorder "podkop.$YT_SECTION=$_pm"
-    _msg="${_msg:+$_msg, }$YT_SECTION: $(wc -l < "$WORK/ytbest" | tr -d ' ') server(s)"
-  fi
-  uci commit podkop || die "uci commit failed, your old settings are in $_bak"
-  if /etc/init.d/podkop restart >/dev/null 2>&1; then
-    info "podkop updated ($_msg), restarted"
-    [ "$CRON" = 1 ] && logger -t podkop-probe "podkop updated ($_msg), restarted" 2>/dev/null
-  else
-    warn "podkop restart failed. Undo: cp $_bak $_cfg && /etc/init.d/podkop restart"
-    [ "$CRON" = 1 ] && logger -t podkop-probe "podkop restart failed after update, backup: $_bak" 2>/dev/null
-  fi
-  [ "${_new_main:-0}" = 1 ] && warn "section '$SECTION' is new and has no lists yet: add them in LuCI -> Services -> Podkop"
-  [ "$VERBOSE" = 1 ] && info "old settings saved in $_bak"
-  return 0
-}
-
-# ask_sections: section names for both lists ("-" = don't use that list)
-ask_sections() {
-  printf 'Section for the main list [%s, - = skip]: ' "$SECTION"
-  read -r _a < "$TTY" || _a=-; case "$_a" in -) DO_MAIN=0 ;; "") ;; *) SECTION=$_a ;; esac
-  if [ "$DO_YT" = 1 ]; then
-    printf 'Section for the YouTube list [%s, - = skip]: ' "$YT_SECTION"
-    read -r _a < "$TTY" || _a=-; case "$_a" in -) DO_YT=0 ;; "") ;; *) YT_SECTION=$_a ;; esac
-  fi
-  [ "$DO_MAIN" = 1 ] && [ "$DO_YT" = 1 ] && [ "$SECTION" = "$YT_SECTION" ] && { warn "both lists can't go into one section"; DO_YT=0; }
-  return 0
-}
-
 HAVE_PODKOP=0
 [ -f /etc/config/podkop ] && command -v uci >/dev/null 2>&1 && HAVE_PODKOP=1
-cp "$WORK/best" /tmp/podkop-probe-best.txt 2>/dev/null
-cp "$WORK/ytbest" /tmp/podkop-probe-youtube.txt 2>/dev/null
+cp "$WORK/best" "$SAVED_BEST" 2>/dev/null
+cp "$WORK/ytbest" "$SAVED_YT" 2>/dev/null
 
 DO_MAIN=0; DO_YT=0
 [ -s "$WORK/best" ] && DO_MAIN=1
 [ "$YOUTUBE" = 1 ] && [ -s "$WORK/ytbest" ] && DO_YT=1
 if [ "$APPLY" != no ] && [ "$DO_MAIN" = 1 ] && case "$SOURCE" in podkop*) false ;; *) true ;; esac; then
   if [ "$HAVE_PODKOP" = 0 ]; then
-    info "podkop not found; the lists are in /tmp/podkop-probe-best.txt and /tmp/podkop-probe-youtube.txt"
+    info "podkop not found; the lists are in $SAVED_BEST and $SAVED_YT"
   else
     if [ "$APPLY" != yes ] && [ -n "$TTY" ]; then
       _nb=$(wc -l < "$WORK/best" | tr -d ' ')
@@ -1914,20 +1936,30 @@ if [ "$APPLY" != no ] && [ "$DO_MAIN" = 1 ] && case "$SOURCE" in podkop*) false 
       if [ "$DO_YT" = 1 ]; then
         printf '%sPut into podkop and restart it?%s\n' "$BD" "$R0"
         printf '  Enter) both:  %s <- %s server(s) (*),  %s <- %s server(s) (y)\n' "$SECTION" "$_nb" "$YT_SECTION" "$(wc -l < "$WORK/ytbest" | tr -d ' ')"
-        printf '  1) only %s   2) only %s   3) other sections   n) nothing\n> ' "$SECTION" "$YT_SECTION"
-        read -r _sel < "$TTY" || _sel=n
-        case "$_sel" in
-          "") ;;
-          1) DO_YT=0 ;;
-          2) DO_MAIN=0 ;;
-          3) ask_sections ;;
-          *) DO_MAIN=0; DO_YT=0 ;;
-        esac
+        printf '  1) only %s   2) only %s   3) other sections   n) nothing\n' "$SECTION" "$YT_SECTION"
+        while :; do
+          printf '> '; read -r _sel < "$TTY" || _sel=n
+          case "$_sel" in
+            ""|y|Y|yes|Yes|д|Д|да|Да) break ;;
+            1) DO_YT=0; break ;;
+            2) DO_MAIN=0; break ;;
+            3) ask_sections; break ;;
+            n|N|no|No|н|Н|нет|Нет|q) DO_MAIN=0; DO_YT=0; break ;;
+            *) echo "Enter (or y) = both, 1, 2, 3, or n" ;;
+          esac
+        done
       else
         printf '%sPut the %s marked (*) server(s) into podkop (%s) and restart it?%s\n' "$BD" "$_nb" "$SECTION" "$R0"
-        printf '  Enter) yes   3) other section   n) nothing\n> '
-        read -r _sel < "$TTY" || _sel=n
-        case "$_sel" in "") ;; 3) ask_sections ;; *) DO_MAIN=0 ;; esac
+        printf '  Enter) yes   3) other section   n) nothing\n'
+        while :; do
+          printf '> '; read -r _sel < "$TTY" || _sel=n
+          case "$_sel" in
+            ""|y|Y|yes|Yes|д|Д|да|Да) break ;;
+            3) ask_sections; break ;;
+            n|N|no|No|н|Н|нет|Нет|q) DO_MAIN=0; break ;;
+            *) echo "Enter (or y) = yes, 3, or n" ;;
+          esac
+        done
       fi
     else
       [ "$APPLY_TO" = youtube ] && DO_MAIN=0
@@ -1936,7 +1968,7 @@ if [ "$APPLY" != no ] && [ "$DO_MAIN" = 1 ] && case "$SOURCE" in podkop*) false 
     if [ "$DO_MAIN" = 1 ] && [ "$SECTION" = main ] && ! uci -q get "podkop.$SECTION" >/dev/null; then
       die "podkop has no section '$SECTION' (use --section)"
     fi
-    if [ "$DO_MAIN$DO_YT" != 00 ]; then apply_podkop; else info "podkop not changed (lists: /tmp/podkop-probe-best.txt, /tmp/podkop-probe-youtube.txt)"; fi
+    if [ "$DO_MAIN$DO_YT" != 00 ]; then apply_podkop; else info "podkop not changed (lists: $SAVED_BEST, $SAVED_YT; podkop-probe --apply-saved puts them in)"; fi
   fi
 elif [ "$APPLY" != no ] && [ "$DO_MAIN" = 0 ] && case "$SOURCE" in podkop*) false ;; *) true ;; esac; then
   _why="no working servers found"
