@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import hmac
 import json
+import re
 import secrets
 from pathlib import Path
 
@@ -105,6 +106,14 @@ def create_app(db: DB, hub: Hub, public_key: str) -> FastAPI:
     async def manager_info():
         return {"version": __version__, "public_key": public_key}
 
+    @app.post("/api/password", dependencies=[api])
+    async def change_password(body: dict):
+        pw = str(body.get("password", ""))
+        if len(pw) < 8:
+            raise HTTPException(400, "the password needs at least 8 characters")
+        db.set_setting("password_hash", hash_password(pw))
+        return {"ok": True}
+
     @app.get("/api/schema", dependencies=[api])
     async def schema():
         return podkop.SCHEMA
@@ -181,12 +190,41 @@ def create_app(db: DB, hub: Hub, public_key: str) -> FastAPI:
     @app.post("/api/routers/{rid}/apply", dependencies=[api])
     async def apply(rid: int, body: dict):
         router_or_404(rid)
-        return await hub.apply(rid, str(body.get("base", "")), body["config"], str(body.get("note", "")))
+        trigger = str(body.get("trigger") or "web")
+        if trigger not in ("web", "restore", "probe"):
+            raise HTTPException(400, "trigger must be web, restore or probe")
+        return await hub.apply(rid, str(body.get("base", "")), body["config"], str(body.get("note", "")), trigger)
 
     @app.get("/api/routers/{rid}/versions", dependencies=[api])
-    async def versions(rid: int):
+    async def versions(rid: int, limit: int = 30, before: int | None = None):
         router_or_404(rid)
-        return db.versions(rid)
+        return db.versions(rid, min(limit, 200), before)
+
+    # --- the draft ------------------------------------------------------------------
+    @app.get("/api/routers/{rid}/draft", dependencies=[api])
+    async def get_draft(rid: int):
+        rt = router_or_404(rid)
+        d = db.draft(rid)
+        return dict(d, **(rt.draft or {})) if d else None
+
+    @app.put("/api/routers/{rid}/draft", dependencies=[api])
+    async def put_draft(rid: int, body: dict):
+        rt = router_or_404(rid)
+        cfg = body.get("config")
+        if not isinstance(cfg, dict) or not isinstance(cfg.get("sections"), list):
+            raise HTTPException(400, "expected {\"config\": {\"sections\": [...]}, \"base\": ...}")
+        db.set_draft(rid, cfg, str(body.get("base", "")))
+        hub.update_draft(rt)
+        hub.publish({"type": "router", "router": rt.snapshot()})
+        return rt.draft
+
+    @app.delete("/api/routers/{rid}/draft", dependencies=[api])
+    async def delete_draft(rid: int):
+        rt = router_or_404(rid)
+        db.delete_draft(rid)
+        hub.update_draft(rt)
+        hub.publish({"type": "router", "router": rt.snapshot()})
+        return {"ok": True}
 
     @app.get("/api/versions/{vid}", dependencies=[api])
     async def version(vid: int):
@@ -220,23 +258,41 @@ def create_app(db: DB, hub: Hub, public_key: str) -> FastAPI:
         return db.events(rid, limit)
 
     @app.get("/api/routers/{rid}/logs", dependencies=[api])
-    async def logs(rid: int, q: str = "", limit: int = 500):
+    async def logs(rid: int, q: str = "", limit: int = 500, source: str = "", level: str = ""):
+        """Stored lines, oldest first; source and level take comma separated values."""
         router_or_404(rid)
-        return db.logs(rid, q, min(limit, 5000))
+        split = lambda v: [x for x in v.split(",") if x]  # noqa: E731
+        rows = db.logs(rid, q, min(limit, 5000), split(source), split(level))
+        for r in rows:
+            p = podkop.parse_log(r["line"])
+            r["time"], r["msg"] = p["time"], p["msg"]
+        return rows
 
     @app.get("/api/routers/{rid}/logs/recent", dependencies=[api])
     async def recent_logs(rid: int, lines: int = 300):
+        """The router's own log buffer, read now."""
         rt = router_or_404(rid)
-        return await rt.agent.call("logs", str(min(lines, 2000)))
+        return [dict(podkop.parse_log(line), line=line)
+                for line in await rt.agent.call("logs", str(min(lines, 2000)))]
 
     # --- probe ------------------------------------------------------------------------
     @app.get("/api/routers/{rid}/probe", dependencies=[api])
     async def probe(rid: int):
         rt = router_or_404(rid)
         st = None
+        ps = db.probe_settings(rid)
+        rules = db.auto_rules(rid)
         with contextlib.suppress(AgentError):
             st = await rt.agent.call("probe-status", timeout=30)
-        return {"settings": db.probe_settings(rid), "status": st, "runs": db.probe_runs(rid)}
+        if st:
+            picks = hub.auto_picks(rid, st)
+            st["rows"] = podkop.probe_rows(st, ps.get("options") or [],
+                                           {"main": ps.get("main_section"), "youtube": ps.get("youtube_section")}, picks)
+            st["keys"] = podkop.probe_keys(st.get("log") or [])
+            for r in rules:
+                r["picked"] = len(picks[r["section"]]["links"])
+                r["picked_fallback"] = len(picks[r["section"]]["fallback"])
+        return {"settings": ps, "status": st, "runs": db.probe_runs(rid), "auto_rules": rules}
 
     @app.put("/api/routers/{rid}/probe", dependencies=[api])
     async def probe_settings(rid: int, body: dict):
@@ -268,15 +324,70 @@ def create_app(db: DB, hub: Hub, public_key: str) -> FastAPI:
     async def probe_preview(rid: int):
         rt = router_or_404(rid)
         st = await rt.agent.call("probe-status", timeout=30)
-        lists = st.get("lists") or {}
-        if not lists.get("main") and not lists.get("youtube"):
-            raise HTTPException(400, "the last probe found no server to use")
         cur = await hub.config(rid)
         try:
-            new = hub.probe_config(db.probe_settings(rid), cur, lists)
+            new = hub.probe_config(rid, cur, st)
         except ValueError as e:
             raise HTTPException(400, str(e)) from None
         return {"fingerprint": cur["fingerprint"], "config": new, "diff": podkop.diff(cur["config"], new)}
+
+    # --- rules whose servers the probe picks by country --------------------------------
+    @app.get("/api/routers/{rid}/auto-rules", dependencies=[api])
+    async def auto_rules(rid: int):
+        router_or_404(rid)
+        return db.auto_rules(rid)
+
+    @app.get("/api/routers/{rid}/auto-rules/{section}", dependencies=[api])
+    async def get_auto_rule(rid: int, section: str):
+        router_or_404(rid)
+        r = db.auto_rule(rid, section)
+        if not r:
+            raise HTTPException(404, "this rule takes its servers from links")
+        return r
+
+    @app.put("/api/routers/{rid}/auto-rules/{section}", dependencies=[api])
+    async def put_auto_rule(rid: int, section: str, body: dict):
+        router_or_404(rid)
+        if not re.fullmatch(r"[A-Za-z0-9_]+", section):
+            raise HTTPException(400, "rule names are letters, digits and _")
+        ps = db.probe_settings(rid)
+        if section in (ps.get("main_section"), ps.get("youtube_section")):
+            raise HTTPException(400, f"{section} gets the probe's own list; pick its servers under Servers probe")
+        try:
+            rule = podkop.check_auto_rule(body)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+        db.set_auto_rule(rid, section, rule)
+        return db.auto_rule(rid, section)
+
+    @app.delete("/api/routers/{rid}/auto-rules/{section}", dependencies=[api])
+    async def delete_auto_rule(rid: int, section: str):
+        router_or_404(rid)
+        db.delete_auto_rule(rid, section)
+        return {"ok": True}
+
+    @app.get("/api/routers/{rid}/auto-rules/{section}/preview", dependencies=[api])
+    async def preview_auto_rule(rid: int, section: str):
+        """What the rule gets from the last probe run: matched servers,
+        fallback and the ones left out with the reason."""
+        rt = router_or_404(rid)
+        rule = db.auto_rule(rid, section)
+        if not rule:
+            raise HTTPException(404, "this rule takes its servers from links")
+        st = None
+        with contextlib.suppress(AgentError):
+            st = await rt.agent.call("probe-status", timeout=30)
+        if not st or not st.get("rows"):
+            last = next((r for r in db.probe_runs(rid) if r["state"] == "done"), None)
+            st = (db.probe_result(last["id"]) if last else None) or {}
+        pick = hub.auto_picks(rid, st).get(section) or {"matched": [], "fallback_rows": [], "left_out": []}
+        ps = db.probe_settings(rid)
+        return {"rule": rule, "finished": st.get("finished"), "has_links": any(r.get("link") for r in st.get("rows") or []),
+                "probe_options": ps.get("options") or [], "schedule": ps.get("schedule") or "",
+                "keys": len(ps.get("keys") or []),
+                "countries": sorted({r["country"] for r in st.get("rows") or [] if len(r.get("country") or "") == 2}),
+                "matched": pick["matched"], "fallback": pick["fallback_rows"],
+                "left_out": pick["left_out"]}
 
     # --- live stream --------------------------------------------------------------------
     @app.get("/api/stream", dependencies=[api])

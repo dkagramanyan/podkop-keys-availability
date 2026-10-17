@@ -5,16 +5,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>podkop-manager</title>
 <link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-<header class="top">
-  <a href="#/" class="brand">podkop-manager</a>
-  <nav><a href="#/">Routers</a><a href="#/settings">Settings</a></nav>
-  <span id="live" class="live" title="live updates">●</span>
-</header>
-<main id="main"></main>
-<div id="toast" class="toast" hidden></div>
+<div class="app">
+  <nav class="side" id="side" aria-label="Sections"></nav>
+  <main class="main" id="main"></main>
+</div>
+<div id="toast" class="toast" role="status" hidden></div>
 <script src="/static/app.js"></script>
 </body>
 </html>

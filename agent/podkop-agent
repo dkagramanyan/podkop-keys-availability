@@ -12,7 +12,7 @@
 # $SSH_ORIGINAL_COMMAND, requests come as JSON on stdin, answers go as JSON to
 # stdout: {"v":1,"ok":true,"data":...} or {"v":1,"ok":false,"error":{...}}.
 
-AGENT_VERSION="0.1.0"
+AGENT_VERSION="0.1.1"
 PROTO=1
 ETC=/etc/podkop-agent
 RUN=/tmp/podkop-agent
@@ -674,7 +674,7 @@ cmd_probe_start() {
   done
   set +f
   echo running > "$RUN/probe/state"
-  rm -f "$RUN/probe/result.csv" "$RUN/probe/exit"
+  rm -f "$RUN/probe/result.csv" "$RUN/probe/result.csv.links" "$RUN/probe/exit"
   now > "$RUN/probe/started"
   spawn _run-probe
   event probe_started
@@ -705,8 +705,14 @@ CSV_JQ='split("\n") | .[1:] | map(select(. != "") | split(",") as $f
      node: ($f[12:] | join(",") | ltrimstr("\"") | rtrimstr("\"") | split("\"\"") | join("\""))})'
 
 cmd_probe_status() {
-  _log=$(tail -n 60 "$RUN/probe/log" 2>/dev/null | jq -Rsc 'split("\n") | map(select(. != ""))')
+  _log=$(tail -n 400 "$RUN/probe/log" 2>/dev/null | jq -Rsc 'split("\n") | map(select(. != ""))')
   _rows='[]'; [ -s "$RUN/probe/result.csv" ] && _rows=$(jq -Rsc "$CSV_JQ" "$RUN/probe/result.csv")
+  # the link of each row, from podkop-probe's result.csv.links ("n<TAB>link")
+  if [ -s "$RUN/probe/result.csv.links" ]; then
+    _rows=$(jq -Rsc --argjson rows "$_rows" '
+      (split("\n") | map(select(. != "") | split("\t") | {key: .[0], value: (.[1:] | join("\t"))}) | from_entries) as $l
+      | $rows | map(. + {link: ($l[.n] // null)})' "$RUN/probe/result.csv.links")
+  fi
   reply "$(jq -nc --arg st "$(cat "$RUN/probe/state" 2>/dev/null || echo none)" \
     --arg s "$(cat "$RUN/probe/started" 2>/dev/null)" --arg f "$(cat "$RUN/probe/finished" 2>/dev/null)" \
     --arg rc "$(cat "$RUN/probe/exit" 2>/dev/null)" --argjson log "${_log:-[]}" --argjson rows "$_rows" \

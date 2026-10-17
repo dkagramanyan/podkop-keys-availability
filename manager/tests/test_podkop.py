@@ -73,3 +73,87 @@ def test_tag_names():
     n = podkop.tag_names(c)
     assert n["main-1-out"] == "🇱🇹 A" and n["main-2-out"] == "h2:3" and n["main-fallback-1-out"] == "C D"
     assert n["main-urltest-out"] == "automatic"
+
+
+def test_parse_log_sources_and_levels():
+    p = podkop.parse_log("Sat Oct 17 23:18:40 2026 user.notice podkop: [info] Stopping the podkop")
+    assert p == {"time": "23:18:40", "source": "podkop", "level": "info", "msg": "Stopping the podkop"}
+    p = podkop.parse_log("Sat Oct 17 23:19:24 2026 user.notice podkop: [fatal] Sing-box configuration is invalid.")
+    assert p["level"] == "error" and p["msg"] == "Sing-box configuration is invalid."
+    p = podkop.parse_log("Sat Oct 17 23:18:48 2026 daemon.err sing-box[14682]: WARN[0000] outbound/vless[a-1-out]: slow")
+    assert (p["source"], p["level"], p["msg"]) == ("sing-box", "warn", "outbound/vless[a-1-out]: slow")
+    # sing-box writes to stderr, so daemon.err alone is not an error
+    p = podkop.parse_log("Sat Oct 17 23:18:48 2026 daemon.err sing-box[14682]: started")
+    assert p["level"] == "info"
+    p = podkop.parse_log("Sat Oct  4 03:00:01 2026 user.notice podkop-agent: apply 20261004-1")
+    assert (p["source"], p["time"]) == ("agent", "03:00:01")
+    assert podkop.parse_log("Sat Oct 17 23:18:48 2026 daemon.err sing-box[1]: ERROR[0001] failsafe: stop")["source"] == "engine"
+    assert podkop.parse_log("garbage")["msg"] == "garbage"
+
+
+def test_probe_rows_goes_to_and_reasons():
+    st = {"lists": {"main": ["vless://a@h:1#A"], "main_fallback": [], "youtube": ["vless://a@h:1#A", "vless://b@h:2#B"]},
+          "rows": [{"node": "A", "verdict": "GOOD", "median": "0.3", "mbit": "90"},
+                   {"node": "B", "verdict": "OK", "median": "0.4", "mbit": "80"},
+                   {"node": "C", "verdict": "OK", "median": "0.9", "mbit": "20"},
+                   {"node": "D", "verdict": "OK", "median": "0.2", "mbit": "-"},
+                   {"node": "E", "verdict": "DEAD", "median": "-", "mbit": "-"},
+                   {"node": "F", "verdict": "OTHER REGION", "country": "RU"},
+                   {"node": "G", "verdict": "SKIPPED"}]}
+    rows = {r["node"]: r for r in podkop.probe_rows(st, ["--max-ping", "800", "--countries", "europe"])}
+    assert [(g["rule"], g["kind"], g["fallback"]) for g in rows["A"]["goes_to"]] == [("main", "main", False),
+                                                                                      ("youtube", "youtube", False)]
+    assert rows["A"]["reason"] == ""
+    assert [g["rule"] for g in rows["B"]["goes_to"]] == ["youtube"]
+    assert rows["C"]["reason"] == "ping 900 ms, 800 or more; too slow, 40 Mbit/s or less"
+    assert rows["D"]["reason"] == ""     # works, the lists were full
+    assert "failed" in rows["E"]["reason"] and "RU" in rows["F"]["reason"] and "podkop" in rows["G"]["reason"]
+
+
+def test_probe_keys():
+    log = ["==> servers", "  key 1  sub.example.com            42 servers  · 10 GB left",
+           "! key 2 (link.example.org): the key's device limit is reached (x): remove an old device"]
+    assert podkop.probe_keys(log) == {1: {"servers": 42},
+                                      2: {"error": "the key's device limit is reached (x): remove an old device"}}
+
+
+ROWS = [{"node": "PL Warsaw 5", "link": "vless://a@h:1#W5", "verdict": "GOOD", "median": "0.47", "mbit": "138",
+         "country": "PL", "exit_ip": "203.0.113.41"},
+        {"node": "PL Krakow 1", "link": "vless://b@h:1#K1", "verdict": "OK", "median": "0.58", "mbit": "96",
+         "country": "PL", "exit_ip": "198.51.100.12"},
+        {"node": "PL Gdansk", "link": "trojan://c@h:1#G", "verdict": "GOOD", "median": "0.3", "mbit": "99",
+         "country": "PL", "exit_ip": "198.51.100.77"},
+        {"node": "PL Slow", "link": "vless://d@h:1#S", "verdict": "OK", "median": "0.4", "mbit": "12",
+         "country": "PL", "exit_ip": "198.51.100.78"},
+        {"node": "PL Fast", "link": "vless://e@h:1#F", "verdict": "GOOD", "median": "0.2", "mbit": "300",
+         "country": "PL", "exit_ip": "198.51.100.79"},
+        {"node": "DE", "link": "vless://f@h:1#D", "verdict": "GOOD", "median": "0.1", "mbit": "300", "country": "DE"},
+        {"node": "no link", "verdict": "GOOD", "median": "0.1", "mbit": "300", "country": "PL"}]
+
+
+def test_auto_pick_filters_limits_and_order():
+    rule = podkop.check_auto_rule({"countries": ["pl"], "protocols": ["vless"], "top": 2, "fallback": 1})
+    p = podkop.auto_pick(ROWS, rule, 700, 40)
+    assert p["links"] == ["vless://e@h:1#F", "vless://a@h:1#W5"] and p["fallback"] == ["vless://b@h:1#K1"]
+    why = {x["name"]: x["reason"] for x in p["left_out"]}
+    assert "trojan" in why["PL Gdansk"] and "Mbit/s" in why["PL Slow"]
+    assert "DE" not in why and "no link" not in why      # other countries are not "left out"
+    ip = podkop.check_auto_rule({"countries": ["PL"], "exit_ips": ["198.51.100.0/24"], "name_contains": "krak"})
+    assert podkop.auto_pick(ROWS, ip, 700, 40)["links"] == ["vless://b@h:1#K1"]
+
+
+def test_check_auto_rule_refuses_bad_input():
+    for bad in ({"countries": ["Poland"]}, {"protocols": ["vmess"]}, {"exit_ips": ["10.0.0.0/33"]}, {"top": 0}):
+        with pytest.raises(ValueError):
+            podkop.check_auto_rule(bad)
+
+
+def test_merge_probe_fills_rules_by_country():
+    base = cfg(("settings", "settings", {}), ("netflix", "section", {"connection_type": "proxy"}),
+               ("main", "section", {"connection_type": "proxy"}))
+    out = podkop.merge_probe(base, {}, auto={"netflix": {"links": ["vless://a"], "fallback": []},
+                                             "gone": {"links": ["vless://b"], "fallback": []},
+                                             "main": {"links": [], "fallback": []}})
+    o = out["sections"][1]["options"]
+    assert o["proxy_config_type"] == "urltest" and o["urltest_proxy_links"] == ["vless://a"]
+    assert "urltest_proxy_links" not in out["sections"][2]["options"] and len(out["sections"]) == 3

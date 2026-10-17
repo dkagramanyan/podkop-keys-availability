@@ -1,5 +1,6 @@
 """podkop's settings: the option schema of podkop 0.7.24 (from its LuCI app),
-the diff between two configs, and putting podkop-probe's lists into a config.
+the diff between two configs, putting podkop-probe's lists into a config,
+reading podkop-probe's results and the router's log lines.
 
 A config is what podkop-agent's config-get returns:
 {"sections": [{"name", "type", "anonymous", "options": {opt: str | [str]}}]}
@@ -8,6 +9,8 @@ A config is what podkop-agent's config-get returns:
 from __future__ import annotations
 
 import copy
+import ipaddress
+import re
 from urllib.parse import unquote
 
 # kind: select (one of values), combo (free text with suggestions), text,
@@ -191,11 +194,14 @@ def _set_urltest(sec: dict, links: list, fallback: list) -> None:
         o.pop("urltest_fallback_links", None)
 
 
-def merge_probe(config: dict, lists: dict, main: str = "main", youtube: str | None = "youtube") -> dict:
+def merge_probe(config: dict, lists: dict, main: str = "main", youtube: str | None = "youtube",
+                auto: dict | None = None) -> dict:
     """podkop-probe's lists put into a config, the way podkop-probe itself
     does it: the main list (and its fallbacks) become the URLTest of `main`;
     the YouTube list goes into `youtube`, created with podkop's youtube list
     and kept above `main` (podkop routes by the first section that matches).
+    auto: {section: {"links": [...], "fallback": [...]}} from auto_pick, for
+    rules whose servers are picked by country; only existing sections get them.
     An empty list leaves its section alone."""
     cfg = copy.deepcopy(config)
     secs = cfg.setdefault("sections", [])
@@ -213,6 +219,9 @@ def merge_probe(config: dict, lists: dict, main: str = "main", youtube: str | No
         _set_urltest(by[youtube], lists["youtube"], lists.get("youtube_fallback") or [])
         by[youtube]["options"]["urltest_testing_url"] = YOUTUBE_PING_URL
         _move_before(secs, youtube, main)
+    for name, pick in (auto or {}).items():
+        if name in by and pick["links"]:
+            _set_urltest(by[name], pick["links"], pick["fallback"])
     return cfg
 
 
@@ -244,3 +253,221 @@ def tag_names(config: dict) -> dict:
         elif o.get("proxy_config_type") == "url" and o.get("proxy_string"):
             out[f"{name}-out"] = link_name(o["proxy_string"])
     return out
+
+
+# --- podkop-probe's results -------------------------------------------------------
+
+USABLE = {"GOOD", "OK", "FLAKY"}
+LIST_KEYS = ("main", "main_fallback", "youtube", "youtube_fallback")
+
+
+def _option(options: list, name: str, default: float) -> float:
+    try:
+        return float(options[options.index(name) + 1])
+    except (ValueError, IndexError):
+        return default
+
+
+def _num(v) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def probe_reason(row: dict, max_ping: float, min_speed: float) -> str:
+    """Why podkop-probe did not pick a server; "" when it works and is fast
+    enough but the lists were full."""
+    v = row.get("verdict", "")
+    if v == "SKIPPED":
+        return "podkop cannot read this link"
+    if v == "NO START":
+        return "sing-box did not start with this server"
+    if v == "NOT VIA NODE":
+        return "traffic did not go through the server"
+    if v == "OTHER REGION":
+        return f"exit IP in {row.get('country') or 'an unknown country'}, outside the chosen countries"
+    if v not in USABLE:
+        return "every request failed: unreachable, blocked or wrong credentials"
+    why = []
+    median, mbit = _num(row.get("median")), _num(row.get("mbit"))
+    if median is not None and median * 1000 >= max_ping:
+        why.append(f"ping {round(median * 1000)} ms, {int(max_ping)} or more")
+    if mbit is not None and mbit <= min_speed:
+        why.append(f"too slow, {int(min_speed)} Mbit/s or less")
+    return "; ".join(why)
+
+
+def probe_limits(options: list) -> tuple[float, float]:
+    """The probe's ping (ms) and speed (Mbit/s) limits from its options."""
+    return _option(options, "--max-ping", 700), _option(options, "--min-speed", 40)
+
+
+def probe_rows(status: dict, options: list, sections: dict | None = None, picks: dict | None = None) -> list[dict]:
+    """The rows of podkop-probe's CSV with where each server went and, for the
+    others, why it was not picked. goes_to: [{"rule", "kind" (main, youtube,
+    auto), "fallback"}]; sections: {"main": rule, "youtube": rule} the probe's
+    lists go to; picks: auto_pick results by rule."""
+    sections = sections or {"main": "main", "youtube": "youtube"}
+    where: dict[str, list] = {}
+
+    def add(link: str, rule: str, kind: str, fallback: bool) -> None:
+        where.setdefault(link, []).append({"rule": rule, "kind": kind, "fallback": fallback})
+
+    lists = status.get("lists") or {}
+    for kind in ("main", "youtube"):
+        if sections.get(kind):
+            for fb in (False, True):
+                for link in lists.get(kind + ("_fallback" if fb else "")) or []:
+                    add(link, sections[kind], kind, fb)
+    for rule, pick in (picks or {}).items():
+        for fb, key in ((False, "links"), (True, "fallback")):
+            for link in pick[key]:
+                add(link, rule, "auto", fb)
+    # rows from an older podkop-probe have no link: match by name
+    by_name = {link_name(k): v for k, v in where.items()}
+    max_ping, min_speed = probe_limits(options)
+    out = []
+    for r in status.get("rows") or []:
+        goes = where.get(r["link"], []) if r.get("link") else by_name.get(r.get("node", ""), [])
+        out.append(dict(r, goes_to=goes, reason="" if goes else probe_reason(r, max_ping, min_speed)))
+    return out
+
+
+PROTOCOLS = ("vless", "trojan", "ss", "hysteria2", "socks")
+
+
+def link_protocol(link: str) -> str:
+    p = link.split("://", 1)[0].lower() if "://" in link else ""
+    return {"hy2": "hysteria2", "shadowsocks": "ss", "socks5": "socks", "socks4": "socks"}.get(p, p)
+
+
+def _ip_in(ip: str, nets: list) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for n in nets:
+        try:
+            if addr in ipaddress.ip_network(n, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def check_auto_rule(rule: dict) -> dict:
+    """A rule by country as stored: lists cleaned up; raises ValueError."""
+    countries = sorted({str(c).strip().upper() for c in rule.get("countries") or [] if str(c).strip()})
+    if any(not re.fullmatch(r"[A-Z]{2}", c) for c in countries):
+        raise ValueError("countries are two-letter codes like PL")
+    protocols = [p for p in PROTOCOLS if p in (rule.get("protocols") or [])]
+    if set(rule.get("protocols") or []) - set(protocols):
+        raise ValueError(f"protocols are {', '.join(PROTOCOLS)}")
+    exit_ips = [str(x).strip() for x in rule.get("exit_ips") or [] if str(x).strip()]
+    for x in exit_ips:
+        try:
+            ipaddress.ip_network(x, strict=False)
+        except ValueError:
+            raise ValueError(f"{x} is not an IP address or subnet") from None
+    try:
+        top, fallback = int(rule.get("top", 5)), int(rule.get("fallback", 2))
+    except (TypeError, ValueError):
+        raise ValueError("how many servers to keep must be a number") from None
+    if not 1 <= top <= 50 or not 0 <= fallback <= 50:
+        raise ValueError("keep 1 to 50 servers and 0 to 50 fallback")
+    return {"countries": countries, "protocols": protocols, "exit_ips": exit_ips,
+            "name_contains": str(rule.get("name_contains") or "").strip(), "top": top, "fallback": fallback}
+
+
+def auto_pick(rows: list, rule: dict, max_ping: float, min_speed: float) -> dict:
+    """The servers of the probe's rows for a rule by country: those that pass
+    its filter and the probe's limits, fastest median first; top of them for
+    the URLTest, the next ones as fallback. left_out: servers in the rule's
+    countries that were not taken, with the reason."""
+    picked, left = [], []
+    for r in rows:
+        link = r.get("link")
+        if not link:
+            continue
+        in_country = not rule["countries"] or (r.get("country") or "").upper() in rule["countries"]
+        if not in_country:
+            continue
+        name = r.get("node") or link_name(link)
+        why = ""
+        if rule["protocols"] and link_protocol(link) not in rule["protocols"]:
+            why = f"{link_protocol(link) or 'unknown protocol'}, not one of the chosen protocols"
+        elif rule["exit_ips"] and not _ip_in(r.get("exit_ip") or "", rule["exit_ips"]):
+            why = f"exit IP {r.get('exit_ip') or 'unknown'} is not in the list"
+        elif rule["name_contains"] and rule["name_contains"].lower() not in name.lower():
+            why = f"name does not contain {rule['name_contains']}"
+        else:
+            why = probe_reason(r, max_ping, min_speed)
+        item = {"name": name, "link": link, "protocol": link_protocol(link), "exit_ip": r.get("exit_ip"),
+                "country": r.get("country"), "median": r.get("median"), "mbit": r.get("mbit"), "verdict": r.get("verdict")}
+        if why:
+            left.append(dict(item, reason=why))
+        else:
+            picked.append(item)
+    picked.sort(key=lambda x: _num(x["median"]) if _num(x["median"]) is not None else 1e9)
+    keep, fb = picked[:rule["top"]], picked[rule["top"]:rule["top"] + rule["fallback"]]
+    left += [dict(x, reason=f"not among the {rule['top'] + rule['fallback']} fastest")
+             for x in picked[rule["top"] + rule["fallback"]:]]
+    return {"matched": keep, "fallback_rows": fb, "left_out": left,
+            "links": [x["link"] for x in keep], "fallback": [x["link"] for x in fb]}
+
+
+_KEY_OK = re.compile(r"^\s*key (\d+)\s+\S+\s+(\d+) servers")
+_KEY_BAD = re.compile(r"key (\d+) \([^)]*\): (.*)$")
+
+
+def probe_keys(log: list) -> dict:
+    """What podkop-probe's output says about each key (subscription), by its
+    position: {1: {"servers": 42}, 2: {"error": "the key's device limit ..."}}."""
+    out: dict[int, dict] = {}
+    for line in log or []:
+        if m := _KEY_OK.match(line):
+            out[int(m.group(1))] = {"servers": int(m.group(2))}
+        elif m := _KEY_BAD.search(line):
+            out[int(m.group(1))] = {"error": m.group(2).strip()}
+    return out
+
+
+# --- the router's log lines -----------------------------------------------------------
+
+# Sat Oct 17 23:18:40 2026 user.notice podkop: [info] Stopping the podkop
+# Sat Oct 17 23:18:48 2026 daemon.err sing-box[14682]: WARN[0000] outbound/vless[...]: ...
+_LOG = re.compile(r"^\w{3} \w{3} +\d+ (\d\d:\d\d:\d\d) \d{4} \w+\.(\w+) ([^:\[\s]+)(?:\[\d+\])?: ?(.*)$")
+_LEVEL_TAG = re.compile(r"^(?:\[(\w+)\]|(TRACE|DEBUG|INFO|WARN|ERROR|FATAL|PANIC)\[\d+\]) ?")
+LEVELS = {"trace": "debug", "debug": "debug", "info": "info", "notice": "info", "warn": "warn",
+          "warning": "warn", "err": "error", "error": "error", "fatal": "error", "panic": "error",
+          "crit": "error", "alert": "error", "emerg": "error"}
+LOG_SOURCES = ("podkop", "sing-box", "engine", "agent")
+
+
+def parse_log(line: str) -> dict:
+    """time (router's clock), source (podkop, sing-box, engine, agent), level
+    (debug, info, warn, error) and the message of one syslog line."""
+    m = _LOG.match(line)
+    if not m:
+        return {"time": "", "source": "", "level": "info", "msg": line}
+    time_, prio, tag, msg = m.groups()
+    lm = _LEVEL_TAG.match(msg)
+    if lm:
+        level = LEVELS.get((lm.group(1) or lm.group(2)).lower(), "info")
+        msg = msg[lm.end():]
+    else:
+        # sing-box writes everything to stderr, so its priority says nothing
+        level = "info" if tag == "sing-box" else LEVELS.get(prio, "info")
+    low = tag.lower()
+    if "engine" in low or "failsafe" in low or (tag == "sing-box" and "failsafe" in msg.lower()):
+        source = "engine"
+    elif tag == "podkop-agent":
+        source = "agent"
+    elif tag == "sing-box":
+        source = "sing-box"
+    elif low.startswith("podkop"):
+        source = "podkop"
+    else:
+        source = tag
+    return {"time": time_, "source": source, "level": level, "msg": msg}
