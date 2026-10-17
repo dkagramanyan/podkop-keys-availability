@@ -4,8 +4,9 @@ Tests all servers from your VPN subscriptions ("keys") on your OpenWrt
 router and puts the best ones into [podkop](https://github.com/itdoginfo/podkop),
 once or every night, as two lists: the 10 fastest servers for the main
 section, and the 10 fastest where YouTube sees Russia (no ads) for a
-separate `youtube` section.
-Needs podkop to be installed.
+separate `youtube` section, each with 5 fallback servers.
+Needs [podkop](https://github.com/itdoginfo/podkop) and
+[podkop-engine](https://github.com/FiyeroT/podkop-engine) to be installed.
 
 ## Run
 
@@ -19,7 +20,7 @@ sh <(wget -O - https://github.com/dkagramanyan/podkop-keys-availability-/release
    press Enter on an empty line.
 2. Press **Enter** for "Europe only".
 3. Wait 2–7 minutes. You get two tables: **Main** (picks marked `*`)
-   and **YouTube** (picks marked `y`).
+   and **YouTube** (picks marked `y`); `f` marks the fallback servers.
 4. Choose what goes into podkop (then it restarts):
    **Enter** = both lists, `1` = only main, `2` = only YouTube,
    `3` = other sections (you type their names), `n` = nothing.
@@ -63,6 +64,8 @@ into podkop and restarts podkop. If nothing works, podkop is left alone.
   or less, are never picked (`--max-ping 500`, `--min-speed 60` to change).
 - **Main list → section `main`:** fewest lost requests, lowest ping, highest
   speed.
+- **Fallback servers:** the next 5 servers of each list go into podkop's
+  fallback links. podkop uses them only when all servers of the list fail.
 - **YouTube list → section `youtube`:** only servers where YouTube sees
   **RU** (the small code next to the YouTube logo; Russia gets no ads),
   ranked by ping to YouTube and speed. If there are none, the section is
@@ -88,7 +91,10 @@ cp /etc/config/podkop.probe-backup.<date> /etc/config/podkop && /etc/init.d/podk
 - **Countries.** "Europe only" checks the server name, the IP you connect
   to and the IP your traffic exits from. So relays "через 🇷🇺" are
   skipped.
-- **xhttp servers** are skipped: podkop (sing-box) can't run them.
+- **Which servers can be used:** every server is built by podkop itself, so
+  it is tested exactly the way podkop will run it. podkop takes vless, trojan,
+  ss, hysteria2 and socks links over tcp, ws, grpc or xhttp; the others
+  (vmess, httpupgrade, ...) are skipped, `-v` shows why.
 - **Speed tests** go through the VPN server, so a provider blocking
   Cloudflare doesn't matter. On fast lines up to 3 run at once.
 - **More detail:** `-v` shows every server and why the others failed.
@@ -113,7 +119,9 @@ cp /etc/config/podkop.probe-backup.<date> /etc/config/podkop && /etc/init.d/podk
    должен быть включён (**Система → Загрузка**).
 4. Получаются два списка: быстрые серверы для `main` и быстрые серверы,
    где YouTube видит `RU` (без рекламы), для секции `youtube` (скрипт
-   сам создаёт её со списком YouTube выше `main`). Серверы с пингом от
+   сам создаёт её со списком YouTube выше `main`). Следующие 5 серверов
+   каждого списка становятся резервными: podkop включает их, только если
+   не работает ни один основной. Серверы с пингом от
    700 мс или скоростью до 40 Мбит/с не берутся. В конце: Enter = оба
    списка, 1 = только main, 2 = только YouTube, 3 = другие секции,
    n = ничего.
