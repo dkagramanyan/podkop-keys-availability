@@ -39,12 +39,12 @@ def ssh_key(d: Path) -> tuple[Path, str]:
 
 
 def source_dir() -> Path:
-    """Where podkop-agent, install.sh and probe.sh are: the repository this
-    package lives in, or PODKOP_MANAGER_SRC."""
+    """Where router/ (podkop-agent, install.sh, probe.sh) is: the repository
+    this package lives in, or PODKOP_MANAGER_SRC."""
     env = os.environ.get("PODKOP_MANAGER_SRC")
     if env:
         return Path(env)
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[1]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -78,11 +78,12 @@ def main(argv: list[str] | None = None) -> int:
 
     import uvicorn
 
+    from .agent import AGENT_FILES
     from .hub import Hub
     from .web import create_app
 
     src = source_dir()
-    missing = [f for f in ("agent/podkop-agent", "agent/install.sh", "probe.sh") if not (src / f).exists()]
+    missing = [f for f in AGENT_FILES if not (src / f).exists()]
     if missing:
         print(f"cannot find {', '.join(missing)} in {src} (set PODKOP_MANAGER_SRC)", file=sys.stderr)
         return 1

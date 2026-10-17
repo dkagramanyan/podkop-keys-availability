@@ -100,7 +100,7 @@ class Agent:
             proc.close()
 
 
-AGENT_FILES = ("agent/podkop-agent", "agent/podkop-agent.init", "agent/install.sh", "probe.sh")
+AGENT_FILES = ("router/podkop-agent", "router/podkop-agent.init", "router/install.sh", "router/probe.sh")
 
 
 async def install(host: str, port: int, password: str, public_key: str, src: Path,

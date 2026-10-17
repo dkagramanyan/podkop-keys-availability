@@ -8,12 +8,12 @@
 # exit IP through the node, fire N requests, count failures, report latency.
 #
 # One-liner (on the router):
-#   sh <(wget -O - https://github.com/dkagramanyan/podkop-keys-availability/releases/latest/download/probe.sh)
+#   sh <(wget -O - https://github.com/dkagramanyan/podkop-manager/releases/latest/download/probe.sh)
 #
-# https://github.com/dkagramanyan/podkop-keys-availability
+# https://github.com/dkagramanyan/podkop-manager
 
-VERSION="1.12.0"
-REPO_URL="https://github.com/dkagramanyan/podkop-keys-availability"
+VERSION="1.13.0"
+REPO_URL="https://github.com/dkagramanyan/podkop-manager"
 RELEASE_URL="$REPO_URL/releases/latest/download/probe.sh"
 BIN=/usr/bin/podkop-probe            # installed copy, used by the nightly run
 CONF=/etc/podkop-probe.conf          # saved keys and settings

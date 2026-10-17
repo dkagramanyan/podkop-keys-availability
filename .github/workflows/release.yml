@@ -1,21 +1,21 @@
 name: release
 
-# Publishes probe.sh and podkop-agent's files (podkop-agent, podkop-agent.init,
+# Publishes the router files (probe.sh, podkop-agent, podkop-agent.init,
 # install.sh) as GitHub release assets:
-#  - automatically on every push to main that changes probe.sh, when the
-#    VERSION inside it has no release yet (so merging a version bump = release)
+#  - automatically on every push to main that changes router/, when the
+#    VERSION in router/probe.sh has no release yet (so merging a version bump = release)
 #  - on a pushed v* tag
 #  - manually from the Actions tab
 
 on:
   push:
     branches: [main]
-    paths: [probe.sh, "agent/**"]
+    paths: ["router/**"]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release (e.g. v1.1.0); empty = VERSION from probe.sh"
+        description: "Tag to release (e.g. v1.1.0); empty = VERSION from router/probe.sh"
         required: false
 
 permissions:
@@ -28,32 +28,32 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Lint
-        run: shellcheck -s dash probe.sh agent/podkop-agent agent/podkop-agent.init agent/install.sh
+        run: shellcheck -s dash router/probe.sh router/podkop-agent router/podkop-agent.init router/install.sh
 
       - name: Resolve tag
         id: tag
         run: |
-          version=$(sed -n 's/^VERSION="\(.*\)"/\1/p' probe.sh)
-          [ -n "$version" ] || { echo "no VERSION in probe.sh"; exit 1; }
+          version=$(sed -n 's/^VERSION="\(.*\)"/\1/p' router/probe.sh)
+          [ -n "$version" ] || { echo "no VERSION in router/probe.sh"; exit 1; }
           if [ "${{ github.ref_type }}" = tag ]; then tag="${{ github.ref_name }}"
           elif [ -n "${{ inputs.tag }}" ]; then tag="${{ inputs.tag }}"
           else tag="v$version"; fi
-          [ "$tag" = "v$version" ] || { echo "tag $tag does not match VERSION=$version in probe.sh"; exit 1; }
+          [ "$tag" = "v$version" ] || { echo "tag $tag does not match VERSION=$version in router/probe.sh"; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
-          ASSETS: probe.sh agent/podkop-agent agent/podkop-agent.init agent/install.sh
+          ASSETS: router/probe.sh router/podkop-agent router/podkop-agent.init router/install.sh
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
             if [ "${{ github.event_name }}" = push ] && [ "${{ github.ref_type }}" = branch ]; then
-              echo "release $TAG already exists; bump VERSION in probe.sh to publish a new one"
+              echo "release $TAG already exists; bump VERSION in router/probe.sh to publish a new one"
               exit 0
             fi
             gh release upload "$TAG" $ASSETS --clobber
           else
             gh release create "$TAG" $ASSETS --target "$GITHUB_SHA" \
-              --title "podkop-probe $TAG" --generate-notes
+              --title "podkop-manager $TAG" --generate-notes
           fi

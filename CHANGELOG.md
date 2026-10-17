@@ -3,6 +3,15 @@
 Versions are podkop-probe's (`probe.sh`); a release also carries
 podkop-agent and podkop-manager.
 
+## 1.13.0 — 2026-10-18
+
+- The repository is now `podkop-manager` (old links redirect).
+- Manager 0.3.0 runs with Docker Compose (`compose.yaml`, host network, data
+  in a volume); `install-ubuntu.sh` and the systemd unit are removed.
+- New layout: the manager at the root, router files in `router/`. Release
+  assets keep their names, so installed routers keep updating.
+- One README for everything.
+
 ## 1.12.0 — 2026-10-18
 
 - Manager 0.2.0: new web interface: a menu with a router switcher, Overview,
