@@ -12,7 +12,7 @@
 #
 # https://github.com/dkagramanyan/podkop-keys-availability-
 
-VERSION="1.9.1"
+VERSION="1.10.0"
 REPO_URL="https://github.com/dkagramanyan/podkop-keys-availability-"
 RELEASE_URL="$REPO_URL/releases/latest/download/probe.sh"
 BIN=/usr/bin/podkop-probe            # installed copy, used by the nightly run
@@ -20,8 +20,12 @@ CONF=/etc/podkop-probe.conf          # saved keys and settings
 LOG=/tmp/podkop-probe.log            # log of the last --cron run
 SAVED_BEST=/tmp/podkop-probe-best.txt     # the lists of the last run
 SAVED_YT=/tmp/podkop-probe-youtube.txt
+SAVED_FB=/tmp/podkop-probe-fallback.txt  # their fallback servers
+SAVED_YTFB=/tmp/podkop-probe-youtube-fallback.txt
 CRONTAB=/etc/crontabs/root
 PODKOP_INSTALL="sh <(wget -O - https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh)"
+ENGINE_URL="https://github.com/FiyeroT/podkop-engine/releases"
+PODKOP_LIB=/usr/lib/podkop
 
 set -u
 export LC_ALL=C
@@ -32,6 +36,7 @@ BASEPORT=39000
 FILE=""; SUBS=""; CONFIG=""; CSV=""
 VERBOSE=0; ASSUME_YES=0; COLOR=auto; SOURCE=""
 TOP=10; APPLY=ask; SECTION=main
+FALLBACK=5                           # servers after the top ones: podkop's fallback links
 SPEED=1; SPEED_URL=""; SPEED_T=8; SPEED_J=""; SPEED_J_USER=""; ENTRY_CHECK=1
 # direct download used to measure the router's own line (not Cloudflare,
 # which some providers block without a VPN)
@@ -70,7 +75,7 @@ EUROPE="EU AD AL AT BA BE BG CH CY CZ DE DK EE ES FI FR GB GR HR HU IE IS IT LI 
 ARGLINKS=""
 WORK="/tmp/podkop-probe.$$"
 TAB=$(printf '\t')
-LINK_RE='(vless|vmess|trojan|ss|hysteria2|hy2)://[^[:space:]"<>'"'"']+'
+LINK_RE='(vless|vmess|trojan|ss|hysteria2|hy2|socks4|socks4a|socks5)://[^[:space:]"<>'"'"']+'
 
 usage() {
   cat <<EOF
@@ -85,7 +90,7 @@ optionally every night. Without a terminal the nodes are taken from podkop
 automatically (its sing-box config or /etc/config/podkop).
 
 Sources:
-  link ...          vless:// vmess:// trojan:// ss:// hysteria2:// hy2:// links
+  link ...          vless:// trojan:// ss:// hysteria2:// hy2:// socks5:// links
   -f FILE           file with links, one per line ('-' = stdin, base64 ok)
   -s URL            subscription URL / "main key" (plain or base64 list of
                     links); repeat -s for several
@@ -125,7 +130,8 @@ YouTube (a separate podkop section for YouTube traffic):
                     (they are kept in /tmp until the router restarts)
 
 Podkop (for link sources: -s, -f, links):
-  --top N           how many best nodes to offer for podkop   (default $TOP)
+  --top N           how many best nodes to offer for podkop   (default $TOP);
+                    the next $FALLBACK become podkop's fallback links
   --apply           write the best nodes to podkop as URLTest and restart it
                     without asking
   --no-apply        never offer to change podkop settings
@@ -301,7 +307,7 @@ fetch() {
 JSON2LINKS='
 def enc: tostring | @uri;
 def kv(k; v): if (v // "" | tostring) == "" then empty else "\(k)=\(v | enc)" end;
-def hp(a; p): (if (a | tostring | test(":")) then "[\(a)]" else "\(a)" end) + ":\(p)";
+def hp(a; p): (if (a | tostring | contains(":")) then "[\(a)]" else "\(a)" end) + ":\(p)";
 def xq(s): [kv("type"; s.network // "tcp"), kv("security"; s.security // "none"),
   kv("sni"; s.realitySettings.serverName // s.tlsSettings.serverName),
   kv("fp"; s.realitySettings.fingerprint // s.tlsSettings.fingerprint),
@@ -309,7 +315,8 @@ def xq(s): [kv("type"; s.network // "tcp"), kv("security"; s.security // "none")
   kv("alpn"; (s.tlsSettings.alpn // []) | join(",")),
   kv("path"; s.wsSettings.path // s.httpupgradeSettings.path // s.xhttpSettings.path),
   kv("host"; s.wsSettings.headers.Host // s.wsSettings.host // s.httpupgradeSettings.host // s.xhttpSettings.host),
-  kv("serviceName"; s.grpcSettings.serviceName)];
+  kv("serviceName"; s.grpcSettings.serviceName),
+  kv("mode"; s.xhttpSettings.mode), kv("extra"; s.xhttpSettings.extra)];
 def sq(o): [kv("type"; o.transport.type // "tcp"),
   kv("security"; if o.tls.reality.enabled then "reality" elif o.tls.enabled then "tls" else "none" end),
   kv("sni"; o.tls.server_name), kv("fp"; o.tls.utls.fingerprint),
@@ -318,11 +325,11 @@ def sq(o): [kv("type"; o.transport.type // "tcp"),
   kv("path"; o.transport.path), kv("host"; o.transport.headers.Host // o.transport.host),
   kv("serviceName"; o.transport.service_name)];
 (if type == "array" then .[] else . end) | select(type == "object") | (.remarks // "") as $rem
-| ([.outbounds[]? | select(type == "object" and ((.protocol // .type) | tostring | test("^(vless|trojan|shadowsocks|hysteria2)$")))] | length) as $np
+| ([.outbounds[]? | select(type == "object" and ((.protocol // .type) | IN("vless", "trojan", "shadowsocks", "hysteria2")))] | length) as $np
 | .outbounds[]? | select(type == "object")
-| ($rem + (if $np > 1 and ((.tag // "proxy") | test("^proxy$") | not) then " [\(.tag)]" else "" end)) as $name
+| ($rem + (if $np > 1 and (.tag // "proxy") != "proxy" then " [\(.tag)]" else "" end)) as $name
 | if .protocol == "vless" then .settings.vnext[0] as $v | $v.users[0] as $u
-    | "vless://\($u.id)@\(hp($v.address; $v.port))?" + (xq(.streamSettings // {}) + [kv("flow"; $u.flow), "encryption=none"] | join("&")) + "#" + ($name | enc)
+    | "vless://\($u.id)@\(hp($v.address; $v.port))?" + (xq(.streamSettings // {}) + [kv("flow"; $u.flow), kv("encryption"; $u.encryption // "none")] | join("&")) + "#" + ($name | enc)
   elif .protocol == "trojan" then .settings.servers[0] as $v
     | "trojan://\($v.password | enc)@\(hp($v.address; $v.port))?" + (xq(.streamSettings // {}) | join("&")) + "#" + ($name | enc)
   elif .protocol == "shadowsocks" then .settings.servers[0] as $v
@@ -416,7 +423,12 @@ sub_why() {
     *happ://crypt*) echo "only encrypted happ://crypt links (Happ-only format, can't be decoded)" ;;
     *"proxies:"*|*"proxy-groups"*) echo "got a Clash config (not supported)" ;;
     *) if [ -s "$1.links" ]; then
-         echo "only placeholder entries: $(sed -n 's/.*#//p' "$1.links" | head -n 2 | awk "$URLDEC_AWK"'{ print dec($0) }' | tr '\n' ';')"
+         _ph=$(sed -n 's/.*#//p' "$1.links" | head -n 2 | awk "$URLDEC_AWK"'{ print dec($0) }' | tr '\n' ';')
+         case "$(printf '%s' "$_ph" | tr 'A-Z' 'a-z')" in
+           *"device limit"*|*"limit of devices"*|*"лимит устройств"*)
+             echo "the key's device limit is reached ($_ph): remove an old device in your provider's bot, the router shows up there as '${ROUTER_MODEL:-OpenWrt}'" ;;
+           *) echo "only placeholder entries: $_ph" ;;
+         esac
        else
          echo "no vless/vmess/trojan/ss/hysteria2 links inside"
        fi ;;
@@ -472,173 +484,39 @@ extract_links() {
   printf '%s\n' "$_t" | tr -d '\r' | grep -oE "$LINK_RE"
 }
 
-# JSON string literal
-js() {
+# link_name <link>: the server name from the link's #fragment, else host:port
+link_name() {
   case "$1" in
-    *[\"\\]*) printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')" ;;
-    *) printf '"%s"' "$1" ;;
+    *#?*) printf '%s\n' "${1#*#}" | awk "$URLDEC_AWK"'{ print dec($0) }' ;;
+    vmess://*) printf '%s' "${1#*://}" | b64d | jq -r '.ps // "vmess"' 2>/dev/null || echo vmess ;;
+    *) _h=${1#*://}; _h=${_h##*@}; printf '%s\n' "${_h%%[?/#]*}" ;;
   esac
 }
 
-# one awk pass: split a link into shell assignments L_* and q_<param>, all
-# percent-decoded. Values are single-quoted, so eval of the output is safe.
-PARSE_AWK='
-function hv(c) { return index("0123456789abcdef", tolower(c)) - 1 }
-function dec(s, plus,   o, i, c, a, b) {
-  o = ""
-  for (i = 1; i <= length(s); i++) {
-    c = substr(s, i, 1)
-    if (c == "%" && i + 2 <= length(s)) {
-      a = hv(substr(s, i + 1, 1)); b = hv(substr(s, i + 2, 1))
-      if (a >= 0 && b >= 0 && a * 16 + b > 0) { o = o sprintf("%c", a * 16 + b); i += 2; continue }
-    }
-    if (c == "+" && plus) c = " "
-    o = o c
-  }
-  return o
-}
-function emit(k, v) { gsub(/[^A-Za-z0-9_]/, "_", k); gsub(/\047/, "\047\\\047\047", v); print k "=\047" v "\047" }
-{
-  s = $0; p = index(s, "://"); emit("L_scheme", tolower(substr(s, 1, p - 1))); s = substr(s, p + 3)
-  fr = ""; p = index(s, "#"); if (p) { fr = substr(s, p + 1); s = substr(s, 1, p - 1) }
-  q = "";  p = index(s, "?"); if (p) { q = substr(s, p + 1); s = substr(s, 1, p - 1) }
-  sub(/\/+$/, "", s)
-  u = ""; p = 0; for (i = length(s); i > 0; i--) if (substr(s, i, 1) == "@") { p = i; break }
-  if (p) { u = substr(s, 1, p - 1); s = substr(s, p + 1) }
-  h = s; port = ""
-  if (s ~ /^\[/) { p = index(s, "]"); h = substr(s, 2, p - 2); r = substr(s, p + 1); if (r ~ /^:/) port = substr(r, 2) }
-  else { for (i = length(s); i > 0; i--) if (substr(s, i, 1) == ":") { h = substr(s, 1, i - 1); port = substr(s, i + 1); break } }
-  sub(/[,-].*/, "", port)
-  emit("L_user", dec(u, 0)); emit("L_host", h); emit("L_port", port); emit("L_name", dec(fr, 1))
-  n = split(q, a, "&")
-  for (i = 1; i <= n; i++) {
-    p = index(a[i], "=")
-    if (p) emit("q_" substr(a[i], 1, p - 1), dec(substr(a[i], p + 1), 0))
-    else if (a[i] != "") emit("q_" a[i], "")
-  }
-}'
-
-parse_link() { eval "$(printf '%s\n' "$1" | awk "$PARSE_AWK")"; }
-
-# tls_json <security> <sni> <fp> <alpn> <insecure 0/1> <pbk> <sid>
-tls_json() {
-  _t="\"tls\":{\"enabled\":true"
-  [ -n "$2" ] && _t="$_t,\"server_name\":$(js "$2")"
-  [ "$5" = 1 ] && _t="$_t,\"insecure\":true"
-  [ -n "$4" ] && _t="$_t,\"alpn\":[$(printf '%s' "$4" | awk -F, '{for(i=1;i<=NF;i++)printf "%s\"%s\"",(i>1?",":""),$i}')]"
-  _fp=$3; [ "$1" = reality ] && [ -z "$_fp" ] && _fp=chrome
-  [ -n "$_fp" ] && _t="$_t,\"utls\":{\"enabled\":true,\"fingerprint\":$(js "$_fp")}"
-  [ "$1" = reality ] && _t="$_t,\"reality\":{\"enabled\":true,\"public_key\":$(js "$6"),\"short_id\":$(js "$7")}"
-  printf '%s},' "$_t"
-}
-
-# transport_json <type> <host> <path> <serviceName>; fails on unsupported
-transport_json() {
-  _p=${3:-/}
-  case "$1" in
-    ""|tcp|raw|none) ;;
-    ws)
-      _ed=""
-      case "$_p" in *\?ed=*)
-        _e=${_p##*\?ed=}; _e=${_e%%&*}; _p=${_p%%\?*}
-        is_uint "$_e" && _ed=",\"max_early_data\":$_e,\"early_data_header_name\":\"Sec-WebSocket-Protocol\"" ;;
-      esac
-      printf '"transport":{"type":"ws","path":%s,"headers":{"Host":%s}%s},' "$(js "$_p")" "$(js "$2")" "$_ed" ;;
-    grpc)        printf '"transport":{"type":"grpc","service_name":%s},' "$(js "$4")" ;;
-    httpupgrade) printf '"transport":{"type":"httpupgrade","host":%s,"path":%s},' "$(js "$2")" "$(js "$_p")" ;;
-    h2|http)     printf '"transport":{"type":"http","host":[%s],"path":%s},' "$(js "$2")" "$(js "$_p")" ;;
-    quic)        printf '"transport":{"type":"quic"},' ;;
-    *) return 1 ;;
-  esac
-}
-
-truthy() { case "$1" in 1|true|True|yes) echo 1 ;; *) echo 0 ;; esac; }
-
-# build_link <link> <dir>: writes <dir>/ob.json + <dir>/name, or <dir>/skip
-build_link() {
-  _d=$2
-  printf '%s\n' "$1" > "$_d/link"
-  parse_link "$1"
-  skip() { printf '%s\n' "$*" > "$_d/skip"; printf '%s\n' "${L_name:-$1}" > "$_d/name"; }
-
-  case "$L_scheme" in
-    vmess)
-      command -v jq >/dev/null 2>&1 || { skip "vmess:// needs jq"; return; }
-      _raw=${1#*://}; _raw=${_raw%%#*}
-      eval "$(printf '%s' "$_raw" | b64d |
-        jq -r 'to_entries[] | "v_\(.key | gsub("[^A-Za-z0-9_]"; "_"))=\(.value | tostring | @sh)"' 2>/dev/null)"
-      L_host=${v_add:-}; L_port=${v_port:-}; L_name=${v_ps:-}
-      ;;
-    ss)
-      if [ -z "$L_user" ]; then          # legacy ss://base64(method:pass@host:port)#name
-        _nm=$L_name; _dec=$(printf '%s' "$L_host" | b64d)
-        parse_link "ss://$_dec"; L_name=$_nm
-      fi
-      ;;
-  esac
-
-  [ -n "${L_host:-}" ] || { skip "cannot parse link"; return; }
-  is_uint "${L_port:-}" || L_port=443
-  [ -n "$L_name" ] || L_name="$L_host:$L_port"
-  printf '%s\n' "$L_name" > "$_d/name"
-
-  _srv="\"server\":$(js "$L_host"),\"server_port\":$L_port"
-  _sni=${q_sni:-${q_peer:-}}
-  _hh=${q_host:-}
-  _ins=$(truthy "${q_allowInsecure:-${q_insecure:-0}}")
-
-  case "$L_scheme" in
-    vless|trojan)
-      if [ "$L_scheme" = trojan ]; then _sec=${q_security:-tls}; else _sec=${q_security:-none}; fi
-      [ -n "$_sni" ] || _sni=${_hh:-$L_host}
-      [ -n "$_hh" ] || _hh=$_sni
-      _tr=$(transport_json "${q_type:-tcp}" "$_hh" "${q_path:-}" "${q_serviceName:-}") ||
-        { skip "transport '${q_type:-}' is not supported by podkop (sing-box)"; return; }
-      _tls=""
-      case "$_sec" in tls|reality|xtls)
-        _tls=$(tls_json "$_sec" "$_sni" "${q_fp:-}" "${q_alpn:-}" "$_ins" "${q_pbk:-}" "${q_sid:-}") ;;
-      esac
-      if [ "$L_scheme" = vless ]; then
-        _fl=""; [ -n "${q_flow:-}" ] && _fl="\"flow\":$(js "$q_flow"),"
-        printf '{"type":"vless","tag":"node",%s,"uuid":%s,%s%s%s"packet_encoding":"xudp"}\n' \
-          "$_srv" "$(js "$L_user")" "$_fl" "$_tls" "$_tr" > "$_d/ob.json"
-      else
-        printf '{"type":"trojan","tag":"node",%s,%s%s"password":%s}\n' \
-          "$_srv" "$_tls" "$_tr" "$(js "$L_user")" > "$_d/ob.json"
-      fi
-      ;;
-    vmess)
-      _sni=${v_sni:-${v_host:-$L_host}}; _hh=${v_host:-$_sni}
-      _tr=$(transport_json "${v_net:-tcp}" "$_hh" "${v_path:-}" "${v_path:-}") ||
-        { skip "transport '${v_net:-}' is not supported by podkop (sing-box)"; return; }
-      _tls=""
-      [ "${v_tls:-}" = tls ] && _tls=$(tls_json tls "$_sni" "${v_fp:-}" "${v_alpn:-}" 0 "" "")
-      printf '{"type":"vmess","tag":"node",%s,"uuid":%s,"security":%s,"alter_id":%s,%s%s"packet_encoding":"xudp"}\n' \
-        "$_srv" "$(js "${v_id:-}")" "$(js "${v_scy:-auto}")" "$(is_uint "${v_aid:-0}" && echo "$v_aid" || echo 0)" \
-        "$_tls" "$_tr" > "$_d/ob.json"
-      ;;
-    ss)
-      case "$L_user" in *:*) _ui=$L_user ;; *) _ui=$(printf '%s' "$L_user" | b64d) ;; esac
-      _m=${_ui%%:*}; _pw=${_ui#*:}
-      _pl=""
-      if [ -n "${q_plugin:-}" ]; then
-        _pn=${q_plugin%%;*}; _po=""; case "$q_plugin" in *\;*) _po=${q_plugin#*;} ;; esac
-        [ "$_pn" = simple-obfs ] && _pn=obfs-local
-        _pl="\"plugin\":$(js "$_pn"),\"plugin_opts\":$(js "$_po"),"
-      fi
-      printf '{"type":"shadowsocks","tag":"node",%s,%s"method":%s,"password":%s}\n' \
-        "$_srv" "$_pl" "$(js "$_m")" "$(js "$_pw")" > "$_d/ob.json"
-      ;;
-    hysteria2|hy2)
-      _ob=""
-      [ -n "${q_obfs:-}" ] && _ob="\"obfs\":{\"type\":$(js "$q_obfs"),\"password\":$(js "${q_obfs_password:-}")},"
-      _tls=$(tls_json tls "${_sni:-$L_host}" "" "${q_alpn:-h3}" "$_ins" "" "")
-      printf '{"type":"hysteria2","tag":"node",%s,%s%s"password":%s}\n' \
-        "$_srv" "$_ob" "$_tls" "$(js "$L_user")" > "$_d/ob.json"
-      ;;
-    *) skip "unsupported scheme $L_scheme://" ;;
-  esac
-}
+# build_nodes: <dir>/ob.json for every link node, made by podkop's own link
+# parser, so each node is tested exactly the way podkop will run it. A link
+# podkop can't use gets <dir>/skip with podkop's reason instead.
+build_nodes() (
+  set +u
+  # shellcheck disable=SC1091
+  . "$PODKOP_LIB/sing_box_config_facade.sh"
+  log() { case "$2" in error|fatal) printf '%s\n' "$1" >> "$_d/skip" ;; esac; }
+  _i=0
+  while [ "$_i" -lt "$COUNT" ]; do
+    _i=$((_i + 1)); _d="$WORK/n/$_i"
+    [ -f "$_d/link" ] || continue
+    ( sing_box_cf_add_proxy_outbound '{"outbounds":[]}' node "$(cat "$_d/link")" 0 ) > "$_d/sb.json" 2>/dev/null
+    if [ ! -f "$_d/skip" ]; then
+      jq -ce '.outbounds[0] | .tag = "node"' "$_d/sb.json" > "$_d/ob.json" 2>/dev/null ||
+        echo "can't read this link" > "$_d/skip"
+    fi
+    if [ -f "$_d/skip" ]; then
+      rm -f "$_d/ob.json"
+      sed -i 's/ Aborted\.$//; s/^/podkop: /' "$_d/skip"
+    fi
+    rm -f "$_d/sb.json"
+  done
+)
 
 # --- node sources ------------------------------------------------------------
 
@@ -666,7 +544,7 @@ podkop_config_path() {
 
 from_uci() {
   command -v uci >/dev/null 2>&1 || return 1
-  uci -q show podkop 2>/dev/null | grep -E '\.(proxy_string|[a-z_]*proxy_links)=' | add_links
+  uci -q show podkop 2>/dev/null | grep -E '\.(proxy_string|[a-z_]*proxy_links|urltest_fallback_links)=' | add_links
 }
 
 ask_links() {
@@ -859,8 +737,8 @@ sb_start() {
   _sd="$WORK/n/$1"; _port=$((BASEPORT + $1)); _try=0
   while :; do
     while port_busy "$_port"; do _port=$((_port + 500)); done
-    printf '{"log":{"level":"error"},%s"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":%s}],"outbounds":[%s,{"type":"direct","tag":"direct"}],"route":{"final":"node"%s}}\n' \
-      "$SB_DNS" "$_port" "$(cat "$_sd/ob.json")" "$SB_RES" > "$_sd/config.json"
+    printf '{"log":{"level":"error"},"dns":{"servers":[{"type":"local","tag":"local"}]},"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":%s}],"outbounds":[%s,{"type":"direct","tag":"direct"}],"route":{"final":"node","default_domain_resolver":"local"}}\n' \
+      "$_port" "$(cat "$_sd/ob.json")" > "$_sd/config.json"
     sing-box run -c "$_sd/config.json" > "$_sd/sb.log" 2>&1 &
     _pid=$!; echo "$_pid" > "$WORK/pids/$1"
     _sk=0
@@ -1289,12 +1167,33 @@ uninstall() {
 
 # --- podkop settings --------------------------------------------------------
 
-# set_urltest <section> <links file>: the section becomes a URLTest of the links
+# set_urltest <section> <links file> <fallback links file>: the section
+# becomes a URLTest of the links, with the fallback links behind them
 set_urltest() {
   uci -q delete "podkop.$1.urltest_proxy_links"
+  uci -q delete "podkop.$1.urltest_fallback_links"
   uci set "podkop.$1.connection_type=proxy"
   uci set "podkop.$1.proxy_config_type=urltest"
   while IFS= read -r _l; do uci add_list "podkop.$1.urltest_proxy_links=$_l"; done < "$2"
+  while IFS= read -r _l; do uci add_list "podkop.$1.urltest_fallback_links=$_l"; done < "$3"
+}
+
+# podkop_up <section> ...: wait until podkop's sing-box runs the URLTest
+# group of every given section. podkop starts in the background, so the exit
+# code of its restart says nothing; a failed start shows in procd as a
+# finished "podkop start" with a non-zero exit code.
+podkop_up() {
+  _w=0
+  while [ "$_w" -lt 90 ]; do
+    sleep 3; _w=$((_w + 3))
+    ubus call service list '{"name":"podkop"}' 2>/dev/null |
+      jq -e '[.podkop.instances[]? | select(.running == false and (.exit_code // 0) != 0)] | length > 0' >/dev/null && return 1
+    _pj=$(podkop clash_api get_proxies 2>/dev/null)
+    _up=1
+    for _s in "$@"; do printf '%s' "$_pj" | grep -q "\"$_s-urltest-out\"" || _up=0; done
+    [ "$_up" = 1 ] && return 0
+  done
+  return 1
 }
 
 # sec_pos <section>: its position among podkop's sections (0 = first)
@@ -1317,31 +1216,39 @@ apply_podkop() {
   _bak="$_cfg.probe-backup.$(date +%Y%m%d-%H%M%S)"
   cp "$_cfg" "$_bak" || die "cannot back up $_cfg"
   ls -1t "$_cfg".probe-backup.* 2>/dev/null | tail -n +4 | while IFS= read -r _f; do rm -f "$_f"; done
-  _msg=""
+  _msg=""; _secs=""
   if [ "$DO_MAIN" = 1 ]; then
     uci -q get "podkop.$SECTION" >/dev/null || _new_main=1
     ensure_section "$SECTION"
-    set_urltest "$SECTION" "$WORK/best"
-    _msg="${_msg:+$_msg, }$SECTION: $(wc -l < "$WORK/best" | tr -d ' ') server(s)"
+    set_urltest "$SECTION" "$WORK/best" "$WORK/best.fb"
+    _msg="${_msg:+$_msg, }$SECTION: $(wc -l < "$WORK/best" | tr -d ' ') server(s) + $(wc -l < "$WORK/best.fb" | tr -d ' ') fallback"
+    _secs="$SECTION"
   fi
   if [ "$DO_YT" = 1 ]; then
     if ! uci -q get "podkop.$YT_SECTION" >/dev/null; then
       ensure_section "$YT_SECTION"
       uci add_list "podkop.$YT_SECTION.community_lists=youtube"
     fi
-    set_urltest "$YT_SECTION" "$WORK/ytbest"
+    set_urltest "$YT_SECTION" "$WORK/ytbest" "$WORK/ytbest.fb"
     uci set "podkop.$YT_SECTION.urltest_testing_url=$YT_PING_URL"
     _pm=$(sec_pos "$SECTION"); _py=$(sec_pos "$YT_SECTION")
     [ -n "$_pm" ] && [ -n "$_py" ] && [ "$_py" -gt "$_pm" ] && uci reorder "podkop.$YT_SECTION=$_pm"
-    _msg="${_msg:+$_msg, }$YT_SECTION: $(wc -l < "$WORK/ytbest" | tr -d ' ') server(s)"
+    _msg="${_msg:+$_msg, }$YT_SECTION: $(wc -l < "$WORK/ytbest" | tr -d ' ') server(s) + $(wc -l < "$WORK/ytbest.fb" | tr -d ' ') fallback"
+    _secs="${_secs:-} $YT_SECTION"
   fi
   uci commit podkop || die "uci commit failed, your old settings are in $_bak"
-  if /etc/init.d/podkop restart >/dev/null 2>&1; then
+  /etc/init.d/podkop restart >/dev/null 2>&1
+  # shellcheck disable=SC2086
+  if podkop_up $_secs; then
+    # a server once chosen by hand in the dashboard stays chosen after a
+    # restart, by its number in the list; give the choice back to URLTest
+    for _s in $_secs; do podkop clash_api set_group_proxy "$_s-out" "$_s-urltest-out" >/dev/null 2>&1; done
     info "podkop updated ($_msg), restarted"
     [ "$CRON" = 1 ] && logger -t podkop-probe "podkop updated ($_msg), restarted" 2>/dev/null
   else
-    warn "podkop restart failed. Undo: cp $_bak $_cfg && /etc/init.d/podkop restart"
-    [ "$CRON" = 1 ] && logger -t podkop-probe "podkop restart failed after update, backup: $_bak" 2>/dev/null
+    cp "$_bak" "$_cfg" && /etc/init.d/podkop restart >/dev/null 2>&1
+    warn "podkop did not start with the new lists, the old settings are back (podkop's log: logread -e podkop)"
+    [ "$CRON" = 1 ] && logger -t podkop-probe "podkop did not start with the new lists, old settings restored" 2>/dev/null
   fi
   [ "${_new_main:-0}" = 1 ] && warn "section '$SECTION' is new and has no lists yet: add them in LuCI -> Services -> Podkop"
   [ "$VERBOSE" = 1 ] && info "old settings saved in $_bak"
@@ -1398,6 +1305,8 @@ if [ "$APPLY_SAVED" = 1 ]; then
   if [ ! -f /etc/config/podkop ] || ! command -v uci >/dev/null 2>&1; then die "podkop not found"; fi
   cp "$SAVED_BEST" "$WORK/best" 2>/dev/null || : > "$WORK/best"
   cp "$SAVED_YT" "$WORK/ytbest" 2>/dev/null || : > "$WORK/ytbest"
+  cp "$SAVED_FB" "$WORK/best.fb" 2>/dev/null || : > "$WORK/best.fb"
+  cp "$SAVED_YTFB" "$WORK/ytbest.fb" 2>/dev/null || : > "$WORK/ytbest.fb"
   DO_MAIN=0; DO_YT=0
   [ -s "$WORK/best" ] && [ "$APPLY_TO" != youtube ] && DO_MAIN=1
   [ -s "$WORK/ytbest" ] && [ "$APPLY_TO" != main ] && [ "$YOUTUBE" = 1 ] && DO_YT=1
@@ -1407,25 +1316,20 @@ if [ "$APPLY_SAVED" = 1 ]; then
 fi
 : > "$NODES"
 
+# podkop's link parser builds the test nodes, podkop-engine (its sing-box) runs them
+{ [ -f "$PODKOP_LIB/sing_box_config_facade.sh" ] && command -v podkop >/dev/null 2>&1; } ||
+  die "podkop not found. Install it: $PODKOP_INSTALL"
+_feat=$(sing-box version 2>/dev/null | sed -n 's/^Features:[[:space:]]*//p')
+for _f in tools.decode-link urltest.fallbacks; do
+  case ",$_feat," in *",$_f,"*) ;; *) die "podkop-engine not found (sing-box has no $_f). Install it: $ENGINE_URL" ;; esac
+done
+need_tool curl curl "it sends the test requests" || die "curl is required"
+SB_VER=$(sing-box version 2>/dev/null | awk 'NR == 1 {print $3}')
+
 _model=$(cat /tmp/sysinfo/model 2>/dev/null)
 _os=$(sed -n "s/^DISTRIB_DESCRIPTION='\(.*\)'/\1/p" /etc/openwrt_release 2>/dev/null)
-_sys="${_model:+ · $_model}${_os:+ · $_os}"
-printf '%spodkop-probe %s%s%s\n' "$BD" "$VERSION" "$R0" "${_sys:+$DM$_sys$R0}"
-
-# sing-box is the one hard requirement
-if ! command -v sing-box >/dev/null 2>&1; then
-  need_tool sing-box sing-box "it runs the proxy nodes" ||
-    die "sing-box not found. Install podkop first: $PODKOP_INSTALL"
-fi
-need_tool curl curl "it sends the test requests" || die "curl is required"
-
-SB_VER=$(sing-box version 2>/dev/null | awk 'NR == 1 {print $3}')
-SB_DNS=""; SB_RES=""
-case "$SB_VER" in
-  0.*|1.[0-9]|1.[0-9].*|1.1[01]|1.1[01].*) ;;
-  *) SB_DNS='"dns":{"servers":[{"type":"local","tag":"local"}]},'
-     SB_RES=',"default_domain_resolver":"local"' ;;
-esac
+_sys="${_model:+ · $_model}${_os:+ · $_os} · podkop $(podkop show_version 2>/dev/null) · sing-box $SB_VER"
+printf '%spodkop-probe %s%s%s\n' "$BD" "$VERSION" "$R0" "$DM$_sys$R0"
 
 # collect nodes
 if [ -n "$ARGLINKS" ]; then printf '%s' "$ARGLINKS" | add_links; SOURCE="command line"; fi
@@ -1469,19 +1373,21 @@ _i=0; OUT_REGION=0
 while IFS= read -r _line; do
   _i=$((_i + 1)); _d="$WORK/n/$_i"; mkdir -p "$_d"
   case "$_line" in
-    L"$TAB"*) ( build_link "${_line#L"$TAB"}" "$_d" ) ;;
+    L"$TAB"*)
+      printf '%s\n' "${_line#L"$TAB"}" > "$_d/link"
+      link_name "${_line#L"$TAB"}" > "$_d/name" ;;
     O"$TAB"*)
       _r=${_line#O"$TAB"}
       printf '%s\n' "${_r%%"$TAB"*}" > "$_d/name"
       printf '%s\n' "${_r#*"$TAB"}" > "$_d/ob.json" ;;
   esac
-  [ -f "$_d/ob.json" ] || [ -f "$_d/skip" ] || echo "build failed" > "$_d/skip"
   _ncc=$(name_cc "$(cat "$_d/name")"); echo "$_ncc" > "$_d/ncc"
   if ! cc_allowed "$_ncc"; then           # e.g. "🇺🇸 USA" when only Europe is wanted
     rm -rf "$_d"; _i=$((_i - 1)); OUT_REGION=$((OUT_REGION + 1))
   fi
 done < "$NODES"
 COUNT=$_i
+build_nodes
 
 HAS_PARALLEL=0
 curl --help all 2>/dev/null | grep -q -- '--parallel-immediate' && HAS_PARALLEL=1
@@ -1725,9 +1631,10 @@ END {
   }
 }' "$WORK/all" | sort -t "$TAB" -k1,1n -k2,2g -k3,3g | cut -f 4- > "$WORK/sorted"
 
-# pick the best TOP nodes that came from links (config outbounds have no
-# link): usable classes only, and one link per exit IP, since several links
-# to the same server add nothing to a URLTest group
+# pick the best TOP + FALLBACK nodes that came from links (config outbounds
+# have no link): usable classes only, and one link per exit IP, since several
+# links to the same server add nothing to a URLTest group. The first TOP go
+# into the URLTest group, the rest become its fallback links.
 : > "$WORK/best"; : > "$WORK/best.names"; : > "$WORK/best.ips"
 pick() { # <n>: add node n to the pick list
   cat "$WORK/n/$1/link" >> "$WORK/best"
@@ -1737,7 +1644,7 @@ pick() { # <n>: add node n to the pick list
   echo "$_xi" >> "$WORK/best.ips"
 }
 while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
-  [ "$(wc -l < "$WORK/best")" -ge "$TOP" ] && break
+  [ "$(wc -l < "$WORK/best")" -ge $((TOP + FALLBACK)) ] && break
   [ -f "$WORK/n/$_n/link" ] || continue
   case "$(verdict "$_s" "$_ok" "$_tot")" in GOOD|OK|FLAKY) ;; *) continue ;; esac
   fast_enough "$_n" || continue
@@ -1746,7 +1653,7 @@ while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
 done < "$WORK/sorted"
 # not enough different servers: fill up with the next best links anyway
 while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
-  [ "$(wc -l < "$WORK/best")" -ge "$TOP" ] && break
+  [ "$(wc -l < "$WORK/best")" -ge $((TOP + FALLBACK)) ] && break
   [ -f "$WORK/n/$_n/link" ] || continue
   case "$(verdict "$_s" "$_ok" "$_tot")" in GOOD|OK|FLAKY) ;; *) continue ;; esac
   fast_enough "$_n" || continue
@@ -1778,13 +1685,23 @@ ytpick() { # <n> <exit ip>
 }
 for _pass in 1 2; do   # 1: one per exit IP, 2: fill up
   while IFS="$TAB" read -r _n _af _ym _sp _xi; do
-    [ "$(wc -l < "$WORK/ytbest")" -ge "$TOP" ] && break
+    [ "$(wc -l < "$WORK/ytbest")" -ge $((TOP + FALLBACK)) ] && break
     [ -f "$WORK/n/$_n/link" ] || continue
     grep -q "^#$_n " "$WORK/ytbest.names" && continue
     [ "$_pass" = 1 ] && [ "$_xi" != "-" ] && grep -qxF "$_xi" "$WORK/ytbest.ips" && continue
     ytpick "$_n" "$_xi"
   done < "$WORK/ytsorted"
 done
+
+# split_fb <list>: <list> keeps the first TOP links, <list>.fb gets the rest
+# (the same for .names)
+split_fb() {
+  for _x in "" .names; do
+    tail -n +$((TOP + 1)) "$1$_x" > "$1.fb$_x"
+    head -n "$TOP" "$1$_x" > "$1.top" && mv "$1.top" "$1$_x"
+  done
+}
+split_fb "$WORK/best"; split_fb "$WORK/ytbest"
 
 # --- report ------------------------------------------------------------------
 
@@ -1798,7 +1715,7 @@ while IFS="$TAB" read -r _n _s _ok _tot _rest; do
 done < "$WORK/sorted"
 printf 'Done in %dm%02ds: %s%d good%s, %s%d unstable%s, %s%d bad%s%s%s\n' $((ELAPSED / 60)) $((ELAPSED % 60)) \
   "$GR" "$_good" "$R0" "$YL" "$_okn" "$R0" "$RD" "$_bad" "$R0" \
-  "$( [ "$_skp" -gt 0 ] && echo ", $_skp can't run in podkop (xhttp)")" \
+  "$( [ "$_skp" -gt 0 ] && echo ", $_skp podkop can't use (-v: why)")" \
   "$( [ "$_slow" -gt 0 ] && echo "; $_slow too slow (ping >= $MAX_PING ms$( [ "$SPEED" = 1 ] && echo " or <= $MIN_SPEED Mbit/s"))")"
 
 # lost%, latency in ms
@@ -1812,13 +1729,14 @@ if [ "$VERBOSE" = 1 ]; then
   while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
     _v=$(verdict "$_s" "$_ok" "$_tot")
     _fp="-"; [ "$_tot" -gt 0 ] && _fp=$(awk -v o="$_ok" -v t="$_tot" 'BEGIN {printf "%.1f", (t - o) * 100 / t}')
-    _mk=" "; grep -q "^#$_n " "$WORK/best.names" && _mk="*"
-    grep -q "^#$_n " "$WORK/ytbest.names" && _mk="${_mk% }y"
+    _mk=" "; grep -q "^#$_n " "$WORK/best.names" && _mk="*"; grep -q "^#$_n " "$WORK/best.fb.names" && _mk="f"
+    if grep -q "^#$_n " "$WORK/ytbest.names"; then _mk="${_mk}y"
+    elif grep -q "^#$_n " "$WORK/ytbest.fb.names"; then _mk="${_mk}f"; fi
     _yc=""; [ "$YOUTUBE" = 1 ] && _yc="$(yt_fmt "$_n")$(printf '%5s ' "$(ms "$(cat "$WORK/n/$_n/yt.ms" 2>/dev/null)")")"
     printf '%-2s%-3s %s%-12s%s %8s %6s %7s %7s %7s %7s  %-15s %-3s %s%s\n' \
       "$_mk" "$_n" "$(vcolor "$_v")" "$_v" "$R0" "$_ok/$_tot" "$_fp" "$_mn" "$_md" "$_p9" "$_sp" "$_xi" "$_xc" "$_yc" "$_nm"
   done < "$WORK/sorted"
-  printf '  %s* = main section, y = YouTube section%s\n' "$DM" "$R0"
+  printf '  %s* = main section, y = YouTube section, f = their fallback (1st column main, 2nd YouTube)%s\n' "$DM" "$R0"
 else
   # the picks (*) and a few runners-up
   printf '%sMain%s %s(section %s: everything else)%s\n' "$BD" "$R0" "$DM" "$SECTION" "$R0"
@@ -1829,12 +1747,14 @@ else
     case "$_v" in GOOD|OK|FLAKY) ;; *) continue ;; esac
     _mk=" "
     if grep -q "^#$_n " "$WORK/best.names"; then _mk="*"
+    elif grep -q "^#$_n " "$WORK/best.fb.names"; then _mk="f"
     elif [ "$_extra" -lt 5 ] && fast_enough "$_n"; then _extra=$((_extra + 1))
     else _more=$((_more + 1)); continue; fi
     set -- $(row_fmt "$_ok" "$_tot" "$_md")
     printf '%s %-3s %7s %7s %s%5s%s  %-3s %s\n' "$_mk" "$_n" "$2" "$_sp" "$(vcolor "$_v")" "$1" "$R0" "$_xc" "$_nm"
   done < "$WORK/sorted"
   [ "$_more" -gt 0 ] && printf '  %s+%d more (-v shows all servers and why the others failed)%s\n' "$DM" "$_more" "$R0"
+  [ -s "$WORK/best.fb" ] && printf '  %sf = fallback: used only when all * servers fail%s\n' "$DM" "$R0"
 fi
 
 # YouTube part
@@ -1852,13 +1772,15 @@ if [ "$YOUTUBE" = 1 ] && [ "$_ytn" -gt 0 ]; then
       while IFS="$TAB" read -r _n _af _ym _sp _xi; do
         _mk=" "
         if grep -q "^#$_n " "$WORK/ytbest.names"; then _mk="y"
+        elif grep -q "^#$_n " "$WORK/ytbest.fb.names"; then _mk="f"
         elif [ "$_extra" -lt 3 ]; then _extra=$((_extra + 1))
         else _more=$((_more + 1)); continue; fi
         printf '%s %-3s %7s %7s  %s%s\n' "$_mk" "$_n" "$(ms "$_ym")" "$(cat "$WORK/n/$_n/speed" 2>/dev/null || echo -)" \
           "$(yt_fmt "$_n")" "$(cat "$WORK/n/$_n/name")"
       done < "$WORK/ytsorted"
       [ "$_more" -gt 0 ] && printf '  %s+%d more%s\n' "$DM" "$_more" "$R0"
-      printf '  %syt = the country YouTube sees; yt ms = ping to YouTube%s\n' "$DM" "$R0"
+      printf '  %syt = the country YouTube sees; yt ms = ping to YouTube%s%s\n' "$DM" \
+        "$( [ -s "$WORK/ytbest.fb" ] && echo "; f = fallback, used only when all y servers fail")" "$R0"
     fi
     printf 'YouTube: %s%s fast server(s) where YouTube sees %s%s%s\n' "$GR" "$(wc -l < "$WORK/ytsorted" | tr -d ' ')" \
       "${YT_NOADS:-any country}" "$R0" "$( [ "$_ytno" -gt 0 ] && echo "; on $_ytno YouTube does not play")"
@@ -1876,7 +1798,7 @@ if [ "$VERBOSE" = 1 ]; then
   while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
     _why=""
     case "$_s" in
-      skip)   _why=$(cat "$WORK/n/$_n/skip") ;;
+      skip)   _why=$(head -n 1 "$WORK/n/$_n/skip") ;;
       start)  _why="sing-box did not start: $(grep -v '^[[:space:]]*$' "$WORK/n/$_n/sb.log" 2>/dev/null | tail -n 1 | cut -c 1-200)" ;;
       direct) _why="exit IP equals the router's own IP: traffic did not go through the node" ;;
       region) _why="exit country $_xc is outside $(countries_label)" ;;
@@ -1922,6 +1844,8 @@ HAVE_PODKOP=0
 [ -f /etc/config/podkop ] && command -v uci >/dev/null 2>&1 && HAVE_PODKOP=1
 cp "$WORK/best" "$SAVED_BEST" 2>/dev/null
 cp "$WORK/ytbest" "$SAVED_YT" 2>/dev/null
+cp "$WORK/best.fb" "$SAVED_FB" 2>/dev/null
+cp "$WORK/ytbest.fb" "$SAVED_YTFB" 2>/dev/null
 
 DO_MAIN=0; DO_YT=0
 [ -s "$WORK/best" ] && DO_MAIN=1
@@ -1935,7 +1859,7 @@ if [ "$APPLY" != no ] && [ "$DO_MAIN" = 1 ] && case "$SOURCE" in podkop*) false 
       echo
       if [ "$DO_YT" = 1 ]; then
         printf '%sPut into podkop and restart it?%s\n' "$BD" "$R0"
-        printf '  Enter) both:  %s <- %s server(s) (*),  %s <- %s server(s) (y)\n' "$SECTION" "$_nb" "$YT_SECTION" "$(wc -l < "$WORK/ytbest" | tr -d ' ')"
+        printf '  Enter) both:  %s <- %s server(s) (*),  %s <- %s server(s) (y), each with its fallbacks (f)\n' "$SECTION" "$_nb" "$YT_SECTION" "$(wc -l < "$WORK/ytbest" | tr -d ' ')"
         printf '  1) only %s   2) only %s   3) other sections   n) nothing\n' "$SECTION" "$YT_SECTION"
         while :; do
           printf '> '; read -r _sel < "$TTY" || _sel=n
