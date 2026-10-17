@@ -5,14 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>podkop-manager</title>
 <link rel="icon" href="data:,">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body class="login">
 <form method="post" action="/login" class="card login-card">
   <h1>podkop-manager</h1>
-  <label>Password <input type="password" name="password" autofocus required autocomplete="current-password"></label>
-  <p class="bad" id="bad" hidden>Wrong password</p>
-  <button type="submit" class="primary">Log in</button>
+  <div class="field">
+    <label for="pw">Password</label>
+    <input class="input" id="pw" type="password" name="password" autofocus required autocomplete="current-password">
+  </div>
+  <p class="bad-text small" id="bad" hidden>Wrong password</p>
+  <button type="submit" class="btn primary lg">Log in</button>
 </form>
 <script>if (location.search.includes("bad=1")) document.getElementById("bad").hidden = false;</script>
 </body>

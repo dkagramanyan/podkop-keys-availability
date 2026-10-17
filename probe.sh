@@ -12,7 +12,7 @@
 #
 # https://github.com/dkagramanyan/podkop-keys-availability
 
-VERSION="1.11.0"
+VERSION="1.12.0"
 REPO_URL="https://github.com/dkagramanyan/podkop-keys-availability"
 RELEASE_URL="$REPO_URL/releases/latest/download/probe.sh"
 BIN=/usr/bin/podkop-probe            # installed copy, used by the nightly run
@@ -1632,44 +1632,29 @@ END {
 }' "$WORK/all" | sort -t "$TAB" -k1,1n -k2,2g -k3,3g | cut -f 4- > "$WORK/sorted"
 
 # pick the best TOP + FALLBACK nodes that came from links (config outbounds
-# have no link): usable classes only, and one link per exit IP, since several
-# links to the same server add nothing to a URLTest group. The first TOP go
-# into the URLTest group, the rest become its fallback links.
-: > "$WORK/best"; : > "$WORK/best.names"; : > "$WORK/best.ips"
-pick() { # <n>: add node n to the pick list
-  cat "$WORK/n/$1/link" >> "$WORK/best"
-  IFS="$TAB" read -r _s _ok _tot _mn _md _p9 _xi _xc _sp _nm < "$WORK/n/$1/result"
-  _sp=$(cat "$WORK/n/$1/speed" 2>/dev/null); [ -n "$_sp" ] || _sp=-   # measured after the result line
-  printf '#%-3s median %6ss %7s Mbit/s  %-3s %s\n' "$1" "$_md" "$_sp" "$_xc" "$_nm" >> "$WORK/best.names"
-  echo "$_xi" >> "$WORK/best.ips"
-}
+# have no link), usable classes only. The first TOP go into the URLTest group,
+# the rest become its fallback links.
+: > "$WORK/best"; : > "$WORK/best.names"
 while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
   [ "$(wc -l < "$WORK/best")" -ge $((TOP + FALLBACK)) ] && break
   [ -f "$WORK/n/$_n/link" ] || continue
   case "$(verdict "$_s" "$_ok" "$_tot")" in GOOD|OK|FLAKY) ;; *) continue ;; esac
   fast_enough "$_n" || continue
-  [ "$_xi" != "-" ] && grep -qxF "$_xi" "$WORK/best.ips" && continue
-  pick "$_n"
-done < "$WORK/sorted"
-# not enough different servers: fill up with the next best links anyway
-while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
-  [ "$(wc -l < "$WORK/best")" -ge $((TOP + FALLBACK)) ] && break
-  [ -f "$WORK/n/$_n/link" ] || continue
-  case "$(verdict "$_s" "$_ok" "$_tot")" in GOOD|OK|FLAKY) ;; *) continue ;; esac
-  fast_enough "$_n" || continue
-  grep -q "^#$_n " "$WORK/best.names" || pick "$_n"
+  cat "$WORK/n/$_n/link" >> "$WORK/best"
+  _sp=$(cat "$WORK/n/$_n/speed" 2>/dev/null); [ -n "$_sp" ] || _sp=-   # measured after the result line
+  printf '#%-3s median %6ss %7s Mbit/s  %-3s %s\n' "$_n" "$_md" "$_sp" "$_xc" "$_nm" >> "$WORK/best.names"
 done < "$WORK/sorted"
 
 # YouTube: nodes where YouTube plays and places us in a YT_NOADS country (no
 # ads; any country with --youtube-noads none), ranked by
 # YouTube ping / best  +  best speed / speed
-# -> ytsorted: n ad-free yt-ms speed exit-ip
+# -> ytsorted: n ad-free yt-ms speed
 : > "$WORK/ytcand"
 while IFS="$TAB" read -r _n _s _ok _tot _mn _md _p9 _xi _xc _sp _nm; do
   [ -f "$WORK/n/$_n/yt.ms" ] || continue
   yt_bad "$_n" && continue
   _af=0; case " $YT_NOADS " in *" $(yt_col "$_n") "*) _af=1 ;; esac
-  printf '%s\t%s\t%s\t%s\t%s\n' "$_n" "$_af" "$(cat "$WORK/n/$_n/yt.ms")" "$(cat "$WORK/n/$_n/speed" 2>/dev/null || echo 0)" "$_xi" >> "$WORK/ytcand"
+  printf '%s\t%s\t%s\t%s\n' "$_n" "$_af" "$(cat "$WORK/n/$_n/yt.ms")" "$(cat "$WORK/n/$_n/speed" 2>/dev/null || echo 0)" >> "$WORK/ytcand"
 done < "$WORK/sorted"
 awk -F "$TAB" -v OFS="$TAB" -v any="$( [ -z "$YT_NOADS" ] && echo 1)" '
 any || $2 == 1 { r[++k] = $0; M[k] = $3 + 0; S[k] = $4 + 0
@@ -1679,19 +1664,12 @@ END {
     printf "%.4f\t%s\n", (bm > 0 ? M[i] / bm : 1) + (bs > 0 ? (S[i] > 0 ? bs / S[i] : 10) : 0), r[i]
 }' "$WORK/ytcand" | sort -t "$TAB" -k1,1g | cut -f 2- > "$WORK/ytsorted"
 
-: > "$WORK/ytbest"; : > "$WORK/ytbest.names"; : > "$WORK/ytbest.ips"
-ytpick() { # <n> <exit ip>
-  cat "$WORK/n/$1/link" >> "$WORK/ytbest"; echo "#$1 " >> "$WORK/ytbest.names"; echo "$2" >> "$WORK/ytbest.ips"
-}
-for _pass in 1 2; do   # 1: one per exit IP, 2: fill up
-  while IFS="$TAB" read -r _n _af _ym _sp _xi; do
-    [ "$(wc -l < "$WORK/ytbest")" -ge $((TOP + FALLBACK)) ] && break
-    [ -f "$WORK/n/$_n/link" ] || continue
-    grep -q "^#$_n " "$WORK/ytbest.names" && continue
-    [ "$_pass" = 1 ] && [ "$_xi" != "-" ] && grep -qxF "$_xi" "$WORK/ytbest.ips" && continue
-    ytpick "$_n" "$_xi"
-  done < "$WORK/ytsorted"
-done
+: > "$WORK/ytbest"; : > "$WORK/ytbest.names"
+while IFS="$TAB" read -r _n _af _ym _sp; do
+  [ "$(wc -l < "$WORK/ytbest")" -ge $((TOP + FALLBACK)) ] && break
+  [ -f "$WORK/n/$_n/link" ] || continue
+  cat "$WORK/n/$_n/link" >> "$WORK/ytbest"; echo "#$_n " >> "$WORK/ytbest.names"
+done < "$WORK/ytsorted"
 
 # split_fb <list>: <list> keeps the first TOP links, <list>.fb gets the rest
 # (the same for .names)
@@ -1769,7 +1747,7 @@ if [ "$YOUTUBE" = 1 ] && [ "$_ytn" -gt 0 ]; then
       printf '%sYouTube%s %s(section %s: YouTube only)%s\n' "$BD" "$R0" "$DM" "$YT_SECTION" "$R0"
       printf '%s  %-3s %7s %7s  %-3s %s%s\n' "$BD" "#" "yt ms" "Mbit/s" "yt" "server" "$R0"
       _extra=0; _more=0
-      while IFS="$TAB" read -r _n _af _ym _sp _xi; do
+      while IFS="$TAB" read -r _n _af _ym _sp; do
         _mk=" "
         if grep -q "^#$_n " "$WORK/ytbest.names"; then _mk="y"
         elif grep -q "^#$_n " "$WORK/ytbest.fb.names"; then _mk="f"
@@ -1836,6 +1814,10 @@ if [ -n "$CSV" ]; then
         "$(printf '%s' "$_nm" | sed 's/"/""/g')"
     done < "$WORK/sorted"
   } > "$CSV" && info "saved $CSV"
+  # the link behind each row ("n<TAB>link"), for podkop-manager's rules by country
+  while IFS="$TAB" read -r _n _rest; do
+    [ -f "$WORK/n/$_n/link" ] && printf '%s\t%s\n' "$_n" "$(cat "$WORK/n/$_n/link")"
+  done < "$WORK/sorted" > "$CSV.links"
 fi
 
 # --- put the best nodes into podkop ------------------------------------------

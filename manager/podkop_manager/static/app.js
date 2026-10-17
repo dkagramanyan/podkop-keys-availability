@@ -1,7 +1,15 @@
 "use strict";
-// podkop-manager web interface: hash routes, plain DOM, live updates over SSE.
+// podkop-manager web interface: hash routes (#/r/<router>/<section>), plain
+// DOM, live updates over server-sent events.
 
-const S = { routers: {}, schema: null, manager: null, view: null };
+const S = {
+  routers: {},        // id -> snapshot from /api/routers and the stream
+  schema: null,       // /api/schema
+  manager: null,      // /api/manager
+  view: null,         // the open page's live-update handlers
+  live: false,        // the stream is connected
+  work: {},           // id -> the routing draft being edited (see loadWork)
+};
 
 // --- helpers --------------------------------------------------------------------
 
@@ -28,6 +36,46 @@ function put(el, ...kids) {
     .map((c) => (c instanceof Node ? c : document.createTextNode(String(c)))));
 }
 
+const ICONS = {
+  overview: '<rect x="2.5" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="9" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="2.5" y="9" width="4.5" height="4.5" rx="1"/><rect x="9" y="9" width="4.5" height="4.5" rx="1"/>',
+  routing: '<path d="M2 4.5h3.5l4 7H14M9.5 4.5H14M12 2.5l2 2-2 2M12 9.5l2 2-2 2"/>',
+  servers: '<rect x="2.5" y="2.5" width="11" height="4.5" rx="1"/><rect x="2.5" y="9" width="11" height="4.5" rx="1"/><path d="M5 4.75h1M5 11.25h1"/>',
+  probe: '<path d="M2.5 11.5a5.5 5.5 0 0 1 11 0"/><path d="M8 11.5l2.6-3.6"/>',
+  logs: '<path d="M3 4h10M3 8h10M3 12h6"/>',
+  history: '<circle cx="8" cy="8" r="5.5"/><path d="M8 5v3.2l2.2 1.4"/>',
+  settings: '<circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M3.6 12.4L5 11M11 5l1.4-1.4"/>',
+  updown: '<path d="M5 6l3-3 3 3M5 10l3 3 3-3"/>',
+  check: '<path d="M3.5 8.5l3 3 6-7"/>',
+  plus: '<path d="M8 3v10M3 8h10"/>',
+  refresh: '<path d="M13 8a5 5 0 1 1-1.5-3.5M13 2.5V5h-2.5"/>',
+  trash: '<path d="M3 4.5h10M6.5 4.5V3h3v1.5M5 4.5l.6 8.5h4.8l.6-8.5"/>',
+  close: '<path d="M4 4l8 8M12 4l-8 8"/>',
+  down: '<path d="M4 6l4 4 4-4"/>',
+  up: '<path d="M4 10l4-4 4 4"/>',
+  right: '<path d="M6 4l4 4-4 4"/>',
+  arrow: '<path d="M3 8h10M9 4l4 4-4 4"/>',
+  search: '<circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/>',
+  shield: '<path d="M10 2.5l6 2.2v4.6c0 3.8-2.6 6.6-6 8.2-3.4-1.6-6-4.4-6-8.2V4.7z"/><path d="M7.2 10l2 2 3.6-4"/>',
+  grip: '<circle cx="3" cy="4" r="1.3"/><circle cx="9" cy="4" r="1.3"/><circle cx="3" cy="9" r="1.3"/><circle cx="9" cy="9" r="1.3"/><circle cx="3" cy="14" r="1.3"/><circle cx="9" cy="14" r="1.3"/>',
+};
+
+function icon(name, size = 16, opts = {}) {
+  const t = document.createElement("template");
+  const box = name === "shield" ? "0 0 20 20" : name === "grip" ? "0 0 12 18" : "0 0 16 16";
+  const paint = name === "grip" ? 'fill="currentColor"' : `fill="none" stroke="${opts.stroke || "currentColor"}" stroke-width="${opts.width || 1.5}"`;
+  const w = name === "grip" ? Math.round(size * 2 / 3) : size;
+  t.innerHTML = `<svg width="${w}" height="${size}" viewBox="${box}" ${paint} aria-hidden="true">${ICONS[name]}</svg>`;
+  const svg = t.content.firstChild;
+  if (opts.class) svg.setAttribute("class", opts.class);
+  return svg;
+}
+
+function spinner() {
+  const t = document.createElement("template");
+  t.innerHTML = '<svg class="spin" width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="10" r="7.5" stroke="var(--accent-ring)" stroke-width="2.5"/><path d="M10 2.5a7.5 7.5 0 0 1 7.5 7.5" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round"/></svg>';
+  return t.content.firstChild;
+}
+
 async function api(method, path, body) {
   const r = await fetch(path, {
     method,
@@ -51,95 +99,262 @@ function toast(msg, bad) {
   clearTimeout(toastTimer); toastTimer = setTimeout(() => (t.hidden = true), bad ? 8000 : 3500);
 }
 
-function modal(...content) {
-  const bg = h("div", { class: "modal-bg", onclick: (e) => { if (e.target === bg) bg.remove(); } },
-    h("div", { class: "modal" }, ...content));
+// a dialog over the page; returns {close, el}; Escape and a click outside close it
+function modal({ title, sub, body, foot, narrow, onclose }) {
+  const titleId = `dlg-${Date.now()}`;
+  let bg;
+  const close = () => { bg.remove(); document.removeEventListener("keydown", onkey); onclose && onclose(); };
+  const onkey = (e) => { if (e.key === "Escape") close(); };
+  const dialog = h("div", { class: `dialog${narrow ? " narrow" : ""}`, role: "dialog", "aria-modal": "true", "aria-labelledby": titleId },
+    h("div", { class: "dialog-head" },
+      h("div", { class: "col" }, h("h1", { id: titleId }, title), sub ? h("p", {}, sub) : null),
+      h("button", { type: "button", class: "btn icon", "aria-label": "Close", onclick: () => close() }, icon("close"))),
+    h("div", { class: "dialog-body" }, body),
+    foot ? h("div", { class: "dialog-foot" }, foot) : null);
+  bg = h("div", { class: "modal-bg", onmousedown: (e) => { if (e.target === bg) close(); } }, dialog);
   document.body.append(bg);
-  return bg;
+  document.addEventListener("keydown", onkey);
+  const first = dialog.querySelector("input, textarea, select, .dialog-foot button");
+  (first || dialog.querySelector("button")).focus();
+  return { close, el: dialog };
 }
 
-const ago = (t) => {
-  if (!t) return "never";
-  const s = Math.round(Date.now() / 1000 - t);
-  if (s < 60) return `${s}s ago`;
+const clone = (x) => JSON.parse(JSON.stringify(x));
+const asList = (v) => (v === undefined || v === null || v === "" ? [] : Array.isArray(v) ? v : [v]);
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many || one + "s"}`;
+const sameDay = (a, b) => a.toDateString() === b.toDateString();
+const hhmm = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+
+// 23:58 today, Thu this week, Oct 16 before
+function shortWhen(t) {
+  if (!t) return "";
+  const d = new Date(t * 1000), now = new Date();
+  if (sameDay(d, now)) return hhmm(d);
+  if (now - d < 6 * 86400e3) return d.toLocaleDateString([], { weekday: "short" });
+  return d.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+// Today 23:59, Yesterday 04:30, Oct 16, 18:12
+function longWhen(t) {
+  if (!t) return "";
+  const d = new Date(t * 1000), now = new Date();
+  const y = new Date(now); y.setDate(now.getDate() - 1);
+  if (sameDay(d, now)) return `Today ${hhmm(d)}`;
+  if (sameDay(d, y)) return `Yesterday ${hhmm(d)}`;
+  return `${d.toLocaleDateString([], { month: "short", day: "numeric" })}, ${hhmm(d)}`;
+}
+
+function ago(t) {
+  const s = Math.max(0, Math.round(Date.now() / 1000 - t));
+  if (s < 60) return "just now";
   if (s < 3600) return `${Math.round(s / 60)} min ago`;
   if (s < 86400) return `${Math.round(s / 3600)} h ago`;
-  return new Date(t * 1000).toLocaleString();
-};
-const when = (t) => (t ? new Date(t * 1000).toLocaleString() : "");
-const clone = (x) => JSON.parse(JSON.stringify(x));
-const asList = (v) => (v === undefined || v === null ? [] : Array.isArray(v) ? v : [v]);
+  return longWhen(t);
+}
 
-// the name of a server: the #fragment of its link
+function duration(s) {
+  if (s < 60) return `${Math.round(s)} s`;
+  if (s < 3600) return `${Math.round(s / 60)} min`;
+  return `${Math.floor(s / 3600)} h ${Math.round((s % 3600) / 60)} min`;
+}
+
+// agent times are UTC like 2026-10-17T21:03:05Z
+const agentTime = (s) => (s ? Date.parse(s) / 1000 : null);
+
+function store(key, value) {
+  try {
+    if (value === undefined) return localStorage.getItem(`podkop-manager.${key}`);
+    localStorage.setItem(`podkop-manager.${key}`, value);
+  } catch { /* private mode, blocked storage */ }
+  return null;
+}
+
+// --- links: name, protocol, host --------------------------------------------------
+
 function linkName(link) {
   const i = link.indexOf("#");
-  if (i < 0) return link.replace(/^[a-z0-9]+:\/\/([^@]*@)?/, "").split(/[?/]/)[0];
-  try { return decodeURIComponent(link.slice(i + 1).replace(/\+/g, " ")); } catch { return link.slice(i + 1); }
+  if (i >= 0) {
+    try { return decodeURIComponent(link.slice(i + 1).replace(/\+/g, " ")); } catch { return link.slice(i + 1); }
+  }
+  return linkHost(link);
 }
 
-// outbound tag -> server name, from a section's links
-function tagNames(config) {
-  const m = {};
-  for (const s of (config && config.sections) || []) {
-    const o = s.options || {};
-    const add = (list, mid) => asList(list).forEach((l, i) => (m[`${s.name}-${mid}${i + 1}-out`] = linkName(l)));
-    if (o.proxy_config_type === "urltest") { add(o.urltest_proxy_links, ""); add(o.urltest_fallback_links, "fallback-"); }
-    if (o.proxy_config_type === "selector") add(o.selector_proxy_links, "");
-    if (o.proxy_config_type === "url" && o.proxy_string) m[`${s.name}-out`] = linkName(o.proxy_string);
-    m[`${s.name}-urltest-out`] = "auto (URLTest)";
-  }
-  return m;
+function linkProto(link) {
+  const m = /^([a-z0-9]+):\/\//i.exec(link);
+  const p = m ? m[1].toLowerCase() : "?";
+  return p === "hy2" ? "hysteria2" : p === "shadowsocks" ? "ss" : p;
 }
+
+function linkHost(link) {
+  let rest = link.replace(/^[a-z0-9]+:\/\//i, "").split("#")[0];
+  rest = rest.slice(rest.lastIndexOf("@") + 1);
+  return rest.split(/[?/]/)[0];
+}
+
+// host:port · transport, security
+function linkDetails(link) {
+  const q = new URLSearchParams((link.split("#")[0].split("?")[1]) || "");
+  const extra = [q.get("type"), q.get("security") && q.get("security") !== "none" ? q.get("security") : null].filter(Boolean);
+  return linkHost(link) + (extra.length ? ` · ${extra.join(", ")}` : "");
+}
+
+const isLink = (v) => typeof v === "string" && /^[a-z0-9]+:\/\//i.test(v);
+
+// --- routers ------------------------------------------------------------------------
 
 function routerState(rt) {
-  if (!rt.online) return ["bad", "offline"];
+  if (!rt.online) return { cls: "bad", label: rt.checked ? "offline" : "connecting" };
   const p = rt.status.podkop;
-  if (p.busy) return ["warn", "applying"];
-  if (p.paused) return ["warn", "stopped"];
-  if (!p.enabled) return ["warn", "disabled"];
-  if (!p.running) return ["bad", "podkop down"];
-  return ["ok", "running"];
+  if (p.busy) return { cls: "warn", label: "applying" };
+  if (p.paused) return { cls: "warn", label: "stopped" };
+  if (!p.enabled) return { cls: "warn", label: "disabled" };
+  if (!p.running) return { cls: "bad", label: "podkop down" };
+  return { cls: "ok", label: "running" };
 }
 
-// --- routing ------------------------------------------------------------------------
+// a change undone on the router in the last day
+const recentAlert = (rt) => (rt.alert && Date.now() / 1000 - rt.alert.t < 86400 ? rt.alert : null);
+const draftChanges = (rt) => (rt.draft && rt.draft.changes) || 0;
 
-const routes = [
-  [/^#?\/?$/, viewDashboard],
-  [/^#\/add$/, viewAdd],
-  [/^#\/settings$/, viewSettings],
-  [/^#\/r\/(\d+)$/, viewOverview],
-  [/^#\/r\/(\d+)\/config$/, viewConfig],
-  [/^#\/r\/(\d+)\/probe$/, viewProbe],
-  [/^#\/r\/(\d+)\/logs$/, viewLogs],
-  [/^#\/r\/(\d+)\/history$/, viewHistory],
-];
+// "running, 4 changes not applied" and its color, for the router list
+function routerLine(rt) {
+  const st = routerState(rt);
+  if (!rt.online) {
+    const since = rt.down_since ? ` since ${shortWhen(rt.down_since)}` : "";
+    return { cls: "bad", text: `offline${since}${rt.error ? ", " + rt.error : ""}` };
+  }
+  const a = recentAlert(rt);
+  if (a) return { cls: "warn", text: `${st.label}, a change was undone ${ago(a.t)}` };
+  const n = draftChanges(rt);
+  return { cls: "", text: n ? `${st.label}, ${plural(n, "change")} not applied` : st.label };
+}
+
+const routerList = () => Object.values(S.routers).sort((a, b) => a.id - b.id);
+
+// --- routes ------------------------------------------------------------------------------
+
+const SECTIONS = {
+  "": { title: "Overview", view: (m, id) => viewOverview(m, id) },
+  rules: { title: "Routing rules", view: (m, id, sub) => viewRules(m, id, sub) },
+  global: { title: "Global settings", view: (m, id) => viewGlobal(m, id) },
+  servers: { title: "Servers", view: (m, id) => viewServers(m, id) },
+  probe: { title: "Servers probe", view: (m, id) => viewProbe(m, id) },
+  logs: { title: "Logs", view: (m, id) => viewLogs(m, id) },
+  history: { title: "History", view: (m, id) => viewHistory(m, id) },
+};
+
+function route() {
+  const m = /^#\/r\/(\d+)(?:\/([a-z]+)(?:\/([A-Za-z0-9_]+))?)?$/.exec(location.hash);
+  if (m) return { rid: +m[1], section: m[2] || "", sub: m[3] || "" };
+  if (location.hash === "#/settings") return { settings: true };
+  return { home: true };
+}
+
+const lastRouter = () => {
+  const id = +store("router");
+  return S.routers[id] ? id : (routerList()[0] || {}).id;
+};
 
 async function render() {
   const main = document.getElementById("main");
   if (S.view && S.view.leave) S.view.leave();
   S.view = null;
-  for (const [re, fn] of routes) {
-    const m = location.hash.match(re);
-    if (m) {
-      put(main, h("p", { class: "muted" }, "Loading…"));
-      try { await fn(main, ...m.slice(1).map(Number)); }
-      catch (e) { put(main, h("div", { class: "card" }, h("p", { class: "bad" }, e.message))); }
-      return;
-    }
+  const r = route();
+  if (r.home) {
+    const id = lastRouter();
+    location.replace(id ? `#/r/${id}` : "#/settings");
+    return;
   }
-  put(main, h("p", {}, "Not found"));
+  if (r.rid && !S.routers[r.rid]) { location.replace("#/"); return; }
+  if (r.rid) store("router", String(r.rid));
+  S.rid = r.rid || lastRouter();
+  drawSide();
+  put(main, h("div", { class: "page" }, h("p", { class: "loading" }, "Loading…")));
+  window.scrollTo(0, 0);
+  const sec = SECTIONS[r.section];
+  document.title = `${r.settings ? "Settings" : sec ? sec.title : "Not found"} · podkop-manager`;
+  try {
+    if (r.settings) await viewSettings(main);
+    else if (sec) await sec.view(main, r.rid, r.sub);
+    else put(main, h("div", { class: "page" }, h("p", {}, "Not found")));
+  } catch (e) {
+    put(main, h("div", { class: "page" }, h("div", { class: "card pad" }, h("p", { class: "bad-text" }, e.message))));
+  }
 }
 
-function routerTabs(rt, active) {
-  const t = (path, label) => h("a", { href: `#/r/${rt.id}${path}`, class: active === path ? "active" : "" }, label);
-  const [cls, label] = routerState(rt);
-  return [
-    h("div", { class: "row spread" },
-      h("h1", {}, rt.name, " ", h("span", { class: `badge ${cls}` }, label)),
-      h("span", { class: "muted small" }, `${rt.host}${rt.port !== 22 ? ":" + rt.port : ""}`)),
-    h("nav", { class: "tabs" }, t("", "Overview"), t("/config", "Settings"), t("/probe", "Servers probe"),
-      t("/logs", "Logs"), t("/history", "History")),
-  ];
+// --- sidebar ---------------------------------------------------------------------------
+
+let switchOpen = false;
+
+function drawSide() {
+  const side = document.getElementById("side");
+  const r = route();
+  const rt = S.routers[S.rid];
+  const cur = (section) => (r.rid && r.section === section ? "page" : null);
+  const link = (section, label, ico, extra) => h("a", { href: `#/r/${rt.id}${section ? "/" + section : ""}`, "aria-current": cur(section) },
+    ico ? icon(ico) : null, label, extra);
+  const n = rt ? draftChanges(rt) : 0;
+  put(side,
+    h("div", { class: "brand" }, h("b", {}, "podkop-manager"),
+      h("span", { class: `live${S.live ? " on" : ""}`, title: S.live ? "live updates on" : "reconnecting" },
+        h("span", { class: "dot sm" }), S.live ? "live" : "offline")),
+    rt ? switcher(rt) : null,
+    rt ? h("div", { class: "nav" },
+      link("", "Overview", "overview"),
+      h("a", { href: `#/r/${rt.id}/rules` }, icon("routing"), "Routing",
+        n ? h("span", { class: "count", title: `${plural(n, "change")} not applied` }, n) : null),
+      h("a", { href: `#/r/${rt.id}/rules`, class: "sub", "aria-current": cur("rules") }, "Rules"),
+      h("a", { href: `#/r/${rt.id}/global`, class: "sub", "aria-current": cur("global") }, "Global settings"),
+      link("servers", "Servers", "servers"),
+      link("probe", "Servers probe", "probe"),
+      link("logs", "Logs", "logs"),
+      link("history", "History", "history")) : null,
+    h("div", { class: "nav nav-bottom" },
+      h("a", { href: "#/settings", "aria-current": r.settings ? "page" : null }, icon("settings"), "Settings")));
+}
+
+function switcher(rt) {
+  const st = routerState(rt);
+  const others = routerList().filter((x) => x.id !== rt.id);
+  const alerts = others.map((x) => {
+    if (!x.online) return { x, text: `${x.name} is offline` };
+    const a = recentAlert(x);
+    return a ? { x, text: `${x.name}: a change was undone ${ago(a.t)}` } : null;
+  }).filter(Boolean);
+  const btn = h("button", { type: "button", class: "switcher", "aria-expanded": String(switchOpen), "aria-controls": "router-list",
+    onclick: (e) => { e.stopPropagation(); switchOpen = !switchOpen; drawSide(); } },
+    h("span", { class: `dot ${st.cls}` }),
+    h("span", { class: "who" }, h("b", {}, rt.name), h("span", {}, `${rt.host}${rt.port !== 22 ? ":" + rt.port : ""} · ${st.label}`)),
+    icon("updown", 14), h("span", { class: "sr" }, "Switch router"));
+  const pop = switchOpen ? h("div", { class: "pop", id: "router-list", role: "listbox", "aria-label": "Routers" },
+    routerList().map((x) => {
+      const line = routerLine(x);
+      return h("a", { href: `#/r/${x.id}${route().section ? "/" + route().section : ""}`, class: "router", role: "option",
+        "aria-selected": String(x.id === rt.id), onclick: () => { switchOpen = false; } },
+      h("span", { class: `dot ${routerState(x).cls}` }),
+      h("span", { class: "who" }, h("b", {}, x.name), h("span", { class: line.cls }, line.text)),
+      x.id === rt.id ? icon("check", 16, { stroke: "var(--accent)", width: 2 }) : null);
+    }),
+    h("hr"),
+    h("a", { href: "#/settings", onclick: () => { switchOpen = false; } }, icon("plus", 15), "Add router"),
+    h("a", { href: "#/settings", onclick: () => { switchOpen = false; } }, icon("settings", 15), "Manage routers")) : null;
+  return h("div", { class: "switch" }, btn, pop,
+    alerts.map((a) => h("a", { href: `#/r/${a.x.id}`, class: "alert-line" }, h("span", { class: "dot sm bad" }), a.text)));
+}
+
+document.addEventListener("click", (e) => {
+  if (switchOpen && !e.target.closest(".switch")) { switchOpen = false; drawSide(); }
+});
+document.addEventListener("keydown", (e) => {
+  if (switchOpen && e.key === "Escape") { switchOpen = false; drawSide(); document.querySelector(".switcher").focus(); }
+});
+
+// --- page parts ----------------------------------------------------------------------------
+
+function pageHead(title, sub, ...actions) {
+  return h("header", { class: "head" },
+    h("div", { class: "title" }, h("h1", {}, title), sub ? h("p", {}, sub) : null),
+    actions.length ? h("div", { class: "row" }, actions) : null);
 }
 
 function getRouter(id) {
@@ -148,598 +363,2247 @@ function getRouter(id) {
   return rt;
 }
 
-// --- dashboard ----------------------------------------------------------------------
-
-async function viewDashboard(main) {
-  const draw = () => {
-    const list = Object.values(S.routers);
-    put(main, 
-      h("div", { class: "row spread" }, h("h1", {}, "Routers"), h("a", { href: "#/add", class: "button" }, "Add router")),
-      list.length ? h("div", { class: "grid" }, list.map(routerCard))
-        : h("div", { class: "card" }, h("p", {}, "No routers yet. "), h("a", { href: "#/add" }, "Add your first router")));
-  };
-  draw();
-  S.view = { onRouter: draw };
+// seg([["udp", "UDP"], ...], value, onchange): a segmented control
+function seg(options, value, onchange, { small, label, disabled } = {}) {
+  return h("div", { class: `seg${small ? " sm" : ""}`, role: "group", "aria-label": label || null },
+    options.map(([v, text]) => h("button", { type: "button", "aria-pressed": String(v === value), disabled,
+      onclick: () => { if (v !== value) onchange(v); } }, text)));
 }
 
-function routerCard(rt) {
-  const [cls, label] = routerState(rt);
-  const st = rt.status;
-  const all = (rt.proxies && rt.proxies.groups) || [];
-  const groups = all.filter((g) => g.type === "Selector");
-  const names = rt.names || {};
-  const shown = (g) => {
-    const ut = all.find((x) => x.name === g.now && x.type === "URLTest");
-    return ut ? `${names[ut.now] || ut.now} (automatic)` : names[g.now] || g.now;
-  };
-  return h("a", { href: `#/r/${rt.id}`, class: "card", style: "display:block;color:inherit;text-decoration:none" },
-    h("div", { class: "row spread" }, h("h2", {}, rt.name), h("span", { class: `badge ${cls}` }, label)),
-    st ? h("div", { class: "small muted" }, `podkop ${st.podkop.version} · sing-box ${st.singbox.version}`) : null,
-    st ? h("div", { class: "small muted" }, st.router.model) : h("div", { class: "small bad" }, rt.error),
-    groups.length ? h("table", { style: "margin-top:8px" }, groups.map((g) =>
-      h("tr", {}, h("td", {}, g.name.replace(/-out$/, "")), h("td", { class: "muted" }, shown(g))))) : null,
-    h("div", { class: "small muted", style: "margin-top:6px" }, `checked ${ago(rt.checked)}`));
+// --- podkop's settings: rules, diffs, labels -----------------------------------------------
+
+const INTERNAL = () => new Set((S.schema && S.schema.internal) || ["shutdown_correctly"]);
+const sectionsOf = (config) => ((config && config.sections) || []);
+const rulesOf = (config) => sectionsOf(config).filter((s) => s.type === "section");
+const bySection = (config) => new Map(sectionsOf(config).map((s) => [s.name, s]));
+const same = (a, b) => JSON.stringify(a === undefined ? null : a) === JSON.stringify(b === undefined ? null : b);
+
+// what changes from a to b, entry by entry like the manager's podkop.diff
+function configDiff(a, b) {
+  const out = [], A = bySection(a), B = bySection(b), internal = INTERNAL();
+  for (const [n, s] of B) if (!A.has(n)) out.push({ section: n, change: "added", type: s.type, options: s.options || {} });
+  for (const n of A.keys()) if (!B.has(n)) out.push({ section: n, change: "removed" });
+  for (const [n, s] of B) {
+    if (!A.has(n)) continue;
+    const oo = A.get(n).options || {}, no = s.options || {};
+    for (const k of [...Object.keys(oo), ...Object.keys(no).filter((k) => !(k in oo))]) {
+      if (!internal.has(k) && !same(oo[k], no[k])) out.push({ section: n, option: k, change: "changed", old: oo[k], new: no[k] });
+    }
+  }
+  const oa = [...A.keys()].filter((n) => B.has(n)), ob = [...B.keys()].filter((n) => A.has(n));
+  if (!same(oa, ob)) out.push({ change: "order", old: oa, new: ob });
+  return out;
 }
 
-// --- add router ---------------------------------------------------------------------
+const FRIENDLY = {
+  connection_type: "Sends to", proxy_config_type: "Servers", proxy_string: "Server", selector_proxy_links: "Servers",
+  urltest_proxy_links: "Servers", urltest_fallback_links: "Fallback servers", outbound_json: "sing-box JSON",
+  urltest_check_interval: "Check every", urltest_tolerance: "Switch only if faster by", urltest_testing_url: "Testing URL",
+  urltest_download_check: "Download check", urltest_download_url: "Download check URL",
+  community_lists: "Community lists", user_domain_list_type: "Your domains", user_domains: "Your domains",
+  user_domains_text: "Your domains", user_subnet_list_type: "Your subnets", user_subnets: "Your subnets",
+  user_subnets_text: "Your subnets", remote_domain_lists: "Domain lists from URLs", remote_subnet_lists: "Subnet lists from URLs",
+  local_domain_lists: "Domain list files", local_subnet_lists: "Subnet list files", interface: "VPN interface",
+  source_network_interfaces: "Which devices", routing_excluded_ips: "IPs never routed", dns_type: "DNS protocol",
+  bootstrap_dns_server: "Bootstrap server", dns_rewrite_ttl: "Rewrite TTL", update_interval: "Update lists every",
+};
 
-async function viewAdd(main) {
-  const f = {
-    name: h("input", { placeholder: "e.g. home" }),
-    host: h("input", { placeholder: "192.168.1.1", required: true }),
-    port: h("input", { value: "22", type: "number" }),
-    password: h("input", { type: "password", autocomplete: "off" }),
-    allow: h("input", { placeholder: "e.g. 192.168.1.10 (optional)" }),
-  };
-  const out = h("div");
-  const btn = h("button", { class: "primary", type: "submit" }, "Install podkop-agent and add");
-  put(main, h("h1", {}, "Add router"), h("form", {
-    class: "card", onsubmit: async (e) => {
-      e.preventDefault(); btn.disabled = true; put(out, h("p", { class: "muted" }, "Installing… (up to a minute)"));
-      try {
-        const r = await api("POST", "/api/routers", { name: f.name.value, host: f.host.value, port: +f.port.value,
-          password: f.password.value, allow_clash: f.allow.value });
-        f.password.value = "";
-        await loadRouters();
-        location.hash = `#/r/${r.id}`;
-      } catch (err) { put(out, h("p", { class: "problem" }, err.message)); btn.disabled = false; }
-    } },
-    field("Name", f.name), field("Router address", f.host), field("SSH port", f.port),
-    field("Root password", f.password, "Used once to install podkop-agent and this manager's key; not stored."),
-    field("Clash API allowed for", f.allow,
-      "podkop's Clash API (port 9090) gets blocked for the LAN. List computers that should still reach it (e.g. for LuCI's dashboard)."),
-    h("p", { class: "small muted" }, "Needs podkop and podkop-engine on the router. Installs podkop-agent, podkop-probe, a restricted SSH key and two firewall rules."),
-    btn, out));
+function optionDef(section, opt) {
+  if (!S.schema) return null;
+  return (section === "settings" ? S.schema.settings : S.schema.section).find((d) => d.name === opt) || null;
 }
 
-function field(label, input, help, opt) {
-  return h("div", { class: "field" },
-    h("div", { class: "name" }, label, opt ? h("div", { class: "opt" }, opt) : null),
-    h("div", {}, input, help ? h("div", { class: "help" }, help) : null));
+const optionLabel = (section, opt) => FRIENDLY[opt] || (optionDef(section, opt) || {}).label || opt;
+
+// what a rule matches, in a few words
+function ruleMatches(sec) {
+  const o = sec.options || {}, parts = [];
+  const lists = asList(o.community_lists);
+  if (lists.length === 1) parts.push(`community ${lists[0]}`);
+  else if (lists.length && lists.length <= 3) parts.push(lists.join(", "));
+  else if (lists.length) parts.push(`${lists.length} community lists`);
+  const count = (type, list, text) => (o[type] === "dynamic" ? asList(o[list]).length
+    : o[type] === "text" ? String(o[text] || "").split(/[\s,]+/).filter(Boolean).length : 0);
+  const d = count("user_domain_list_type", "user_domains", "user_domains_text");
+  const n = count("user_subnet_list_type", "user_subnets", "user_subnets_text");
+  if (d) parts.push(plural(d, "domain"));
+  if (n) parts.push(plural(n, "subnet"));
+  const remote = asList(o.remote_domain_lists).length + asList(o.remote_subnet_lists).length;
+  const local = asList(o.local_domain_lists).length + asList(o.local_subnet_lists).length;
+  if (remote) parts.push(plural(remote, "remote list"));
+  if (local) parts.push(plural(local, "list file"));
+  return parts.join(", ") || "nothing yet";
 }
 
-// --- settings (the manager's) ------------------------------------------------------------
-
-async function viewSettings(main) {
-  const info = S.manager || (S.manager = await api("GET", "/api/manager"));
-  put(main, h("h1", {}, "Settings"),
-    h("div", { class: "card" },
-      h("h2", {}, "This manager"),
-      h("p", {}, `podkop-manager ${info.version}`),
-      h("p", { class: "small muted" }, "Its SSH key (routers let it run only podkop-agent):"),
-      h("pre", {}, info.public_key),
-      h("form", { method: "post", action: "/logout", style: "margin-top:14px" }, h("button", {}, "Log out"))));
+// where a rule sends traffic: [text, chip class]
+function ruleDest(sec) {
+  const o = sec.options || {};
+  switch (o.connection_type) {
+    case "vpn": return [`VPN ${o.interface || ""}`.trim(), "vpn"];
+    case "block": return ["Block", "block"];
+    case "exclusion": return ["Direct", "direct"];
+    case "proxy": {
+      const pt = o.proxy_config_type || "url";
+      if (pt === "urltest") return [`Proxy, fastest of ${asList(o.urltest_proxy_links).length}`, ""];
+      if (pt === "selector") return [`Proxy, choice of ${asList(o.selector_proxy_links).length}`, ""];
+      if (pt === "outbound") return ["Proxy, sing-box JSON", ""];
+      return ["Proxy, one server", ""];
+    }
+    default: return [o.connection_type || "not set", "direct"];
+  }
 }
 
-// --- overview ---------------------------------------------------------------------------
+const destChip = (sec) => { const [text, cls] = ruleDest(sec); return h("span", { class: `dest ${cls}` }, text); };
+
+// the server a rule uses now: {text, mode}
+function ruleNow(rt, sec, devices) {
+  const o = sec.options || {};
+  if (o.connection_type === "block") return { text: "–" };
+  if (o.connection_type === "exclusion") return { text: "not through podkop" };
+  if (o.connection_type === "vpn") {
+    const ok = !devices || devices.includes(o.interface);
+    return { text: ok ? o.interface || "–" : `${o.interface} not found`, bad: !ok };
+  }
+  if (!rt.proxies) return { text: "–" };
+  const groups = rt.proxies.groups || [];
+  const g = groups.find((x) => x.name === `${sec.name}-out`);
+  if (!g) return { text: "–" };
+  const ut = groups.find((x) => x.name === `${sec.name}-urltest-out`);
+  const tag = g.now === `${sec.name}-urltest-out` && ut ? ut.now : g.now;
+  const server = (rt.proxies.servers || []).find((x) => x.name === tag);
+  const pinned = ((rt.status && rt.status.pins) || []).some((p) => p.section === sec.name);
+  const name = (rt.names || {})[tag] || tag;
+  return { text: server && server.delay ? `${name}, ${server.delay} ms` : name,
+    mode: pinned ? "pinned" : o.proxy_config_type === "urltest" ? "auto" : "" };
+}
+
+// the version the router runs now, by its fingerprint
+const runningVersion = (rt, versions) => (rt.status
+  ? (versions || []).find((v) => v.fingerprint_after && v.fingerprint_after === rt.status.fingerprint) : null);
+
+// "claude.ai in main, new rule banks_direct" from a diff
+function diffSummary(diff) {
+  const parts = diff.map((d) => {
+    if (d.change === "added") return `new rule ${d.section}`;
+    if (d.change === "removed") return `rule ${d.section} removed`;
+    if (d.change === "order") return "rule order";
+    const added = asList(d.new).filter((x) => !asList(d.old).includes(x));
+    if (Array.isArray(d.new) && added.length === 1 && !isLink(added[0])) return `${added[0]} in ${d.section}`;
+    return `${d.section}: ${optionLabel(d.section, d.option).toLowerCase()}`;
+  });
+  const uniq = [...new Set(parts)];
+  return uniq.slice(0, 3).join(", ") + (uniq.length > 3 ? ` and ${uniq.length - 3} more` : "");
+}
+
+// --- events ---------------------------------------------------------------------------------
+
+const EVENT_TEXT = {
+  applied: (d) => (d.restarted ? "Settings applied, podkop restarted" : "Settings saved, podkop is stopped"),
+  reverted: (d) => `Change undone: ${d.reason}`,
+  revert_failed: (d) => `Change failed and podkop does not run with the old settings either: ${d.revert_reason}`,
+  podkop_down: (d) => `podkop is down${d.failsafe ? ": " + d.failsafe : ""}`,
+  podkop_up: () => "podkop is up again",
+  recovered: (d) => `Watchdog: ${d.action}`,
+  recovery_failed: (d) => `Watchdog could not bring podkop back: ${d.reason}`,
+  recovery_gave_up: () => "Watchdog gave up: 3 tries in the last hour",
+  pinned: (d) => `${d.section}: pinned ${serverName(d.section, d.server)}`,
+  pin_cleared: (d) => `${d.section}: back to automatic`,
+  pin_restored: (d) => `${d.section}: pin ${serverName(d.section, d.server)} set again`,
+  pin_dropped: (d) => `${d.section}: pin removed, ${d.reason}`,
+  agent_started: (d) => `podkop-agent ${d.version} started`,
+  service: (d) => `podkop ${d.action}`,
+  probe_started: () => "Probe started",
+  probe_done: (d) => (d.exit === 0 ? "Probe finished" : `Probe failed (exit ${d.exit})`),
+  probe_apply_failed: (d) => `Probe result not applied: ${d.message}`,
+  probe_not_started: (d) => `Nightly probe not started: ${d.message}`,
+  auto_rule_empty: (d) => `${d.section}: no server matched after the probe, the rule keeps its last servers`,
+};
+const EVENT_DOT = {
+  applied: "ok", podkop_up: "ok", reverted: "bad", revert_failed: "bad", podkop_down: "bad", recovery_failed: "bad",
+  recovery_gave_up: "bad", probe_apply_failed: "bad", probe_not_started: "bad", recovered: "warn", pin_dropped: "warn",
+  auto_rule_empty: "warn",
+  pinned: "accent", pin_cleared: "accent", pin_restored: "accent",
+};
+
+function serverName(section, tag) {
+  const rt = S.routers[S.rid];
+  return (rt && rt.names && rt.names[tag]) || tag;
+}
+
+const eventText = (type, d) => (EVENT_TEXT[type] ? EVENT_TEXT[type](d || {}) : `${type} ${JSON.stringify(d || {})}`);
+
+// --- overview -------------------------------------------------------------------------------------
 
 async function viewOverview(main, id) {
-  const rt = getRouter(id);
-  let config = null;
-  try { config = (await api("GET", `/api/routers/${id}/config`)).config; } catch { /* offline */ }
-  const events = h("div");
-  const loadEvents = async () => {
-    const ev = await api("GET", `/api/routers/${id}/events?limit=30`);
-    put(events, h("table", {}, ev.map((e) => h("tr", {},
-      h("td", { class: "small muted", style: "white-space:nowrap" }, ago(e.t)), h("td", {}, eventText(e.type, e.data))))));
+  const page = h("div", { class: "page" });
+  put(main, page);
+  let data = {};
+  const load = async () => {
+    const [config, events, probe, versions, draft] = await Promise.allSettled([
+      api("GET", `/api/routers/${id}/config`), api("GET", `/api/routers/${id}/events?limit=12`),
+      api("GET", `/api/routers/${id}/probe`), api("GET", `/api/routers/${id}/versions?limit=50`),
+      api("GET", `/api/routers/${id}/draft`)]);
+    const v = (r) => (r.status === "fulfilled" ? r.value : null);
+    data = { config: v(config), events: v(events) || [], probe: v(probe), versions: v(versions) || [], draft: v(draft) };
+    data.auto = Object.fromEntries(((data.probe && data.probe.auto_rules) || []).map((r) => [r.section, r]));
+  };
+
+  const service = (action, label, cls) => h("button", { type: "button", class: `btn ${cls || ""}`, onclick: async (e) => {
+    const b = e.currentTarget; b.disabled = true;
+    try { await api("POST", `/api/routers/${id}/service`, { action }); toast(`podkop: ${action} done`); }
+    catch (err) { toast(err.message, true); }
+    b.disabled = false;
+  } }, label);
+
+  const draw = () => {
+    const rt = S.routers[id];
+    if (!rt) return;
+    const st = rt.status, pk = st && st.podkop;
+    const cfg = data.config && data.config.config;
+    const running = runningVersion(rt, data.versions);
+    put(page,
+      pageHead("Overview", `What podkop on ${rt.name} is doing right now`,
+        h("button", { type: "button", class: "btn", onclick: async (e) => {
+          const b = e.currentTarget; b.disabled = true;
+          try { await api("POST", `/api/routers/${id}/refresh`); await load(); draw(); } catch (err) { toast(err.message, true); }
+          b.disabled = false;
+        } }, icon("refresh", 15), "Refresh"),
+        pk && pk.running ? service("restart", "Restart podkop") : pk ? service("start", "Start podkop", "primary") : null,
+        pk && pk.running ? service("stop", "Stop", "danger") : null),
+      !rt.online ? h("div", { class: "banner bad" }, h("span", { class: "dot bad" }),
+        h("span", { class: "grow" }, h("b", {}, "The router does not answer. "), rt.error || ""),
+        h("span", { class: "muted small" }, rt.down_since ? `since ${shortWhen(rt.down_since)}` : "")) : null,
+      waiting(rt, cfg, running),
+      st ? statusStrip(st) : null,
+      h("div", { class: "split" },
+        h("div", { class: "stack", style: "flex: 2 1 600px; min-width: 0" },
+          nowRouting(rt, cfg, running),
+          nightly(rt)),
+        eventsCard(rt)));
+  };
+
+  // things that wait for the user: an unapplied draft, a probe result not in podkop yet
+  const waiting = (rt, cfg, running) => {
+    const notes = [];
+    if (data.draft && cfg && data.draft.changes) {
+      const d = configDiff(cfg, data.draft.config);
+      notes.push(h("div", { class: "note" }, h("span", { class: "dot accent" }),
+        h("div", { class: "col" }, h("span", {}, `${plural(d.length, "routing change")} ${d.length === 1 ? "is" : "are"} not applied`),
+          h("span", {}, `${diffSummary(d)}.${running ? ` The router still runs #${running.id}.` : ""}`)),
+        h("a", { class: "alink", href: `#/r/${id}/rules` }, "Open changes")));
+    }
+    const ps = data.probe && data.probe.status;
+    if (ps && ps.state === "done" && cfg && probeIsNew(ps, cfg, data.probe.settings)) {
+      const n = (k) => asList(ps.lists[k]).length;
+      const rows = ps.rows || [];
+      const usable = rows.filter((r) => ["GOOD", "OK", "FLAKY"].includes(r.verdict)).length;
+      notes.push(h("div", { class: "note" }, h("span", { class: "dot accent" }),
+        h("div", { class: "col" }, h("span", {}, `Probe from ${shortWhen(agentTime(ps.finished))} has new server lists`),
+          h("span", {}, `main ${n("main")} and ${n("main_fallback")} fallback, YouTube ${n("youtube")} and ${n("youtube_fallback")} fallback. ${usable} of ${rows.length} servers usable.`)),
+        h("a", { class: "alink", href: `#/r/${id}/probe` }, "See results")));
+    }
+    return notes.length ? h("section", { class: "card clip waiting", "aria-label": "Waiting for you" }, notes) : null;
+  };
+
+  const statusStrip = (st) => {
+    const s = routerState(S.routers[id]);
+    const pk = st.podkop;
+    const days = Math.floor(st.uptime / 86400), hours = Math.floor((st.uptime % 86400) / 3600);
+    return h("section", { class: "card status-strip", "aria-label": "Status" },
+      h("div", {}, h("span", {}, "podkop"), h("span", {}, h("span", { class: `dot sm ${s.cls}` }), `${pk.version || "?"}, ${s.label}`)),
+      h("div", {}, h("span", {}, "sing-box"), h("span", {}, st.singbox.version || "not found")),
+      h("div", {}, h("span", {}, "podkop-agent"),
+        h("span", {}, `${st.agent.version}, ${pk.paused || !pk.enabled ? "watchdog paused" : "watchdog on"}`)),
+      h("div", {}, h("span", {}, "Router"),
+        h("span", {}, [st.router.model, (st.router.openwrt || "").replace(/ r\d+-\w+$/, ""), `up ${days ? days + " d" : hours + " h"}`].filter(Boolean).join(", "))),
+      st.failsafe && !pk.running ? h("div", { style: "grid-column: 1 / -1" }, h("span", {}, `Failsafe, ${st.failsafe.time}`),
+        h("span", { class: "bad-text" }, st.failsafe.message)) : null);
+  };
+
+  const nowRouting = (rt, cfg, running) => {
+    const rules = rulesOf(cfg);
+    return h("section", { class: "card clip", "aria-labelledby": "now-routing" },
+      h("div", { class: "card-head", style: "align-items: baseline" },
+        h("div", { class: "col" }, h("h2", { id: "now-routing" }, "Now routing"),
+          h("span", { class: "small muted" }, running ? `Rules from #${running.id}, first match wins` : "First matching rule wins")),
+        h("div", { class: "row", style: "gap: 16px" },
+          h("a", { class: "alink", href: `#/r/${id}/rules` }, "Edit rules"),
+          h("a", { class: "alink", href: `#/r/${id}/servers` }, "Pin servers"))),
+      !cfg ? h("p", { class: "empty" }, rt.online ? "Could not read podkop's settings." : "Shown when the router answers.")
+        : h("div", { class: "scroll-x" }, h("table", { class: "wide" },
+          h("tr", {}, h("th", { scope: "col", style: "width: 24px" }, "#"), h("th", { scope: "col" }, "Rule"),
+            h("th", { scope: "col" }, "Matches"), h("th", { scope: "col" }, "Goes to"), h("th", { scope: "col" }, "Now")),
+          rules.map((sec, i) => {
+            const now = ruleNow(rt, sec, data.config.devices);
+            return h("tr", {},
+              h("td", { class: "muted num" }, i + 1),
+              h("td", { class: "mono", style: "font-size: 13px; font-weight: 500" }, sec.name),
+              h("td", { style: "color: var(--text-2)" }, ruleMatches(sec)),
+              h("td", {}, data.auto[sec.name] && (sec.options || {}).connection_type === "proxy"
+                ? h("span", { class: "dest" }, `Proxy, ${data.auto[sec.name].countries.join(", ") || "any country"} servers`) : destChip(sec)),
+              h("td", {}, h("span", { class: "row", style: "gap: 8px" }, h("span", { class: now.bad ? "bad-text" : "" }, now.text),
+                now.mode ? h("span", { class: "mode" }, now.mode) : null)));
+          }),
+          h("tr", {}, h("td", {}), h("td", { class: "nowrap", style: "color: var(--text-2)" }, "Everything else"),
+            h("td", { class: "muted" }, "no rule matched"), h("td", {}, h("span", { class: "dest direct" }, "Direct")),
+            h("td", { class: "muted" }, "not through podkop")))));
+  };
+
+  const nightly = () => {
+    const p = data.probe;
+    const ps = p && p.settings;
+    if (!ps) return null;
+    const last = (p.runs || []).find((r) => r.trigger === "schedule");
+    let lastText = "";
+    if (last) {
+      const day = longWhen(last.started).replace(/ \d\d:\d\d$/, "").replace(/, \d\d:\d\d$/, "");
+      lastText = last.state !== "done" ? `Last nightly run ${day.toLowerCase()}: ${last.state}.`
+        : last.version_id ? `Last nightly run ${day.toLowerCase()} applied as #${last.version_id}.`
+          : `Last nightly run ${day.toLowerCase()} finished, not applied.`;
+    }
+    let next = "";
+    if (ps.schedule) {
+      const [hh, mm] = ps.schedule.split(":").map(Number);
+      const t = new Date(); t.setHours(hh, mm, 0, 0);
+      if (t <= new Date()) t.setDate(t.getDate() + 1);
+      next = `Next run in ${duration((t - new Date()) / 1000)}.`;
+    }
+    return h("section", { class: "card note", "aria-labelledby": "nightly", style: "padding: 16px 18px" },
+      h("div", { class: "col", style: "flex: 1 1 320px; gap: 3px" },
+        h("h2", { id: "nightly", class: "h2" }, "Nightly probe"),
+        h("span", { style: "font-size: 13.5px; color: var(--text-2); font-weight: 400" }, ps.schedule
+          ? `Every night at ${ps.schedule}, ${ps.auto_apply ? "applied by itself if podkop starts with it" : "results wait for you to apply them"}.`
+          : "Off. Set a time to test your subscriptions every night."),
+        lastText || next ? h("span", { class: "small muted" }, [lastText, next].filter(Boolean).join(" ")) : null),
+      h("a", { class: "btn", href: `#/r/${id}/probe` }, "Probe settings"));
+  };
+
+  const eventsCard = () => h("aside", { class: "card events", "aria-label": "Events", style: "flex: 1 1 300px; min-width: 0" },
+    h("div", { class: "row", style: "justify-content: space-between; margin-bottom: 8px" },
+      h("h2", {}, "Events"), h("a", { class: "small", href: `#/r/${id}/history` }, "History")),
+    data.events.length ? data.events.map((e) => h("div", { class: "event" },
+      h("span", { class: "num" }, shortWhen(e.t)), h("span", { class: `dot ${EVENT_DOT[e.type] || "gray"}` }),
+      h("span", {}, eventText(e.type, e.data))))
+      : h("p", { class: "muted small" }, "Nothing yet."));
+
+  await load();
+  draw();
+  let timer;
+  const later = () => { clearTimeout(timer); timer = setTimeout(async () => { await load(); draw(); }, 800); };
+  S.view = {
+    leave: () => clearTimeout(timer),
+    onRouter: (r) => { if (r.id !== id) return; if (data.config && r.status && r.status.fingerprint !== data.config.fingerprint) later(); else draw(); },
+    onEvent: (m) => m.router_id === id && later(),
+    onProbe: (m) => m.router_id === id && m.state !== "running" && later(),
+  };
+}
+
+// the probe's lists differ from what the rules it fills have now
+function probeIsNew(ps, cfg, settings) {
+  const by = bySection(cfg);
+  const check = (key, section) => {
+    const links = asList(ps.lists && ps.lists[key]);
+    if (!links.length || !section) return false;
+    const s = by.get(section);
+    return !s || !same(asList((s.options || {}).urltest_proxy_links), links)
+      || !same(asList((s.options || {}).urltest_fallback_links), asList(ps.lists[`${key}_fallback`]));
+  };
+  return check("main", (settings && settings.main_section) || "main")
+    || check("youtube", settings ? settings.youtube_section : "youtube");
+}
+
+// --- servers ------------------------------------------------------------------------------------
+
+// outbound tag -> link, from the rules' server lists (the way podkop names outbounds)
+function tagLinks(config) {
+  const m = {};
+  for (const s of rulesOf(config)) {
+    const o = s.options || {};
+    const add = (list, mid) => asList(list).forEach((l, i) => (m[`${s.name}-${mid}${i + 1}-out`] = l));
+    if (o.proxy_config_type === "urltest") { add(o.urltest_proxy_links, ""); add(o.urltest_fallback_links, "fallback-"); }
+    if (o.proxy_config_type === "selector") add(o.selector_proxy_links, "");
+    if (o.proxy_config_type === "url" && o.proxy_string) m[`${s.name}-out`] = o.proxy_string;
+  }
+  return m;
+}
+
+async function viewServers(main, id) {
+  const page = h("div", { class: "page" });
+  put(main, page);
+  let config = null, auto = {};
+  const tested = {};        // tag -> delay from "Test delays" (0 = timeout)
+  const open = new Set();   // groups showing all servers
+  const busy = new Set();   // groups being tested
+  const load = async () => {
+    const [c, a] = await Promise.all([api("GET", `/api/routers/${id}/config`).catch(() => null),
+      api("GET", `/api/routers/${id}/auto-rules`).catch(() => [])]);
+    config = c; auto = Object.fromEntries(a.map((r) => [r.section, r]));
+  };
+
+  const testGroup = async (sec) => {
+    busy.add(sec); draw();
+    try {
+      const d = await api("POST", `/api/routers/${id}/delays`, { section: sec });
+      for (const [tag, ms] of Object.entries(d)) tested[tag] = ms;
+      for (const s of config ? groupsOf() : []) if (s.name === sec) for (const t of memberTags(s)) if (!(t in d)) tested[t] = 0;
+    } catch (e) { toast(e.message, true); }
+    busy.delete(sec); draw();
+    api("POST", `/api/routers/${id}/refresh`).catch(() => {});
+  };
+
+  const pin = async (sec, tag) => {
+    try {
+      await api("POST", `/api/routers/${id}/pin`, { section: sec, server: tag });
+      toast(tag === "auto" ? `${sec}: back to automatic` : `${sec}: pinned ${serverName(sec, tag)}`);
+    } catch (e) { toast(e.message, true); }
+  };
+
+  const groupsOf = () => rulesOf(config.config).filter((s) => ["urltest", "selector"].includes((s.options || {}).proxy_config_type)
+    && (s.options || {}).connection_type === "proxy");
+  const memberTags = (s) => {
+    const g = (S.routers[id].proxies.groups || []).find((x) => x.name === `${s.name}-out`);
+    return g ? g.all.filter((t) => t !== `${s.name}-urltest-out`) : [];
   };
 
   const draw = () => {
     const rt = S.routers[id];
     if (!rt) return;
-    const st = rt.status;
-    const pk = st && st.podkop;
-    const svc = (action, label, cls) => h("button", { class: cls, onclick: async (e) => {
-      e.target.disabled = true;
-      try { await api("POST", `/api/routers/${id}/service`, { action }); toast(`podkop: ${action}`); }
-      catch (err) { toast(err.message, true); }
-      e.target.disabled = false;
-    } }, label);
-    put(main, ...routerTabs(rt, ""),
-      !rt.online ? h("div", { class: "card problem" }, rt.error || "offline") : null,
-      st ? h("div", { class: "card" },
-        h("div", { class: "row spread" },
-          h("div", {},
-            h("div", {}, `podkop ${pk.version} · sing-box ${st.singbox.version} · agent ${st.agent.version}`),
-            h("div", { class: "small muted" }, `${st.router.model} · ${st.router.openwrt} · up ${Math.round(st.uptime / 3600)} h`),
-            st.failsafe && !pk.running ? h("div", { class: "small bad" }, `failsafe ${st.failsafe.time}: ${st.failsafe.message}`) : null),
-          h("div", { class: "row" },
-            pk.running ? svc("restart", "Restart podkop") : svc("start", "Start podkop", "primary"),
-            pk.running ? svc("stop", "Stop", "danger") : null,
-            h("button", { onclick: async () => { await api("POST", `/api/routers/${id}/refresh`); } }, "Refresh")))) : null,
-      groupsCard(rt, Object.assign(tagNames(config), rt.names || {}), config),
-      h("div", { class: "card" }, h("h2", {}, "Events"), events),
-      h("div", { class: "card row" },
-        h("button", { class: "danger", onclick: () => removeRouter(rt) }, "Remove router"),
-        h("span", { class: "small muted" }, "From this manager; optionally also removes podkop-agent and the key from the router (podkop itself stays).")));
-    loadEvents().catch(() => {});
+    const head = pageHead("Servers", "Which server each rule uses now. Pin one to stop automatic switching. The router keeps the pin after restarts.",
+      config && rt.proxies && groupsOf().length ? h("button", { type: "button", class: "btn", disabled: busy.size > 0, onclick: async () => {
+        for (const s of groupsOf()) await testGroup(s.name);
+      } }, icon("probe", 15), busy.size ? "Testing…" : "Test all delays") : null);
+    if (!config) { put(page, head, h("div", { class: "card empty" }, rt.online ? "Could not read podkop's settings." : "Shown when the router answers.")); return; }
+    if (!rt.proxies) { put(page, head, h("div", { class: "card empty" }, "Servers show up here while podkop runs.")); return; }
+    const links = tagLinks(config.config);
+    const pins = Object.fromEntries(((rt.status && rt.status.pins) || []).map((p) => [p.section, p.server]));
+    const delayOf = (tag) => {
+      if (tag in tested) return tested[tag];
+      const s = (rt.proxies.servers || []).find((x) => x.name === tag);
+      return s ? s.delay : null;
+    };
+    const groups = groupsOf();
+    const others = rulesOf(config.config).filter((s) => !groups.includes(s)).map((s) => s.name);
+    put(page, head,
+      groups.length ? null : h("div", { class: "card empty" }, "No rule picks from a list of servers (Selector or Fastest)."),
+      groups.map((s) => {
+        const o = s.options || {};
+        const g = (rt.proxies.groups || []).find((x) => x.name === `${s.name}-out`);
+        if (!g) return h("section", { class: "card pad" }, h("h2", { class: "mono" }, s.name), h("p", { class: "muted small" }, "sing-box has no group for this rule yet."));
+        const ut = (rt.proxies.groups || []).find((x) => x.name === `${s.name}-urltest-out`);
+        const current = g.now === `${s.name}-urltest-out` && ut ? ut.now : g.now;
+        const pinned = !!pins[s.name];
+        const all = memberTags(s);
+        // fastest first, then untested, then timeouts
+        const rank = (t) => { const ms = delayOf(t); return ms ? ms : ms === 0 ? 1e9 : 1e8; };
+        const main = all.filter((t) => !t.startsWith(`${s.name}-fallback-`)).sort((a, b) => rank(a) - rank(b));
+        const fb = all.filter((t) => t.startsWith(`${s.name}-fallback-`));
+        const shown = open.has(s.name) ? [...main, ...fb] : main.slice(0, 5);
+        const hidden = main.length - Math.min(main.length, 5);
+        const mode = pinned ? ["pinned", "accent"] : o.proxy_config_type === "urltest" ? ["automatic", "ok"] : ["your choice", ""];
+        const ar = auto[s.name];
+        const exits = ar && ar.countries.length ? ` with an exit IP in ${ar.countries.map(countryName).join(" or ")}` : "";
+        const desc = ar ? `Fastest of ${main.length} ${ar.protocols.length ? ar.protocols.join(", ") + " " : ""}servers${exits}, taken from your subscriptions by the probe.`
+          : o.proxy_config_type === "urltest"
+            ? `Fastest of ${main.length}${fb.length ? `, with ${fb.length} fallback` : ""}. Checked every ${o.urltest_check_interval || "3m"}.`
+            : `Choice of ${main.length}.`;
+        return h("section", { class: "card clip", "aria-label": `Rule ${s.name}` },
+          h("div", { class: "card-head", style: "padding-bottom: 14px" },
+            h("div", { class: "col", style: "flex: 1 1 260px; gap: 3px" },
+              h("div", { class: "row", style: "gap: 10px" }, h("h2", { class: "mono" }, s.name), h("span", { class: `pill ${mode[1]}` }, mode[0])),
+              h("span", { class: "small muted" }, desc + (pinned ? " Pinned: the router keeps this server until you go back to automatic." : ""))),
+            h("div", { class: "row" },
+              pinned && ut ? h("button", { type: "button", class: "btn sm", onclick: () => pin(s.name, "auto") }, "Back to automatic") : null,
+              h("button", { type: "button", class: "btn sm", disabled: busy.has(s.name), onclick: () => testGroup(s.name) },
+                busy.has(s.name) ? "Testing…" : "Test delays"))),
+          h("div", { class: "scroll-x" }, h("table", { class: "wide" },
+            h("tr", {}, h("th", { scope: "col" }, "Server"), h("th", { scope: "col" }, "Protocol"),
+              h("th", { scope: "col", style: "width: 34%" }, "Delay"), h("th", { scope: "col", class: "r" }, h("span", { class: "sr" }, "Action"))),
+            shown.map((tag) => {
+              const ms = delayOf(tag), dead = ms === 0, now = tag === current;
+              const isFb = fb.includes(tag);
+              return h("tr", { class: now ? "current" : "" },
+                h("td", {}, h("span", { class: "row", style: "gap: 8px" }, (rt.names || {})[tag] || tag,
+                  now && pinned ? h("span", { class: "xs muted" }, "pinned") : null,
+                  isFb ? h("span", { class: "xs muted" }, "fallback") : null)),
+                h("td", { class: "mono-cell", style: "color: var(--text-2)" }, links[tag] ? linkProto(links[tag]) : "–"),
+                h("td", {}, h("div", { class: "delay" },
+                  h("div", { class: "bar" }, ms === null || ms === undefined ? null
+                    : h("div", { class: dead ? "dead" : now ? "now" : "", style: `width: ${dead ? 100 : Math.min(100, Math.round(ms / 8))}%` })),
+                  h("span", { class: `ms${dead ? " bad-text" : ""}` }, dead ? "timeout" : ms ? `${ms} ms` : "–"))),
+                h("td", { class: "r", style: "width: 110px" },
+                  now ? h("span", { class: "xs", style: "font-weight: 500" }, "In use")
+                    : dead ? null : h("button", { type: "button", class: "btn xs", onclick: () => pin(s.name, tag) }, "Pin")));
+            }))),
+          hidden || fb.length ? h("div", { style: "padding: 10px 18px; border-top: 1px solid var(--line-soft)" },
+            h("button", { type: "button", class: "link-btn", "aria-expanded": String(open.has(s.name)), onclick: () => {
+              if (open.has(s.name)) open.delete(s.name); else open.add(s.name); draw();
+            } }, open.has(s.name) ? "Show fewer"
+              : `Show ${[hidden ? `${hidden} more` : "", fb.length ? `${fb.length} fallback` : ""].filter(Boolean).join(" and ")}`,
+            icon(open.has(s.name) ? "up" : "down", 14, { width: 1.6 }))) : null);
+      }),
+      others.length ? h("section", { class: "card note" },
+        h("span", { class: "small muted", style: "flex: 1 1 320px" },
+          `${others.join(", ")} ${others.length === 1 ? "has" : "have"} no server list to pick from here. To change which servers a rule has, edit the rule.`),
+        h("a", { class: "alink", href: `#/r/${id}/rules` }, "Open rules")) : null);
   };
+
+  await load();
   draw();
-  S.view = { onRouter: (r) => r.id === id && draw(), onEvent: (m) => m.router_id === id && loadEvents() };
+  S.view = { onRouter: (r) => {
+    if (r.id !== id) return;
+    if (config && r.status && r.status.fingerprint !== config.fingerprint) load().then(draw); else draw();
+  } };
 }
 
-function groupsCard(rt, names, config) {
-  if (!rt.proxies) return h("div", { class: "card muted" }, "Servers show up here while podkop runs.");
-  const delay = {};
-  for (const s of rt.proxies.servers) delay[s.name] = s.delay;
-  const pins = {};
-  for (const p of (rt.status && rt.status.pins) || []) pins[p.section] = p.server;
-  const sections = ((config && config.sections) || []).filter((s) => s.type === "section");
-  const groups = rt.proxies.groups.filter((g) => g.type === "Selector");
-  return h("div", { class: "card" }, h("h2", {}, "Servers"),
-    groups.length ? null : h("p", { class: "muted" }, "No section uses selector or URLTest."),
-    groups.map((g) => {
-      const sec = g.name.replace(/-out$/, "");
-      const ut = rt.proxies.groups.find((x) => x.name === `${sec}-urltest-out`);
-      const current = g.now === `${sec}-urltest-out` && ut ? ut.now : g.now;
-      const pin = async (server) => {
-        try { await api("POST", `/api/routers/${rt.id}/pin`, { section: sec, server }); toast(server === "auto" ? "automatic choice" : `pinned ${names[server] || server}`); }
-        catch (e) { toast(e.message, true); }
-      };
-      const test = h("button", { class: "small", onclick: async (e) => {
-        e.target.disabled = true; e.target.textContent = "testing…";
-        try {
-          const d = await api("POST", `/api/routers/${rt.id}/delays`, { section: sec });
-          Object.assign(delay, d); toast(`tested ${Object.keys(d).length} servers`);
-          api("POST", `/api/routers/${rt.id}/refresh`).catch(() => {});
-        } catch (err) { toast(err.message, true); }
-        e.target.disabled = false; e.target.textContent = "Test all now";
-      } }, "Test all now");
-      const members = g.all.filter((m) => !m.endsWith("-urltest-out"));
-      return h("div", { style: "margin-bottom:14px" },
-        h("div", { class: "row spread" },
-          h("h3", {}, sec, " ", pins[sec] ? h("span", { class: "badge warn" }, "pinned") : ut ? h("span", { class: "badge ok" }, "automatic") : null),
-          h("div", { class: "row" }, test, pins[sec] && ut ? h("button", { class: "small", onclick: () => pin("auto") }, "Back to automatic") : null)),
-        h("div", { class: "scroll" }, h("table", {},
-          h("tr", {}, h("th", {}, "server"), h("th", { class: "num" }, "delay, ms"), h("th", {})),
-          members.map((m) => h("tr", { class: m === current ? "now" : "" },
-            h("td", {}, m === current ? "▶ " : "", names[m] || m, h("span", { class: "muted small" }, ` ${m}`)),
-            h("td", { class: "num" }, delay[m] ? delay[m] : "–"),
-            h("td", {}, m === current && pins[sec] ? null : h("button", { class: "small", onclick: () => pin(m) }, "Use")))))));
-    }),
-    sections.length ? null : null);
-}
+// --- logs ------------------------------------------------------------------------------------------
 
-function removeRouter(rt) {
-  const also = h("input", { type: "checkbox", checked: true });
-  const m = modal(h("h2", {}, `Remove ${rt.name}?`),
-    h("label", { class: "row" }, also, "also remove podkop-agent, its key and firewall rules from the router"),
-    h("p", { class: "small muted" }, "podkop and its settings stay on the router."),
-    h("div", { class: "row" },
-      h("button", { class: "danger", onclick: async () => {
-        try {
-          const r = await api("DELETE", `/api/routers/${rt.id}?uninstall=${also.checked ? 1 : 0}`);
-          delete S.routers[rt.id]; m.remove(); location.hash = "#/";
-          toast(r.note || `${rt.name} removed`, !!r.note);
-        } catch (e) { toast(e.message, true); }
-      } }, "Remove"),
-      h("button", { onclick: () => m.remove() }, "Cancel")));
-}
+const LOG_SOURCES = [["podkop", "podkop"], ["sing-box", "sing-box"], ["engine", "engine"], ["agent", "agent"]];
+const LOG_LEVELS = { all: [], warn: ["warn", "error"], error: ["error"] };
 
-const EVENT_TEXT = {
-  applied: (d) => (d.restarted ? "settings applied, podkop restarted" : "settings saved (podkop stopped)"),
-  reverted: (d) => `change undone: ${d.reason}`,
-  revert_failed: (d) => `change failed and podkop does not run with the old settings either: ${d.revert_reason}`,
-  podkop_down: (d) => `podkop is down${d.failsafe ? ": " + d.failsafe : ""}`,
-  podkop_up: () => "podkop is up again",
-  recovered: (d) => `watchdog: ${d.action}`,
-  recovery_failed: (d) => `watchdog could not bring podkop back: ${d.reason}`,
-  recovery_gave_up: () => "watchdog gave up: 3 tries in the last hour",
-  pinned: (d) => `${d.section}: pinned ${d.server}`,
-  pin_cleared: (d) => `${d.section}: automatic choice`,
-  pin_restored: (d) => `${d.section}: pin ${d.server} set again`,
-  pin_dropped: (d) => `${d.section}: pin removed, ${d.reason}`,
-  agent_started: (d) => `podkop-agent ${d.version} started`,
-  service: (d) => `podkop ${d.action}`,
-  probe_started: () => "probe started",
-  probe_done: (d) => `probe finished (exit ${d.exit})`,
-  probe_apply_failed: (d) => `probe result not applied: ${d.message}`,
-  probe_not_started: (d) => `nightly probe not started: ${d.message}`,
-};
-function eventText(type, d) {
-  const f = EVENT_TEXT[type];
-  const bad = ["reverted", "revert_failed", "podkop_down", "recovery_failed", "recovery_gave_up", "probe_apply_failed"].includes(type);
-  return h("span", { class: bad ? "bad" : "" }, f ? f(d || {}) : `${type} ${JSON.stringify(d)}`);
-}
-
-// --- settings editor ------------------------------------------------------------------
-
-async function viewConfig(main, id) {
+async function viewLogs(main, id) {
   const rt = getRouter(id);
-  const schema = S.schema || (S.schema = await api("GET", "/api/schema"));
-  const loaded = await api("GET", `/api/routers/${id}/config`);
-  let base = loaded.fingerprint;
-  let work = clone(loaded.config);
-  const ctx = { lists: loaded.community_lists, interfaces: loaded.interfaces, devices: loaded.devices };
-  const problemsBox = h("div");
+  const f = { q: "", sources: new Set(), level: "all", follow: true, buffer: null };
+  const box = h("div", { class: "logbox", tabindex: "0", "aria-label": "Log lines" });
+  const lines = h("div", { class: "loglines" });
+  box.append(lines);
+  const foot = h("div", { class: "card-foot" });
+  const toolbar = h("div", { class: "row", role: "toolbar", "aria-label": "Log filters", style: "gap: 10px 12px" });
+  const page = h("div", { class: "page" },
+    pageHead("Logs", `podkop, sing-box, podkop-engine and podkop-agent on ${rt.name}`),
+    toolbar,
+    h("section", { class: "card clip", "aria-label": "Log lines" }, box, foot));
+  put(main, page);
 
-  const settingsSec = () => work.sections.find((s) => s.name === "settings");
-  const proxySections = () => work.sections.filter((s) => s.type === "section"
-    && !["block", "exclusion"].includes((s.options || {}).connection_type)).map((s) => s.name);
+  const lineEl = (r) => h("div", { class: `logline ${r.level === "error" || r.level === "warn" ? r.level : ""}` },
+    h("span", {}, r.time || (r.t ? new Date(r.t * 1000).toLocaleTimeString([], { hourCycle: "h23" }) : "")),
+    h("span", {}, r.source || "–"), h("span", {}, r.level), h("span", {}, r.msg));
+  const matches = (r) => (!f.sources.size || f.sources.has(r.source))
+    && (f.level === "all" || LOG_LEVELS[f.level].includes(r.level))
+    && (!f.q || r.line.toLowerCase().includes(f.q.toLowerCase()));
+  const toBottom = () => { box.scrollTop = box.scrollHeight; };
 
-  const draw = () => {
-    const secs = work.sections.filter((s) => s.type === "section");
-    put(main, ...routerTabs(rt, "/config"),
-      h("div", { class: "card" }, h("h2", {}, "Global settings"), optionsForm(settingsSec(), schema.settings, schema, ctx, proxySections, draw)),
-      secs.map((sec, i) => h("div", { class: "card" },
-        h("div", { class: "row spread" }, h("h2", {}, `Section ${sec.name}`),
-          h("div", { class: "row" },
-            h("button", { class: "small", disabled: i === 0, onclick: () => move(sec, -1) }, "↑ earlier"),
-            h("button", { class: "small", disabled: i === secs.length - 1, onclick: () => move(sec, 1) }, "↓ later"),
-            h("button", { class: "small danger", onclick: () => {
-              if (confirm(`Remove section ${sec.name}?`)) { work.sections = work.sections.filter((s) => s !== sec); draw(); }
-            } }, "Remove"))),
-        i === 0 && secs.length > 1 ? h("p", { class: "small muted" }, "The first section that matches a site wins.") : null,
-        optionsForm(sec, schema.section, schema, ctx, proxySections, draw))),
-      work.sections.filter((s) => s.type !== "section" && s.type !== "settings").map((s) =>
-        h("div", { class: "card" }, h("h2", {}, `${s.type} ${s.name}`), optionsForm(s, [], schema, ctx, proxySections, draw))),
-      h("div", { class: "card row" },
-        h("input", { id: "newsec", placeholder: "new section name (letters, digits, _)", style: "max-width:320px" }),
-        h("button", { onclick: () => {
-          const n = document.getElementById("newsec").value.trim();
-          if (!/^[A-Za-z0-9_]+$/.test(n)) return toast("letters, digits and _ only", true);
-          if (work.sections.some((s) => s.name === n)) return toast("this name is taken", true);
-          work.sections.push({ name: n, type: "section", anonymous: false, options: { connection_type: "proxy", proxy_config_type: "url" } });
-          draw();
-        } }, "Add section")),
-      problemsBox,
-      h("div", { class: "card row", style: "position:sticky;bottom:0" },
-        h("button", { onclick: check }, "Check"),
-        h("button", { class: "primary", onclick: review }, "Review and apply"),
-        h("button", { onclick: async () => { const r = await api("GET", `/api/routers/${id}/config`); base = r.fingerprint; work = clone(r.config); put(problemsBox, ); draw(); toast("reloaded from the router"); } }, "Discard changes")));
+  const fill = (rows) => {
+    put(lines, rows.length ? rows.map(lineEl) : h("p", { class: "empty" }, f.q || f.sources.size || f.level !== "all"
+      ? "No line matches these filters." : "No lines stored yet. New lines arrive while the router is connected."));
+    toBottom();
+  };
+  const load = async () => {
+    const qs = new URLSearchParams({ limit: "1000", q: f.q, source: [...f.sources].join(","), level: LOG_LEVELS[f.level].join(",") });
+    fill(await api("GET", `/api/routers/${id}/logs?${qs}`));
   };
 
-  const move = (sec, d) => {
-    const all = work.sections; const i = all.indexOf(sec);
-    let j = i + d;
-    while (j >= 0 && j < all.length && all[j].type !== "section") j += d;
-    if (j < 0 || j >= all.length) return;
-    [all[i], all[j]] = [all[j], all[i]]; draw();
+  const drawFoot = () => put(foot,
+    f.buffer ? h("span", {}, `The router's own log buffer, read at ${hhmm(new Date(f.buffer * 1000))}. Filters apply to stored lines.`)
+      : h("span", {}, "Stored on this manager. Newest at the bottom, new lines arrive live."),
+    f.buffer ? h("button", { type: "button", class: "link-btn", onclick: () => { f.buffer = null; drawAll(); load(); } }, "Back to stored lines")
+      : h("span", { class: `live${f.follow && S.live ? " on" : ""}` }, h("span", { class: "dot sm" }),
+        f.follow ? (S.live ? "following" : "reconnecting") : "paused"));
+
+  let qTimer;
+  const drawTools = () => put(toolbar,
+    h("label", { class: "search" }, icon("search", 15, { width: 1.6 }), h("span", { class: "sr" }, "Search logs"),
+      h("input", { placeholder: "Search, e.g. main-4-out or timeout", value: f.q, disabled: !!f.buffer, oninput: (e) => {
+        f.q = e.target.value.trim(); clearTimeout(qTimer); qTimer = setTimeout(load, 300);
+      } })),
+    h("div", { class: "row", style: "gap: 6px" },
+      h("button", { type: "button", class: "toggle", "aria-pressed": String(!f.sources.size), disabled: !!f.buffer,
+        onclick: () => { f.sources.clear(); drawTools(); load(); } }, "All sources"),
+      LOG_SOURCES.map(([v, label]) => h("button", { type: "button", class: "toggle", "aria-pressed": String(f.sources.has(v)),
+        disabled: !!f.buffer, onclick: () => {
+          if (f.sources.has(v)) f.sources.delete(v); else f.sources.add(v);
+          if (f.sources.size === LOG_SOURCES.length) f.sources.clear();
+          drawTools(); load();
+        } }, label))),
+    seg([["all", "All"], ["warn", "Warnings"], ["error", "Errors"]], f.level, (v) => { f.level = v; drawTools(); load(); },
+      { label: "Level", disabled: !!f.buffer }),
+    h("div", { class: "row", style: "margin-left: auto; gap: 12px" },
+      h("label", { class: "check inline" }, h("input", { type: "checkbox", checked: f.follow, onchange: (e) => {
+        f.follow = e.target.checked; drawFoot(); if (f.follow) toBottom();
+      } }), "Follow live"),
+      h("button", { type: "button", class: "btn sm", onclick: async (e) => {
+        const b = e.currentTarget; b.disabled = true;
+        try {
+          const rows = await api("GET", `/api/routers/${id}/logs/recent?lines=500`);
+          f.buffer = Date.now() / 1000; drawAll(); fill(rows);
+        } catch (err) { toast(err.message, true); }
+        b.disabled = false;
+      } }, "Load router buffer")));
+  const drawAll = () => { drawTools(); drawFoot(); };
+
+  drawAll();
+  await load();
+  S.view = {
+    onLog: (m) => {
+      if (m.router_id !== id || f.buffer || !matches(m)) return;
+      if (lines.firstChild && lines.firstChild.classList.contains("empty")) lines.firstChild.remove();
+      lines.append(lineEl(m));
+      if (lines.childNodes.length > 3000) lines.firstChild.remove();
+      if (f.follow) toBottom();
+    },
+    onLive: drawFoot,
   };
+}
 
-  const showProblems = (probs) => put(problemsBox, probs.length
-    ? h("div", { class: "card" }, h("h2", {}, "podkop would not start with these settings"),
-      probs.map((p) => h("div", { class: "problem" }, `${p.section}${p.option ? " / " + p.option : ""}${p.index !== undefined ? " #" + (p.index + 1) : ""}: ${p.message}`)))
-    : h("div", { class: "card" }, h("span", { class: "badge ok" }, "no problems found")));
+// --- changes, as shown in History and the apply dialog ----------------------------------------------
 
-  async function check() {
-    try { showProblems((await api("POST", `/api/routers/${id}/validate`, { config: work })).problems); }
-    catch (e) { toast(e.message, true); }
+const TEXT_LISTS = new Set(["user_domains_text", "user_subnets_text"]);
+const shortValue = (v) => (isLink(v) ? linkName(v) : String(v).length > 60 ? String(v).slice(0, 57) + "…" : String(v));
+
+// a few chips, then "and N more"
+function chipList(items, cls) {
+  const box = h("span", { class: "vals" });
+  const draw = (all) => put(box, (all ? items : items.slice(0, 6)).map((x) => h("span", { class: `${cls}${isLink(x) ? " plain" : ""}` },
+    cls === "add" ? `+ ${shortValue(x)}` : shortValue(x))),
+  !all && items.length > 6 ? h("button", { type: "button", class: "link-btn", onclick: () => draw(true) }, `and ${items.length - 6} more`) : null);
+  draw(false);
+  return box;
+}
+
+// option values as the editor names them
+const VALUE_LABELS = {
+  connection_type: { proxy: "Proxy", vpn: "VPN", block: "Block", exclusion: "Direct" },
+  proxy_config_type: { url: "One link", selector: "Selector", urltest: "Fastest (URLTest)", outbound: "sing-box JSON" },
+  user_domain_list_type: { disabled: "Off", dynamic: "List", text: "Text" },
+  user_subnet_list_type: { disabled: "Off", dynamic: "List", text: "Text" },
+};
+
+// the old and new value of one option
+function changeValue(opt, oldV, newV) {
+  const names = VALUE_LABELS[opt];
+  if (names) { oldV = oldV === undefined ? oldV : names[oldV] || oldV; newV = newV === undefined ? newV : names[newV] || newV; }
+  if (Array.isArray(oldV) || Array.isArray(newV) || TEXT_LISTS.has(opt)) {
+    const split = (v) => (TEXT_LISTS.has(opt) && !Array.isArray(v) ? String(v || "").split(/[\s,]+/).filter(Boolean) : asList(v));
+    const o = split(oldV), n = split(newV);
+    const add = n.filter((x) => !o.includes(x)), del = o.filter((x) => !n.includes(x));
+    if (!add.length && !del.length) return h("span", { class: "muted" }, "same items, new order");
+    return h("span", { class: "vals" }, add.length ? chipList(add, "add") : null, del.length ? chipList(del, "del") : null);
   }
+  if (opt === "outbound_json") return h("span", {}, "changed");
+  if (oldV === undefined || oldV === null) return h("span", { class: "vals" }, h("span", { class: "add" }, shortValue(newV)));
+  if (newV === undefined || newV === null) return h("span", { class: "vals" }, h("span", { class: "del" }, shortValue(oldV)), h("span", { class: "muted xs" }, "back to default"));
+  return h("span", { class: "vals" }, h("span", { class: "del" }, shortValue(oldV)), icon("arrow", 14, { stroke: "var(--muted)" }), h("span", { class: "add" }, shortValue(newV)));
+}
 
-  async function review() {
-    let d;
-    try { d = await api("POST", `/api/routers/${id}/diff`, { config: work }); } catch (e) { return toast(e.message, true); }
-    if (d.fingerprint !== base) {
-      return toast("podkop's settings changed on the router since you opened this page: press Discard changes to reload", true);
+// "Direct, 12 domains" for a rule added in a change
+function newRuleSummary(options) {
+  const sec = { name: "", options };
+  const m = ruleMatches(sec);
+  return `${ruleDest(sec)[0]}${m === "nothing yet" ? "" : ", " + m}`;
+}
+
+// [section, label, value] rows for a diff; config (optional) gives rule positions
+function changeRows(diff, config) {
+  const pos = (n) => rulesOf(config).findIndex((s) => s.name === n) + 1;
+  return diff.map((d) => {
+    if (d.change === "added") {
+      return [d.section, d.type === "section" ? "New rule" : `New ${d.type}`,
+        h("span", {}, d.type === "section" ? newRuleSummary(d.options) + (config ? `, rule ${pos(d.section)}` : "") : "")];
     }
-    if (!d.diff.length) return toast("nothing changed");
-    confirmApply(id, base, work, d.diff, "edited in the web interface", async (ok) => {
-      if (ok) { const r = await api("GET", `/api/routers/${id}/config`); base = r.fingerprint; work = clone(r.config); draw(); }
-    }, showProblems);
-  }
-
-  draw();
-  S.view = {};
-}
-
-// optionsForm: every option of the schema whose dependencies hold, then the
-// options the schema doesn't know (kept as they are)
-function optionsForm(sec, defs, schema, ctx, proxySections, redraw) {
-  const o = sec.options || (sec.options = {});
-  const shown = (def) => !def.depends || def.depends.some((cond) =>
-    Object.entries(cond).every(([k, v]) => (o[k] ?? defaultOf(defs, k)) === v));
-  const set = (name, value, again) => {
-    if (value === "" || value === null || (Array.isArray(value) && !value.length)) delete o[name];
-    else o[name] = value;
-    if (again) redraw();
-  };
-  const known = new Set(defs.map((d) => d.name).concat(schema.internal));
-  const rows = defs.filter(shown).map((def) => field(def.label, widget(def, o[def.name], (v) =>
-    set(def.name, v, defs.some((d) => d.depends && d.depends.some((c) => def.name in c))), ctx, proxySections), def.help, def.name));
-  const other = Object.keys(o).filter((k) => !known.has(k));
-  if (other.length) {
-    rows.push(h("h3", {}, "Other options"));
-    for (const k of other) {
-      const isList = Array.isArray(o[k]);
-      rows.push(field(k, h("textarea", { class: "mono", rows: isList ? 3 : 1,
-        oninput: (e) => set(k, isList ? e.target.value.split("\n").map((x) => x.trim()).filter(Boolean) : e.target.value) },
-      isList ? o[k].join("\n") : o[k]), isList ? "one per line" : null, k));
-    }
-  }
-  return h("div", {}, rows);
-}
-
-function defaultOf(defs, name) {
-  const d = defs.find((x) => x.name === name);
-  return d && d.default !== undefined ? d.default : undefined;
-}
-
-function widget(def, value, onchange, ctx, proxySections) {
-  const dv = def.default;
-  switch (def.kind) {
-    case "select":
-      return h("select", { onchange: (e) => onchange(e.target.value) },
-        value === undefined && dv === undefined ? h("option", { value: "" }, "—") : null,
-        def.values.map((v) => h("option", { value: v, selected: (value ?? dv) === v }, v)),
-        value !== undefined && !def.values.includes(value) ? h("option", { value, selected: true }, value) : null);
-    case "combo": {
-      const lid = `dl-${def.name}`;
-      return h("div", {}, h("input", { list: lid, value: value ?? "", placeholder: dv ?? "", oninput: (e) => onchange(e.target.value) }),
-        h("datalist", { id: lid }, def.values.map((v) => h("option", { value: v }))));
-    }
-    case "text": case "number":
-      return h("input", { type: def.kind === "number" ? "number" : "text", value: value ?? "", placeholder: dv ?? "",
-        oninput: (e) => onchange(e.target.value) });
-    case "flag":
-      return h("label", { class: "row" }, h("input", { type: "checkbox", checked: (value ?? dv) === "1",
-        onchange: (e) => onchange(e.target.checked ? "1" : "0") }), "on");
-    case "textarea":
-      return h("textarea", { class: "mono", rows: 4, oninput: (e) => onchange(e.target.value) }, value ?? "");
-    case "list":
-      return h("div", {}, h("textarea", { class: "mono", rows: Math.min(12, Math.max(3, asList(value).length + 1)),
-        oninput: (e) => onchange(e.target.value.split("\n").map((x) => x.trim()).filter(Boolean)) }, asList(value).join("\n")),
-      h("div", { class: "help" }, `one per line${asList(value).length ? ` · ${asList(value).length}` : ""}`));
-    case "community": case "devices": case "interfaces": {
-      const all = def.kind === "community" ? ctx.lists : def.kind === "devices" ? ctx.devices : ctx.interfaces;
-      const cur = asList(value ?? dv);
-      const opts = [...new Set([...all, ...cur])];
-      return h("div", { class: "checks" }, opts.map((v) => h("label", {},
-        h("input", { type: "checkbox", checked: cur.includes(v), onchange: (e) => {
-          const next = e.target.checked ? [...cur, v] : cur.filter((x) => x !== v);
-          cur.splice(0, cur.length, ...next); onchange([...cur]);
-        } }), v)));
-    }
-    case "device": case "section": {
-      const all = def.kind === "device" ? ctx.devices : proxySections();
-      return h("select", { onchange: (e) => onchange(e.target.value) }, h("option", { value: "" }, "—"),
-        [...new Set([...all, ...(value ? [value] : [])])].map((v) => h("option", { value: v, selected: value === v }, v)));
-    }
-    default:
-      return h("input", { value: value ?? "", oninput: (e) => onchange(e.target.value) });
-  }
-}
-
-// --- review, apply, follow the job ----------------------------------------------------
-
-function diffList(diff) {
-  const val = (v) => (v === undefined || v === null ? "—" : Array.isArray(v) ? v.map(linkOrValue).join(", ") : linkOrValue(v));
-  return h("ul", { class: "diff" }, diff.map((d) => {
-    if (d.change === "added") return h("li", { class: "add" }, `new section ${d.section}`);
-    if (d.change === "removed") return h("li", { class: "del" }, `section ${d.section} removed`);
-    if (d.change === "order") return h("li", {}, `order of sections: ${d.new.join(" → ")}`);
-    return h("li", {}, h("b", {}, `${d.section} / ${d.option}`), ": ", h("span", { class: "del" }, val(d.old)), " → ", h("span", { class: "add" }, val(d.new)));
-  }));
-}
-const linkOrValue = (v) => (/^[a-z0-9]+:\/\//.test(v) ? linkName(v) : v.length > 80 ? v.slice(0, 77) + "…" : v);
-
-function confirmApply(id, base, config, diff, note, done, showProblems) {
-  const status = h("div");
-  const go = h("button", { class: "primary", onclick: async () => {
-    go.disabled = true;
-    put(status, h("p", { class: "muted" }, "Checking and applying… podkop restarts (about 15 s)"));
-    try {
-      const r = await api("POST", `/api/routers/${id}/apply`, { base, config, note });
-      const v = await followVersion(r.version, status);
-      const ok = ["applied", "saved", "unchanged"].includes(v.state);
-      if (!ok && v.details && v.details.problems && showProblems) { showProblems(v.details.problems); }
-      done && done(ok);
-    } catch (e) { put(status, h("p", { class: "problem" }, e.message)); go.disabled = false; }
-  } }, "Apply");
-  const m = modal(h("h2", {}, "Changes"), diffList(diff), status,
-    h("div", { class: "row", style: "margin-top:12px" }, go, h("button", { onclick: () => m.remove() }, "Close")));
-}
-
-// wait for a version's job; the hub sends job updates live, a poll is the fallback
-function followVersion(vid, status) {
-  return new Promise((resolve) => {
-    const show = (v) => {
-      const cls = { applied: "ok", saved: "ok", unchanged: "ok", rejected: "bad", reverted: "bad", failed: "bad" }[v.state] || "warn";
-      put(status, h("p", {}, h("span", { class: `badge ${cls}` }, v.state), " ", v.message || ""));
-    };
-    const poll = async () => {
-      const v = await api("GET", `/api/versions/${vid}`).catch(() => null);
-      if (v && !["pending", "running"].includes(v.state)) { show(v); resolve(v); return; }
-      if (v && v.details) show({ state: v.details.state, message: v.details.message });
-      setTimeout(poll, 2000);
-    };
-    poll();
+    if (d.change === "removed") return [d.section, "Rule removed", h("span", {})];
+    if (d.change === "order") return ["", "Rule order", h("span", { class: "mono xs" }, d.new.filter((n) => n !== "settings").join(" → "))];
+    return [d.section, optionLabel(d.section, d.option), changeValue(d.option, d.old, d.new)];
   });
 }
 
-// --- probe ----------------------------------------------------------------------------
+// --- history -------------------------------------------------------------------------------------------
 
-const PROBE_FIELDS = [
-  ["--countries", "Countries", "europe, all, or codes like DE,NL"],
-  ["--max-ping", "Max ping, ms", "700"],
-  ["--min-speed", "Min speed, Mbit/s", "40"],
-  ["--top", "Servers per list", "10"],
-];
+const VERSION_STATE = {
+  applied: ["applied", "ok"], saved: ["saved", "ok"], unchanged: ["no change", ""], reverted: ["undone", "bad"],
+  rejected: ["rejected", "warn"], failed: ["failed", "bad"], pending: ["applying", "accent"], running: ["applying", "accent"],
+  unknown: ["unknown", ""],
+};
 
+function versionWho(v) {
+  if (v.trigger === "probe") return /nightly/i.test(v.note || "") ? "nightly probe" : "probe result, by you";
+  return "by you";
+}
+
+function versionMeta(v, running) {
+  const parts = [longWhen(v.t), versionWho(v)];
+  if (v.diff.length) parts.push(plural(v.diff.length, "change"));
+  if (running) parts.push("running now");
+  if (v.state === "reverted") parts.push(`the router put the old settings back${v.seconds ? ` after ${v.seconds} s` : ""}`);
+  if (v.state === "rejected") parts.push("stopped before podkop was touched");
+  return parts.join(" · ");
+}
+
+const problemText = (p) => `${p.section}${p.option ? " / " + p.option : ""}${p.index !== undefined && p.index !== null ? " #" + (p.index + 1) : ""}: ${p.message}`;
+
+function versionReason(v) {
+  if (v.state === "reverted") return ["podkop did not start with these settings", v.reason || v.message, ""];
+  if (v.state === "failed") return ["The change failed", v.message, ""];
+  if (v.state === "rejected") {
+    if (v.problems && v.problems.length) return ["Check failed", v.problems.map(problemText).join("\n"), "warn"];
+    return [v.code === "config_changed" ? "podkop's settings changed on the router first" : "Not applied", v.message, "warn"];
+  }
+  return null;
+}
+
+async function viewHistory(main, id) {
+  const page = h("div", { class: "page" });
+  put(main, page);
+  let list = [], more = true, filter = "all";
+  const open = new Set();
+  const load = async (older) => {
+    const before = older && list.length ? `&before=${list[list.length - 1].id}` : "";
+    const got = await api("GET", `/api/routers/${id}/versions?limit=30${before}`);
+    list = older ? list.concat(got) : got;
+    more = got.length === 30;
+  };
+
+  const draw = () => {
+    const rt = S.routers[id];
+    if (!rt) return;
+    const runningId = (runningVersion(rt, list) || {}).id;
+    const shown = list.filter((v) => filter === "all" || (filter === "ok" ? ["applied", "saved"].includes(v.state)
+      : ["reverted", "rejected", "failed"].includes(v.state)));
+    put(page,
+      pageHead("History", "Every change made from this manager: by you, the nightly probe or a restore"),
+      h("div", { class: "row" }, seg([["all", "All"], ["ok", "Applied"], ["bad", "Undone or rejected"]], filter,
+        (v) => { filter = v; draw(); }, { label: "Show" })),
+      shown.length ? h("ol", { class: "versions" }, shown.map((v) => {
+        const [label, cls] = VERSION_STATE[v.state] || [v.state, ""];
+        const reason = versionReason(v);
+        const isOpen = open.has(v.id);
+        const rows = isOpen ? changeRows(v.diff) : [];
+        return h("li", { class: "card clip" },
+          h("div", { class: "vhead" },
+            h("span", { class: "vid" }, `#${v.id}`),
+            h("span", { class: `pill ${cls}` }, label),
+            h("div", { class: "col" }, h("span", {}, v.note || "Change from the web interface"), h("span", {}, versionMeta(v, v.id === runningId))),
+            h("div", { class: "row", style: "gap: 6px" },
+              v.diff.length ? h("button", { type: "button", class: "btn ghost sm", "aria-expanded": String(isOpen), onclick: () => {
+                if (isOpen) open.delete(v.id); else open.add(v.id); draw();
+              } }, isOpen ? "Hide changes" : "Show changes", icon(isOpen ? "up" : "down", 14, { width: 1.6 })) : null,
+              ["applied", "saved"].includes(v.state) && v.id !== runningId
+                ? h("button", { type: "button", class: "btn sm", onclick: () => restore(v.id) }, "Restore") : null)),
+          reason ? h("div", { class: `reason ${reason[2]}` }, h("span", {}, reason[0]), h("span", { style: "white-space: pre-wrap" }, reason[1])) : null,
+          isOpen ? h("div", { class: "changes-grid" }, rows.map(([sec, lbl, val]) => [
+            h("span", { class: "mono xs" }, sec), h("span", { class: "muted" }, lbl), val])) : null);
+      })) : h("div", { class: "card empty" }, list.length ? "Nothing here with this filter." : "Nothing applied from this manager yet."),
+      more && list.length ? h("button", { type: "button", class: "btn", style: "align-self: center", onclick: async () => {
+        await load(true); draw();
+      } }, "Show older") : null);
+  };
+
+  const restore = async (vid) => {
+    try {
+      const v = await api("GET", `/api/versions/${vid}`);
+      const d = await api("POST", `/api/routers/${id}/diff`, { config: v.config });
+      if (!d.diff.length) return toast("The router already has these settings");
+      openApply(id, { base: d.fingerprint, config: v.config, note: `Restore #${vid}`, trigger: "restore",
+        done: async () => { await load(); draw(); } });
+    } catch (e) { toast(e.message, true); }
+  };
+
+  await load();
+  draw();
+  S.view = {
+    onRouter: (r) => r.id === id && draw(),
+    onJob: (m) => { if (m.router_id === id && FINAL_STATES.includes(m.job.state)) load().then(draw); },
+  };
+}
+
+const FINAL_STATES = ["applied", "saved", "unchanged", "rejected", "reverted", "failed"];
+
+// --- servers probe ------------------------------------------------------------------------------------
+
+const VALUE_OPTIONS = ["--countries", "--max-ping", "--min-speed", "--top"];
+const USABLE = ["GOOD", "OK", "FLAKY"];
+const FALLBACK = 5;   // podkop-probe's fallback servers per list
+
+// podkop-probe's options as a form: {"--countries": "europe", ..., flags: Set, rest: [...]}
 function parseOptions(opts) {
-  const r = { flags: new Set() };
+  const r = { flags: new Set(), rest: [] };
   for (let i = 0; i < opts.length; i++) {
-    if (PROBE_FIELDS.some(([k]) => k === opts[i])) { r[opts[i]] = opts[i + 1]; i++; }
-    else r.flags.add(opts[i]);
+    if (VALUE_OPTIONS.includes(opts[i])) { r[opts[i]] = opts[i + 1]; i++; }
+    else if (["--no-youtube", "-q"].includes(opts[i])) r.flags.add(opts[i]);
+    else r.rest.push(opts[i]);
   }
   return r;
 }
 
+// sub.example.com/s/…k9Q: enough to tell keys apart, not enough to use one
+function keyLabel(url) {
+  try {
+    const u = new URL(url);
+    const path = u.pathname + u.search;
+    return path.length > 8 ? `${u.host}${path.slice(0, path.indexOf("/", 1) + 1 || 1)}…${path.slice(-3)}` : u.host + path;
+  } catch { return url.slice(0, 12) + "…"; }
+}
+
+const countryName = (cc) => {
+  try { return new Intl.DisplayNames(["en"], { type: "region" }).of(cc); } catch { return cc; }
+};
+
+// "exit PL, vless, 5 and 2 fallback"
+const autoRuleSummary = (r) => [
+  r.countries.length ? `exit ${r.countries.join(", ")}` : "any exit country",
+  r.protocols.length ? r.protocols.join(", ") : "any protocol",
+  `${r.top} and ${r.fallback} fallback`].join(", ");
+
+function verdictTag(v) {
+  const cls = { GOOD: "good", OK: "good", FLAKY: "flaky" }[v] || "dead";
+  return h("span", { class: `box-tag ${cls}` }, v);
+}
+
+function goesTags(row) {
+  if (!row.goes_to.length) return h("span", { class: "xs muted" }, "not used");
+  return h("span", { class: "row", style: "gap: 4px" }, row.goes_to.map((g) => h("span", {
+    class: `box-tag ${g.fallback ? "fb" : `k-${g.kind === "youtube" ? "yt" : g.kind}`}`,
+    title: g.fallback ? `fallback of ${g.rule}` : null,
+  }, g.fallback ? `${g.rule} fallback` : g.rule)));
+}
+
 async function viewProbe(main, id) {
-  const rt = getRouter(id);
-  let data = await api("GET", `/api/routers/${id}/probe`);
-  const ps = data.settings;
-  const parsed = parseOptions(ps.options || []);
-  const f = {
-    keys: h("textarea", { class: "mono", rows: 4 }, (ps.keys || []).join("\n")),
-    schedule: h("input", { value: ps.schedule || "", placeholder: "HH:MM, empty = off", style: "max-width:220px" }),
-    auto: h("input", { type: "checkbox", checked: !!ps.auto_apply }),
-    main: h("input", { value: ps.main_section || "main", style: "max-width:200px" }),
-    yt: h("input", { value: ps.youtube_section || "youtube", style: "max-width:200px" }),
-    noyt: h("input", { type: "checkbox", checked: parsed.flags.has("--no-youtube") }),
-    quick: h("input", { type: "checkbox", checked: parsed.flags.has("-q") }),
+  const page = h("div", { class: "page" });
+  put(main, page);
+  let data, config = null;
+  let form;            // the left column's values, saved with Save
+  let filter = "picked";
+  let lastState = null;
+
+  const load = async () => {
+    const [p, c] = await Promise.all([api("GET", `/api/routers/${id}/probe`),
+      api("GET", `/api/routers/${id}/config`).catch(() => null)]);
+    data = p; config = c;
   };
-  for (const [k, , ph] of PROBE_FIELDS) f[k] = h("input", { value: parsed[k] || "", placeholder: ph, style: "max-width:260px" });
-  const statusBox = h("div");
+  const resetForm = () => {
+    const ps = data.settings, o = parseOptions(ps.options || []);
+    const c = o["--countries"] || "all";
+    form = {
+      keys: [...(ps.keys || [])], newKey: "",
+      countries: ["europe", "all"].includes(c) ? c : "choose", codes: ["europe", "all"].includes(c) ? "" : c,
+      maxPing: o["--max-ping"] || "", minSpeed: o["--min-speed"] || "", top: o["--top"] || "",
+      youtube: !o.flags.has("--no-youtube"), quick: o.flags.has("-q"), rest: o.rest,
+      main: ps.main_section || "main", yt: ps.youtube_section || "youtube",
+      schedule: ps.schedule || "", auto: !!ps.auto_apply,
+    };
+  };
 
   const save = async () => {
     const options = [];
-    for (const [k] of PROBE_FIELDS) if (f[k].value.trim()) options.push(k, f[k].value.trim());
-    if (f.noyt.checked) options.push("--no-youtube");
-    if (f.quick.checked) options.push("-q");
-    await api("PUT", `/api/routers/${id}/probe`, {
-      keys: f.keys.value.split("\n").map((x) => x.trim()).filter(Boolean), options, schedule: f.schedule.value.trim(),
-      auto_apply: f.auto.checked, main_section: f.main.value.trim(), youtube_section: f.noyt.checked ? "" : f.yt.value.trim(),
+    const countries = form.countries === "choose" ? form.codes.trim() : form.countries;
+    if (countries) options.push("--countries", countries);
+    if (String(form.maxPing).trim()) options.push("--max-ping", String(form.maxPing).trim());
+    if (String(form.minSpeed).trim()) options.push("--min-speed", String(form.minSpeed).trim());
+    if (String(form.top).trim()) options.push("--top", String(form.top).trim());
+    if (!form.youtube) options.push("--no-youtube");
+    if (form.quick) options.push("-q");
+    options.push(...form.rest);
+    data.settings = await api("PUT", `/api/routers/${id}/probe`, {
+      keys: form.keys, options, schedule: form.schedule, auto_apply: form.auto,
+      main_section: form.main, youtube_section: form.youtube ? form.yt : "",
     });
   };
 
-  const drawStatus = () => {
-    const st = data.status;
-    if (!st || st.state === "none") { put(statusBox, h("p", { class: "muted" }, "No probe has run on this router since it started.")); return; }
-    const lists = st.lists || {};
-    const n = (k) => (lists[k] || []).length;
-    const cls = { running: "warn", done: "ok", failed: "bad" }[st.state] || "";
-    put(statusBox, 
-      h("div", { class: "row spread" },
-        h("div", {}, h("span", { class: `badge ${cls}` }, st.state), " ", h("span", { class: "muted small" }, `started ${st.started}${st.finished ? ", finished " + st.finished : ""}`)),
-        st.state === "done" && (n("main") || n("youtube")) ? h("button", { class: "primary", onclick: applyLists },
-          `Review and apply: main ${n("main")} + ${n("main_fallback")} fallback, YouTube ${n("youtube")}`) : null),
-      st.rows && st.rows.length ? h("div", { class: "scroll", style: "margin-top:10px" }, h("table", {},
-        h("tr", {}, ["#", "verdict", "ok", "median s", "Mbit/s", "country", "YouTube", "server"].map((x) => h("th", {}, x))),
-        st.rows.map((r) => h("tr", {}, h("td", {}, r.n),
-          h("td", {}, h("span", { class: `badge ${["GOOD", "OK"].includes(r.verdict) ? "ok" : r.verdict === "FLAKY" ? "warn" : "bad"}` }, r.verdict)),
-          h("td", { class: "num" }, `${r.ok}/${r.total}`), h("td", { class: "num" }, r.median), h("td", { class: "num" }, r.mbit),
-          h("td", {}, r.country), h("td", {}, r.youtube), h("td", {}, r.node))))) : null,
-      h("details", { style: "margin-top:10px", open: st.state === "running" || st.state === "failed" },
-        h("summary", {}, "Output"), h("pre", {}, (st.log || []).join("\n"))));
+  const left = () => {
+    const sections = rulesOf(config && config.config).filter((s) => (s.options || {}).connection_type === "proxy").map((s) => s.name);
+    const keys = (data.status && data.status.keys) || {};
+    const top = form.top || 10;
+    const sectionSelect = (value, onchange, id_, extra) => h("select", { id: id_, class: "input sm mono", style: "width: auto",
+      onchange: (e) => onchange(e.target.value), disabled: extra && extra.disabled },
+    [...new Set([...sections, value].filter(Boolean))].map((n) => h("option", { value: n, selected: n === value },
+      sections.includes(n) ? n : `${n} (new rule)`)));
+    const num = (label, key, unit, ph) => h("div", { class: "field" }, h("label", { for: `p-${key}` }, label),
+      h("div", { class: "unit" }, h("input", { id: `p-${key}`, class: "input mid", inputmode: "numeric", placeholder: ph, value: form[key],
+        oninput: (e) => { form[key] = e.target.value; } }), h("span", {}, unit)));
+    const addKey = () => {
+      const v = form.newKey.trim();
+      if (!/^https?:\/\//.test(v)) return toast("A subscription URL starts with https://", true);
+      if (!form.keys.includes(v)) form.keys.push(v);
+      form.newKey = ""; drawLeft();
+    };
+    return h("div", { class: "stack", style: "flex: 1 1 340px; min-width: 0" },
+      h("section", { class: "card pad", "aria-labelledby": "p-subs" },
+        h("div", { class: "col" }, h("h2", { id: "p-subs" }, "Subscriptions"),
+          h("span", { class: "small muted" }, "Kept on this manager, sent to the router only for a run")),
+        form.keys.map((k, i) => {
+          const info = keys[i + 1];
+          return h("div", { class: "subscr" },
+            h("div", { class: "col" }, h("span", { class: "ellipsis", title: keyLabel(k) }, keyLabel(k)),
+              info ? h("span", { class: info.error ? "bad-text" : "" }, info.error ? info.error : `${info.servers} servers in the last run`) : null),
+            h("button", { type: "button", class: "btn icon", "aria-label": "Remove subscription", onclick: () => {
+              form.keys.splice(i, 1); drawLeft();
+            } }, icon("trash", 14, { width: 1.6 })));
+        }),
+        h("div", { class: "row", style: "flex-wrap: nowrap" },
+          h("label", { for: "newsub", class: "sr" }, "Subscription URL"),
+          h("input", { id: "newsub", class: "input mono", placeholder: "https:// subscription URL", value: form.newKey,
+            style: "font-size: 12.5px", oninput: (e) => { form.newKey = e.target.value; },
+            onkeydown: (e) => { if (e.key === "Enter") addKey(); } }),
+          h("button", { type: "button", class: "btn", onclick: addKey }, "Add"))),
+      h("section", { class: "card pad", "aria-labelledby": "p-filters" },
+        h("h2", { id: "p-filters" }, "What counts as good"),
+        h("div", { class: "field" }, h("span", { class: "label" }, "Countries"),
+          seg([["europe", "Europe"], ["all", "All"], ["choose", "Choose"]], form.countries, (v) => { form.countries = v; drawLeft(); }, { label: "Countries" }),
+          form.countries === "choose" ? h("input", { class: "input mid mono", placeholder: "Codes, e.g. DE,NL,FI", value: form.codes,
+            "aria-label": "Country codes", oninput: (e) => { form.codes = e.target.value; } }) : null,
+          h("span", { class: "help" }, "Checks the name, server IP and exit IP, so relays through RU are skipped")),
+        h("div", { style: "display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px" },
+          num("Max ping", "maxPing", "ms", "700"), num("Min speed", "minSpeed", "Mbit/s", "40"), num("Per list", "top", "servers", "10")),
+        h("label", { class: "check" }, h("input", { type: "checkbox", checked: form.youtube, onchange: (e) => { form.youtube = e.target.checked; drawLeft(); } }),
+          h("span", { class: "col" }, h("span", {}, "Build a YouTube list"), h("span", {}, "Fastest servers where YouTube sees Russia, so no ads"))),
+        h("label", { class: "check" }, h("input", { type: "checkbox", checked: form.quick, onchange: (e) => { form.quick = e.target.checked; } }),
+          h("span", { class: "col" }, h("span", {}, "Quick run"), h("span", {}, "Fewer requests and a short speed test")))),
+      h("section", { class: "card pad", "aria-labelledby": "p-into" },
+        h("h2", { id: "p-into" }, "Into podkop"),
+        h("div", { style: "display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px 12px; align-items: center" },
+          h("label", { for: "r-main", style: "font-size: 13.5px" }, `Main list, ${top} and ${FALLBACK} fallback`),
+          sectionSelect(form.main, (v) => { form.main = v; }, "r-main"),
+          h("label", { for: "r-yt", style: "font-size: 13.5px" }, `YouTube list, ${top} and ${FALLBACK} fallback`),
+          sectionSelect(form.yt, (v) => { form.yt = v; }, "r-yt", { disabled: !form.youtube })),
+        h("div", { class: "sep stack", style: "gap: 8px" },
+          h("span", { style: "font-size: 13.5px; font-weight: 500" }, "Rules with servers by country"),
+          (data.auto_rules || []).map((r) => h("a", { href: `#/r/${id}/rules/${r.section}`, class: "subscr", style: "padding: 9px 10px; color: var(--text)" },
+            h("span", { class: "mono", style: "font-size: 13px; font-weight: 500" }, r.section),
+            h("span", { class: "xs muted grow" }, autoRuleSummary(r)), icon("right", 14, { stroke: "var(--muted)", width: 1.6 }))),
+          h("span", { class: "xs muted" }, (data.auto_rules || []).length ? "Set up in the rule, under Sends to, From my subscriptions."
+            : "None yet. In a rule, under Sends to, choose From my subscriptions to have the probe pick its servers by country.")),
+        h("div", { class: "sep stack", style: "gap: 10px" },
+          h("div", { class: "row", style: "justify-content: space-between" },
+            h("label", { for: "sched", style: "font-size: 13.5px; font-weight: 500" }, "Every night at"),
+            h("input", { id: "sched", type: "time", class: "input mid num", style: "width: 110px", value: form.schedule,
+              oninput: (e) => { form.schedule = e.target.value; } })),
+          h("label", { class: "check" }, h("input", { type: "checkbox", checked: form.auto, onchange: (e) => { form.auto = e.target.checked; } }),
+            h("span", { class: "col" }, h("span", {}, "Apply the nightly result by itself"), h("span", {}, "Checked first and undone if podkop does not start"))),
+          !form.schedule ? h("span", { class: "xs muted" }, "Empty time: no nightly run.") : null)),
+      h("div", { class: "row", style: "flex-wrap: nowrap" },
+        h("button", { type: "button", class: "btn lg", style: "flex: 1", onclick: async () => {
+          try { await save(); toast("Saved"); drawLeft(); } catch (e) { toast(e.message, true); }
+        } }, "Save"),
+        h("button", { type: "button", class: "btn primary lg", style: "flex: 1", disabled: data.status && data.status.state === "running",
+          onclick: async () => {
+            try {
+              await save();
+              await api("POST", `/api/routers/${id}/probe/start`);
+              toast("Probe started, it takes 2 to 10 minutes");
+              await load(); drawRight();
+            } catch (e) { toast(e.message, true); }
+          } }, "Save and run now")));
   };
+
+  const leftBox = h("div", { style: "display: contents" });
+  const rightBox = h("div", { class: "stack", style: "flex: 2 1 600px; min-width: 0" });
+  const drawLeft = () => put(leftBox, left());
+
+  const lastRun = () => {
+    const st = data.status;
+    if (!st || st.state === "none") {
+      return h("section", { class: "card pad" }, h("h2", {}, "Last run"),
+        h("p", { class: "muted small" }, "No probe has run on this router since it started. Add your subscriptions and press Save and run now."));
+    }
+    const rows = st.rows || [];
+    const usable = rows.filter((r) => USABLE.includes(r.verdict));
+    const run = (data.runs || [])[0];
+    const by = run && run.trigger === "schedule" ? "by the nightly schedule" : "by you";
+    const started = agentTime(st.started), finished = agentTime(st.finished);
+    const isNew = st.state === "done" && config && probeIsNew(st, config.config, data.settings)
+      || (st.state === "done" && (data.auto_rules || []).some((r) => r.picked));
+    let sub = `Started ${by} at ${started ? shortWhen(started) : "?"}`;
+    if (st.state === "running") sub += ". Running now, this takes 2 to 10 minutes.";
+    else if (finished && started) sub += `, took ${duration(finished - started)}.`;
+    if (st.state === "done") sub += isNew ? " Not applied yet." : " Its servers are in podkop.";
+    const n = (k) => asList(st.lists && st.lists[k]).length;
+    const shown = rows.filter((r) => filter === "all" || (filter === "usable" ? USABLE.includes(r.verdict) : r.goes_to.length || r.reason));
+    const pill = { running: ["running", "accent"], done: ["done", "ok"], failed: ["failed", "bad"] }[st.state] || [st.state, ""];
+    return h("section", { class: "card clip", "aria-labelledby": "p-last" },
+      h("div", { class: "card-head", style: "padding: 18px 18px 14px" },
+        h("div", { class: "col", style: "flex: 1 1 280px; gap: 4px" },
+          h("div", { class: "row", style: "gap: 10px" }, h("h2", { id: "p-last" }, "Last run"),
+            h("span", { class: `pill ${pill[1]}` }, st.state === "running" ? spinner() : null, pill[0])),
+          h("span", { class: "small muted" }, sub)),
+        st.state === "done" && isNew ? h("button", { type: "button", class: "btn primary", onclick: applyLists }, "Review and apply lists") : null),
+      rows.length ? h("div", { class: "totals" },
+        h("div", {}, h("span", {}, "Tested"), h("span", {}, rows.length)),
+        h("div", {}, h("span", {}, "Usable"), h("span", {}, usable.length)),
+        h("div", {}, h("span", {}, "Main list"), h("span", {}, `${n("main")} + ${n("main_fallback")}`)),
+        data.settings.youtube_section ? h("div", {}, h("span", {}, "YouTube list"), h("span", {}, `${n("youtube")} + ${n("youtube_fallback")}`)) : null,
+        (data.auto_rules || []).map((r) => h("div", {}, h("span", {}, `${r.section}${r.countries.length ? ", " + r.countries.join(", ") : ""}`),
+          h("span", {}, `${r.picked || 0} + ${r.picked_fallback || 0}`)))) : null,
+      rows.length ? h("div", { class: "row", style: "padding: 12px 18px" },
+        [["all", `All ${rows.length}`], ["usable", `Usable ${usable.length}`], ["picked", "Picked and rejected"]].map(([v, t]) =>
+          h("button", { type: "button", class: "toggle", "aria-pressed": String(filter === v), onclick: () => { filter = v; drawRight(); } }, t)),
+        rows[0] && rows[0].total ? h("span", { class: "xs muted", style: "margin-left: auto" }, `${rows[0].total} requests per server`) : null) : null,
+      rows.length ? h("div", { class: "scroll-x" }, h("table", { style: "min-width: 760px" },
+        h("tr", {}, h("th", { scope: "col" }, "Goes to"), h("th", { scope: "col" }, "Result"), h("th", { scope: "col", class: "r" }, "OK"),
+          h("th", { scope: "col", class: "r" }, "Median"), h("th", { scope: "col", class: "r" }, "Mbit/s"), h("th", { scope: "col" }, "Exit"),
+          h("th", { scope: "col" }, "YouTube sees"), h("th", { scope: "col" }, "Server")),
+        shown.map((r) => {
+          const [ys, yc] = String(r.youtube || "-").split(":");
+          const median = parseFloat(r.median);
+          return h("tr", {},
+            h("td", {}, goesTags(r)),
+            h("td", {}, verdictTag(r.verdict)),
+            h("td", { class: "r num" }, r.total ? `${r.ok}/${r.total}` : "–"),
+            h("td", { class: "r num nowrap" }, Number.isFinite(median) ? `${median.toFixed(2)} s` : "–"),
+            h("td", { class: `r num${/slow/.test(r.reason) ? " bad-text" : ""}` }, r.mbit && r.mbit !== "-" ? Math.round(+r.mbit) : "–"),
+            h("td", { class: "mono-cell" }, r.country || "–"),
+            h("td", { class: "mono-cell", style: yc === "RU" && ys === "ok" ? "font-weight: 500; color: var(--yt)" : "color: var(--muted)" },
+              ys === "ok" ? yc : ys === "-" || !ys ? "–" : ys === "bot" ? "bot check" : ys === "no" ? "no video" : "failed"),
+            h("td", { style: "min-width: 180px" }, h("span", { class: "col" }, h("span", {}, r.node),
+              r.reason ? h("span", { class: "xs muted" }, r.reason) : null)));
+        }))) : null,
+      h("details", { style: "border-top: 1px solid var(--line)", open: st.state === "failed" },
+        h("summary", { style: "padding: 12px 18px; font-size: 13px; font-weight: 500" }, icon("right", 14, { width: 1.6, class: "chev" }),
+          "Full output of podkop-probe"),
+        h("pre", { class: "out" }, (st.log || []).join("\n"))));
+  };
+
+  const runs = () => h("section", { class: "card events", "aria-labelledby": "p-runs" },
+    h("h2", { id: "p-runs", style: "margin-bottom: 8px" }, "Runs"),
+    (data.runs || []).length ? data.runs.map((u, i) => {
+      const pill = { running: ["running", "accent"], done: ["done", "ok"], failed: ["failed", "bad"] }[u.state] || [u.state, ""];
+      let result = h("span", { class: "muted" }, u.state === "failed" ? "Nothing applied, old settings kept" : u.state === "running" ? "" : "Not applied");
+      if (u.version_id) {
+        result = u.version_state === "unchanged" ? h("span", { class: "muted" }, "Same servers as before, nothing to apply")
+          : h("a", { href: `#/r/${id}/history`, style: "font-weight: 500" },
+            `Applied as #${u.version_id}${["reverted", "rejected", "failed"].includes(u.version_state) ? `, ${VERSION_STATE[u.version_state][0]}` : ""}`);
+      } else if (i === 0 && u.state === "done") result = h("span", { class: "muted" }, "Not applied yet");
+      return h("div", { class: "run" },
+        h("span", { class: "num" }, longWhen(u.started)),
+        h("span", { class: "muted" }, u.trigger === "schedule" ? "nightly" : u.trigger),
+        h("span", { class: `pill ${pill[1]}` }, pill[0]), result);
+    }) : h("p", { class: "muted small" }, "No runs from this manager yet."));
+
+  const drawRight = () => put(rightBox, lastRun(), runs());
 
   const applyLists = async () => {
     try {
       const p = await api("POST", `/api/routers/${id}/probe/preview`);
-      confirmApply(id, p.fingerprint, p.config, p.diff, "probe result", null, null);
+      openApply(id, { base: p.fingerprint, config: p.config, note: "Probe result", trigger: "probe",
+        done: async () => { await load(); drawRight(); } });
     } catch (e) { toast(e.message, true); }
   };
 
-  const refresh = async () => { data = await api("GET", `/api/routers/${id}/probe`); drawStatus(); };
-
-  put(main, ...routerTabs(rt, "/probe"),
-    h("div", { class: "card" }, h("h2", {}, "Keys and options"),
-      field("Keys", f.keys, "Subscription URLs, one per line. Kept on this manager."),
-      PROBE_FIELDS.map(([k, label]) => field(label, f[k], null, k)),
-      field("YouTube list", h("label", { class: "row" }, f.noyt, "skip"), "Otherwise the fastest servers where YouTube sees RU go into the YouTube section."),
-      field("Quick run", h("label", { class: "row" }, f.quick, "fewer requests, short speed test")),
-      field("Main section", f.main), field("YouTube section", f.yt),
-      field("Every night at", f.schedule), field("Apply the nightly result", h("label", { class: "row" }, f.auto, "automatically (checked and undone if podkop fails)")),
-      h("div", { class: "row" },
-        h("button", { onclick: async () => { try { await save(); toast("saved"); } catch (e) { toast(e.message, true); } } }, "Save"),
-        h("button", { class: "primary", onclick: async () => {
-          try { await save(); await api("POST", `/api/routers/${id}/probe/start`); toast("probe started, takes 2–10 minutes"); await refresh(); }
-          catch (e) { toast(e.message, true); }
-        } }, "Save and run now"))),
-    h("div", { class: "card" }, h("h2", {}, "Last run"), statusBox),
-    h("div", { class: "card" }, h("h2", {}, "Runs"), h("table", {}, (data.runs || []).map((r) =>
-      h("tr", {}, h("td", {}, when(r.started)), h("td", {}, r.trigger), h("td", {}, r.state),
-        h("td", {}, r.version_id ? h("a", { href: `#/r/${id}/history` }, `applied as #${r.version_id}`) : ""))))));
-  drawStatus();
-  const timer = setInterval(() => { if (data.status && data.status.state === "running") refresh().catch(() => {}); }, 10000);
-  S.view = { leave: () => clearInterval(timer), onProbe: (m) => m.router_id === id && refresh().catch(() => {}) };
-}
-
-// --- logs -------------------------------------------------------------------------------
-
-async function viewLogs(main, id) {
-  const rt = getRouter(id);
-  const box = h("div", { class: "logbox" });
-  const q = h("input", { placeholder: "search stored logs", style: "max-width:320px" });
-  const line = (l) => h("div", { class: /\[(fatal|error)\]|ERROR|FATAL/.test(l) ? "err" : /\[warn\]|WARN/.test(l) ? "warn" : "" }, l);
-  const fill = (lines) => { put(box, ...lines.map(line)); box.scrollTop = box.scrollHeight; };
-  const load = async () => fill((await api("GET", `/api/routers/${id}/logs?limit=1000&q=${encodeURIComponent(q.value)}`)).map((r) => r.line));
-  put(main, ...routerTabs(rt, "/logs"),
-    h("div", { class: "card" },
-      h("div", { class: "row", style: "margin-bottom:10px" }, q,
-        h("button", { onclick: load }, "Search"),
-        h("button", { onclick: async () => { try { fill(await api("GET", `/api/routers/${id}/logs/recent?lines=500`)); } catch (e) { toast(e.message, true); } } }, "Router's buffer now"),
-        h("span", { class: "muted small" }, "podkop, sing-box, podkop-engine and podkop-agent; new lines appear live")),
-      box));
   await load();
-  S.view = { onLog: (m) => {
-    if (m.router_id !== id || q.value) return;
-    const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
-    box.append(line(m.line));
-    if (box.childNodes.length > 3000) box.firstChild.remove();
-    if (stick) box.scrollTop = box.scrollHeight;
-  } };
+  resetForm();
+  put(page,
+    pageHead("Servers probe", "Tests every server from your subscriptions on the router and puts the fastest into podkop"),
+    h("div", { class: "split" }, leftBox, rightBox));
+  drawLeft(); drawRight();
+  lastState = data.status && data.status.state;
+  const timer = setInterval(async () => {
+    if (!data.status || data.status.state !== "running") return;
+    await load().catch(() => {});
+    drawRight();
+    if (lastState === "running" && data.status && data.status.state !== "running") drawLeft();
+    lastState = data.status && data.status.state;
+  }, 10000);
+  S.view = {
+    leave: () => clearInterval(timer),
+    onProbe: (m) => { if (m.router_id === id) load().then(drawRight).catch(() => {}); },
+  };
 }
 
-// --- history ------------------------------------------------------------------------------
+// --- the routing draft ---------------------------------------------------------------------------------
+// One per router, shared by Rules and Global settings, kept on the manager
+// (/draft) so it survives reloads. w.config is edited in place.
 
-async function viewHistory(main, id) {
-  const rt = getRouter(id);
-  const list = await api("GET", `/api/routers/${id}/versions`);
-  const cls = (s) => ({ applied: "ok", saved: "ok", unchanged: "", rejected: "bad", reverted: "bad", failed: "bad" }[s] || "warn");
-  put(main, ...routerTabs(rt, "/history"),
-    list.length ? null : h("div", { class: "card muted" }, "Nothing applied from this manager yet."),
-    list.map((v) => h("div", { class: "card" },
-      h("div", { class: "row spread" },
-        h("div", {}, h("b", {}, `#${v.id}`), " ", h("span", { class: `badge ${cls(v.state)}` }, v.state), " ",
-          h("span", { class: "muted small" }, `${when(v.t)} · ${v.note || ""}`)),
-        ["applied", "saved"].includes(v.state) ? h("button", { class: "small", onclick: () => restore(v.id) }, "Restore this version") : null),
-      v.message ? h("p", { class: "small" }, v.message) : null,
-      h("details", {}, h("summary", {}, `${v.diff.length} change(s)`), diffList(v.diff)))));
+async function loadWork(id) {
+  if (S.work[id] && S.work[id].saving) await saveWork(S.work[id]);
+  const [cur, draft, versions, rules] = await Promise.all([api("GET", `/api/routers/${id}/config`),
+    api("GET", `/api/routers/${id}/draft`), api("GET", `/api/routers/${id}/versions?limit=50`).catch(() => []),
+    api("GET", `/api/routers/${id}/auto-rules`).catch(() => [])]);
+  const old = S.work[id];
+  const w = {
+    id, orig: cur.config, fp: cur.fingerprint,
+    ctx: { lists: cur.community_lists || [], devices: cur.devices || [], interfaces: cur.interfaces || [] },
+    config: draft ? draft.config : clone(cur.config), base: draft ? draft.base : cur.fingerprint,
+    versions, auto: Object.fromEntries(rules.map((r) => [r.section, r])),
+    problems: old && old.problems && draft && same(old.config, draft.config) ? old.problems : null,
+    saving: null, redraw: () => {},
+  };
+  S.work[id] = w;
+  return w;
+}
 
-  async function restore(vid) {
-    const v = await api("GET", `/api/versions/${vid}`);
-    const d = await api("POST", `/api/routers/${id}/diff`, { config: v.config });
-    if (!d.diff.length) return toast("the router already has these settings");
-    confirmApply(id, d.fingerprint, v.config, d.diff, `restore #${vid}`, () => render(), null);
+const workChanges = (w) => configDiff(w.orig, w.config);
+
+async function saveWork(w) {
+  clearTimeout(w.saving);
+  w.saving = null;
+  try {
+    if (workChanges(w).length) await api("PUT", `/api/routers/${w.id}/draft`, { config: w.config, base: w.base });
+    else await api("DELETE", `/api/routers/${w.id}/draft`);
+  } catch (e) { toast(`The draft was not saved: ${e.message}`, true); }
+}
+
+// after every edit: save the draft a moment later, update the bar
+function touch(w) {
+  w.problems = w.problems ? Object.assign(w.problems, { stale: true }) : null;
+  clearTimeout(w.saving);
+  w.saving = setTimeout(() => saveWork(w), 500);
+  w.drawBar && w.drawBar();
+}
+
+async function discardWork(w) {
+  clearTimeout(w.saving);
+  w.saving = null;
+  await api("DELETE", `/api/routers/${w.id}/draft`);
+  await loadWork(w.id);
+  render();
+}
+
+async function checkWork(w) {
+  w.checking = true; w.drawBar && w.drawBar();
+  try {
+    const r = await api("POST", `/api/routers/${w.id}/validate`, { config: w.config });
+    w.problems = r.problems;
+  } catch (e) { toast(e.message, true); }
+  w.checking = false;
+  w.redraw();
+}
+
+function reviewWork(w) {
+  openApply(w.id, { base: w.base, config: w.config, note: "", trigger: "web", done: async (ok) => {
+    if (ok) { await loadWork(w.id); render(); }
+  } });
+}
+
+// the bar over Rules: changes, problems, Discard, Check, Review and apply
+function draftBar(w) {
+  const box = h("div");
+  w.drawBar = () => {
+    const n = workChanges(w).length;
+    const rt = S.routers[w.id];
+    // while the router applies, its fingerprint moves; that is not someone else's change
+    const busy = !!(rt && rt.status && rt.status.podkop.busy);
+    const stale = w.base !== w.fp && !busy;
+    const running = runningVersion(rt, w.versions);
+    if (!n && !stale) { put(box); return; }
+    const probs = w.problems || [];
+    put(box, h("div", { class: `banner${stale ? " bad" : ""}`, role: "region", "aria-label": "Unapplied changes" },
+      h("span", { class: `dot ${stale ? "bad" : "accent"}` }),
+      h("div", { class: "row grow", style: "flex: 1 1 300px; align-items: baseline; gap: 4px 12px" },
+        h("span", { style: "font-size: 14px; font-weight: 600" }, n ? `${plural(n, "change")} not applied` : "Draft"),
+        stale ? h("span", { class: "small bad-text" }, "podkop's settings changed on the router after this draft was started. Applying it would undo that, so the router refuses it: discard the draft and make your changes again.")
+          : busy ? h("span", { class: "small muted" }, "The router is applying settings now…")
+            : w.checking ? h("span", { class: "small muted" }, "Checking on the router…")
+            : w.problems ? h("span", { class: `small ${probs.length ? "bad-text" : "ok-text"}` },
+              probs.length ? `${plural(probs.length, "problem")} found by Check${w.problems.stale ? ", changed since" : ""}` : `Check found no problems${w.problems.stale ? ", changed since" : ""}`) : null,
+        !stale ? h("span", { class: "small muted" }, `Draft kept on this manager. The router still runs ${running ? `the settings from #${running.id}` : "its current settings"}.`) : null),
+      h("div", { class: "row" },
+        h("button", { type: "button", class: "btn ghost", onclick: async () => {
+          if (confirm(`Discard ${plural(n, "change")}? The router keeps its settings.`)) await discardWork(w);
+        } }, "Discard"),
+        !stale ? h("button", { type: "button", class: "btn", disabled: w.checking, onclick: () => checkWork(w) }, w.problems ? "Check again" : "Check") : null,
+        !stale ? h("button", { type: "button", class: "btn primary", onclick: () => reviewWork(w) }, "Review and apply") : null)),
+    probs.length ? h("div", { class: "problem-box", style: "margin-top: 8px" }, probs.map((p) => h("div", {},
+      p.section && rulesOf(w.config).some((s) => s.name === p.section)
+        ? h("a", { href: `#/r/${w.id}/rules/${p.section}`, style: "color: inherit; text-decoration: underline" }, problemText(p)) : problemText(p)))) : null);
+  };
+  w.drawBar();
+  return box;
+}
+
+// --- fields bound to one section of the draft --------------------------------------------------------
+
+function binder(w, section, defs, { defaults = true } = {}) {
+  const sec = () => sectionsOf(w.config).find((s) => s.name === section);
+  const orig = bySection(w.orig).get(section);
+  const o = () => (sec().options || (sec().options = {}));
+  const def = (opt) => (defs.find((d) => d.name === opt) || {}).default;
+  const b = {
+    get: (opt) => o()[opt],
+    val: (opt) => (o()[opt] !== undefined ? o()[opt] : def(opt)),
+    set: (opt, v, redraw) => {
+      if (v === "" || v === null || v === undefined || (Array.isArray(v) && !v.length)) delete o()[opt];
+      else o()[opt] = v;
+      touch(w);
+      if (redraw) w.redraw();
+    },
+    old: (opt) => (orig ? (orig.options || {})[opt] : undefined),
+    changed: (opt) => !!orig && !same(b.old(opt), o()[opt]),
+    isNew: !orig,
+    // dot: accent when changed in the draft, gray when it differs from podkop's default
+    dot: (opt) => {
+      if (b.changed(opt)) return h("span", { class: "dot sm accent", title: "changed in this draft" });
+      const d = def(opt), v = o()[opt];
+      return defaults && v !== undefined && d !== undefined && !same(asList(v), asList(d)) ? h("span", { class: "dot sm gray", title: "differs from podkop's default" }) : null;
+    },
+    was: (opt) => {
+      if (!b.changed(opt) || Array.isArray(b.old(opt)) || Array.isArray(o()[opt])) return null;
+      const old = b.old(opt);
+      return h("span", { class: "was" }, old === undefined ? "was not set" : `was ${shortValue(old)}`);
+    },
+    problems: (opt) => (w.problems || []).filter((p) => p.section === section && p.option === opt && (p.index === undefined || p.index === null)),
+    problemEls: (opt) => b.problems(opt).map((p) => h("span", { class: "field-problem" }, p.message)),
+    indexProblem: (opt, i) => (w.problems || []).find((p) => p.section === section && p.option === opt && p.index === i),
+  };
+  return b;
+}
+
+// focus survives a redraw when controls carry data-k
+function keepFocus(fn) {
+  const a = document.activeElement;
+  const k = a && a.getAttribute && a.getAttribute("data-k");
+  const pos = a && "selectionStart" in a ? a.selectionStart : null;
+  fn();
+  if (!k) return;
+  const el = document.querySelector(`[data-k="${CSS.escape(k)}"]`);
+  if (el) { el.focus(); if (pos !== null && "setSelectionRange" in el) try { el.setSelectionRange(pos, pos); } catch { /* not a text field */ } }
+}
+
+// label with its marker dot
+const lbl = (b, opt, text, forId) => h(forId ? "label" : "span", { class: forId ? null : "label", for: forId || null }, b.dot(opt), text);
+
+function textField(b, opt, { mono, placeholder, width, type } = {}) {
+  return h("input", { class: `input mid${mono ? " mono" : ""}`, style: width ? `max-width: ${width}` : null, type: type || "text",
+    "data-k": `${opt}`, value: b.get(opt) ?? "", placeholder: placeholder ?? (b.val(opt) ?? ""),
+    oninput: (e) => b.set(opt, e.target.value), onchange: () => keepFocus(() => {}) });
+}
+
+function comboField(b, opt, values, { mono = true } = {}) {
+  const lid = `dl-${opt}`;
+  return h("span", { style: "display: contents" },
+    h("input", { class: `input mid${mono ? " mono" : ""}`, list: lid, "data-k": opt, value: b.get(opt) ?? "", placeholder: b.val(opt) ?? "",
+      oninput: (e) => b.set(opt, e.target.value) }),
+    h("datalist", { id: lid }, values.map((v) => h("option", { value: v }))));
+}
+
+function selectField(b, opt, values, { mono } = {}) {
+  const v = b.val(opt);
+  return h("select", { class: `input mid${mono ? " mono" : ""}`, "data-k": opt, onchange: (e) => b.set(opt, e.target.value, true) },
+    v === undefined ? h("option", { value: "" }, "—") : null,
+    [...new Set([...values, ...(v !== undefined ? [v] : [])])].map((x) => h("option", { value: x, selected: x === v }, x)));
+}
+
+function flagField(b, opt, text, sub, { disabled } = {}) {
+  return h("label", { class: sub ? "check" : "check inline" },
+    h("input", { type: "checkbox", "data-k": opt, checked: b.val(opt) === "1", disabled,
+      onchange: (e) => b.set(opt, e.target.checked ? "1" : "0", true) }),
+    sub ? h("span", { class: "col" }, h("span", { class: "row", style: "gap: 8px" }, text, b.dot(opt)), h("span", {}, sub))
+      : h("span", { class: "row", style: "gap: 8px" }, text, b.dot(opt)));
+}
+
+function segField(b, opt, values, labels) {
+  return seg(values.map((v, i) => [v, labels ? labels[i] : v]), b.val(opt), (v) => b.set(opt, v, true), { small: true, label: opt });
+}
+
+// chips for a list of words (domains, subnets, URLs); new ones are green
+function tokenField(b, opt, { placeholder, splitter = /[\s,]+/ } = {}) {
+  const items = asList(b.get(opt));
+  const old = asList(b.old(opt));
+  const add = (text) => {
+    const more = text.split(splitter).map((x) => x.trim()).filter(Boolean).filter((x) => !items.includes(x));
+    if (more.length) b.set(opt, [...items, ...more], true);
+  };
+  return h("div", { class: "tokens" },
+    items.map((x, i) => h("span", { class: `token${b.isNew || !old.includes(x) ? " new" : ""}${b.indexProblem(opt, i) ? " bad" : ""}`,
+      title: b.indexProblem(opt, i) ? b.indexProblem(opt, i).message : null }, x,
+    h("button", { type: "button", "aria-label": `Remove ${x}`, onclick: () => b.set(opt, items.filter((y) => y !== x), true) },
+      icon("close", 10, { width: 2 })))),
+    h("label", { class: "sr", for: `add-${opt}` }, `Add to ${opt}`),
+    h("input", { id: `add-${opt}`, "data-k": `add-${opt}`, placeholder: placeholder || "Add, Enter",
+      onkeydown: (e) => {
+        if (e.key === "Enter" || e.key === ",") { e.preventDefault(); const v = e.target.value; e.target.value = ""; keepFocus(() => add(v)); }
+        else if (e.key === "Backspace" && !e.target.value && items.length) keepFocus(() => b.set(opt, items.slice(0, -1), true));
+      },
+      onpaste: (e) => {
+        const text = (e.clipboardData || window.clipboardData).getData("text");
+        if (/[\s,]/.test(text.trim())) { e.preventDefault(); keepFocus(() => add(text)); }
+      },
+      onblur: (e) => { if (e.target.value.trim()) { const v = e.target.value; e.target.value = ""; add(v); } } }));
+}
+
+// Off / List / Text for user domains and subnets
+function userListField(b, kind) {
+  const type = `user_${kind}_list_type`, list = `user_${kind}s`, text = `user_${kind}s_text`;
+  const mode = b.val(type) || "disabled";
+  const name = kind === "domain" ? "Your domains" : "Your subnets";
+  const changed = b.changed(type) || b.changed(list) || b.changed(text);
+  const label = h("span", { class: "label" }, changed ? h("span", { class: "dot sm accent" }) : null, name);
+  if (mode === "disabled" && kind === "subnet") {
+    return h("div", { class: "mini" }, label, h("span", { class: "row" }, h("span", { class: "small muted" }, "Off"),
+      h("button", { type: "button", class: "link-btn", onclick: () => b.set(type, "dynamic", true) }, "Turn on")));
   }
-  S.view = {};
+  return h("div", { class: "field" },
+    h("div", { class: "row", style: "justify-content: space-between" }, label,
+      seg([["disabled", "Off"], ["dynamic", "List"], ["text", "Text"]], mode, (v) => b.set(type, v, true), { small: true, label: name })),
+    mode === "dynamic" ? tokenField(b, list, { placeholder: kind === "domain" ? "Add domain, Enter" : "Add subnet, Enter" }) : null,
+    mode === "text" ? h("textarea", { class: "input", rows: 5, "data-k": text, oninput: (e) => b.set(text, e.target.value) }, b.get(text) || "") : null,
+    mode === "dynamic" ? h("span", { class: "help" }, "Green items are new in this draft. Paste several at once, separated by spaces or new lines.") : null,
+    b.problemEls(list), b.problemEls(text));
 }
 
-// --- start ------------------------------------------------------------------------------
+// --- links ----------------------------------------------------------------------------------------------
+
+const LINK_RE = /[a-z0-9]+:\/\/[^\s"'<>]+/gi;
+
+// the list of server links of a rule: rows with name, protocol, host; drag, remove, add
+function serversField(w, b, opt, { title, help, collapsible, probeLink }) {
+  const links = asList(b.get(opt));
+  const old = asList(b.old(opt));
+  const ui = w.ui[`${b.name}:${opt}`] || (w.ui[`${b.name}:${opt}`] = { open: !collapsible, all: false });
+  const head = h("div", { class: "servers-head" },
+    h("span", {}, b.changed(opt) ? h("span", { class: "dot sm accent" }) : null, `${title}, ${links.length}`),
+    probeLink ? h("a", { class: "small", style: "font-weight: 500", href: `#/r/${w.id}/probe` }, "Take from last probe") : null);
+  if (collapsible && !ui.open) {
+    return h("div", { class: "mini" }, h("div", { class: "col" }, h("span", { class: "row", style: "gap: 8px; font-size: 13px; font-weight: 500" },
+      b.changed(opt) ? h("span", { class: "dot sm accent" }) : null, `${title}, ${links.length}`), h("span", { class: "xs muted" }, help)),
+    h("button", { type: "button", class: "btn sm", style: "width: 32px; padding: 0", "aria-label": `Show ${title.toLowerCase()}`,
+      onclick: () => { ui.open = true; w.redraw(); } }, icon("down", 14, { width: 1.6 })));
+  }
+  const shown = ui.all ? links : links.slice(0, 6);
+  let drag = null;
+  const move = (from, to) => { const l = [...links]; l.splice(to, 0, l.splice(from, 1)[0]); b.set(opt, l, true); };
+  const addArea = h("textarea", { class: "input", rows: 2, id: `paste-${opt}`, "data-k": `paste-${opt}`,
+    placeholder: "Paste links, one per line: vless://, trojan://, ss://, hysteria2://, socks://" });
+  const addLinks = () => {
+    const found = (addArea.value.match(LINK_RE) || []).filter((l) => !links.includes(l));
+    if (!found.length) return toast("No links found: they start with vless://, trojan://, ss://, hysteria2:// or socks://", true);
+    addArea.value = "";
+    b.set(opt, [...links, ...found], true);
+  };
+  return h("div", { class: "servers" }, head,
+    collapsible ? h("div", { class: "servers-more" }, h("span", { class: "xs muted" }, help), " ",
+      h("button", { type: "button", class: "link-btn", onclick: () => { ui.open = false; w.redraw(); } }, "Hide")) : null,
+    shown.map((l, i) => {
+      const p = b.indexProblem(opt, i);
+      const isNew = b.isNew || !old.includes(l);
+      return h("div", { class: `srv${p ? " bad" : isNew ? " new" : ""}`, draggable: "true",
+        ondragstart: (e) => { drag = i; e.dataTransfer.effectAllowed = "move"; e.currentTarget.classList.add("dragging"); },
+        ondragend: (e) => e.currentTarget.classList.remove("dragging"),
+        ondragover: (e) => e.preventDefault(),
+        ondrop: (e) => { e.preventDefault(); if (drag !== null && drag !== i) move(drag, i); drag = null; } },
+      h("span", { class: "grip", "aria-hidden": "true" }, icon("grip", 16)),
+      h("div", { class: "col" },
+        h("div", {}, h("span", { class: "nm" }, linkName(l)), h("span", { class: "proto" }, linkProto(l)),
+          isNew ? h("span", { class: "tag ok" }, "new") : null),
+        h("span", { class: "host ellipsis", title: linkDetails(l) }, linkDetails(l)),
+        p ? h("span", { class: "err" }, p.message) : null),
+      h("button", { type: "button", class: "btn icon", "aria-label": `Move ${linkName(l)} up`, title: "Move up", disabled: i === 0,
+        onclick: () => move(i, i - 1) }, icon("up", 14, { width: 1.6 })),
+      h("button", { type: "button", class: "btn icon", "aria-label": `Remove ${linkName(l)}`, onclick: () => b.set(opt, links.filter((_, j) => j !== i), true) },
+        icon("trash", 14, { width: 1.6 })));
+    }),
+    links.length > 6 ? h("div", { class: "servers-more" }, h("button", { type: "button", class: "link-btn", onclick: () => { ui.all = !ui.all; w.redraw(); } },
+      ui.all ? "Show fewer" : `Show ${links.length - 6} more`)) : null,
+    h("div", { class: "servers-add" },
+      h("div", { class: "row", style: "justify-content: space-between" },
+        h("label", { for: `paste-${opt}`, class: "xs", style: "font-weight: 500; color: var(--text-2)" }, "Add servers"),
+        h("button", { type: "button", class: "btn xs", onclick: addLinks }, "Add")),
+      addArea, b.problemEls(opt)));
+}
+
+// --- routing rules -----------------------------------------------------------------------------------------
+
+const CONNECTIONS = [["proxy", "Proxy"], ["vpn", "VPN"], ["block", "Block"], ["exclusion", "Direct"]];
+const PROXY_TYPES = [["url", "One link"], ["selector", "Selector"], ["urltest", "Fastest (URLTest)"], ["outbound", "sing-box JSON"]];
+const PROXY_HELP = {
+  url: "One server for everything this rule matches.",
+  selector: "A list of servers; you pick which one is used under Servers.",
+  urltest: "Tests every server and uses the fastest. Fallback servers are used only when all of them fail.",
+  outbound: "A sing-box outbound written by hand, checked with sing-box before it is applied.",
+};
+
+async function viewRules(main, id, sub) {
+  const w = await loadWork(id);
+  w.ui = w.ui || {};
+  const page = h("div", { class: "page" });
+  put(main, page);
+  const bar = draftBar(w);
+  const listBox = h("section", { "aria-label": "Rules", class: "stack", style: "flex: 1 1 400px; min-width: 0; gap: 10px" });
+  const editBox = h("div", { style: "flex: 1.3 1 520px; min-width: 0" });
+  put(page, pageHead("Routing rules", "podkop sections as rules: what each one matches and where that traffic goes"),
+    bar, h("div", { class: "split" }, listBox, editBox));
+
+  const selected = () => {
+    const rules = rulesOf(w.config);
+    return rules.find((s) => s.name === sub) || rules[0] || null;
+  };
+  w.redraw = () => keepFocus(() => { drawList(); drawEditor(); w.drawBar(); });
+
+  const reorder = (from, to) => {
+    const rules = rulesOf(w.config);
+    const moved = [...rules];
+    moved.splice(to, 0, moved.splice(from, 1)[0]);
+    let k = 0;
+    w.config.sections = sectionsOf(w.config).map((s) => (s.type === "section" ? moved[k++] : s));
+    touch(w); w.redraw();
+  };
+
+  const drawList = () => {
+    const rules = rulesOf(w.config);
+    const diff = workChanges(w);
+    const origNames = new Set(rulesOf(w.orig).map((s) => s.name));
+    const sel = selected();
+    let drag = null;
+    put(listBox,
+      h("div", { class: "col", style: "padding: 0 2px 4px" }, h("h2", { class: "h2" }, "Rules"),
+        h("p", { class: "small muted" }, "A site goes to the first rule that matches it. Drag to change the order, or use Alt and the arrow keys.")),
+      rules.map((s, i) => {
+        const n = diff.filter((d) => d.section === s.name && d.change === "changed").length;
+        const auto = w.auto[s.name];
+        const tag = !origNames.has(s.name) ? h("span", { class: "tag ok" }, "new") : n ? h("span", { class: "tag" }, plural(n, "change")) : null;
+        return h("a", { href: `#/r/${id}/rules/${s.name}`, class: "rule", "aria-selected": String(sel === s), draggable: "true",
+          title: "Drag, or Alt+Up / Alt+Down, to change the order",
+          ondragstart: (e) => { drag = i; e.dataTransfer.effectAllowed = "move"; e.currentTarget.classList.add("dragging"); },
+          ondragend: (e) => e.currentTarget.classList.remove("dragging"),
+          ondragover: (e) => { e.preventDefault(); },
+          ondrop: (e) => { e.preventDefault(); if (drag !== null && drag !== i) reorder(drag, i); drag = null; },
+          onkeydown: (e) => {
+            if (!e.altKey || !["ArrowUp", "ArrowDown"].includes(e.key)) return;
+            e.preventDefault();
+            const to = i + (e.key === "ArrowUp" ? -1 : 1);
+            if (to < 0 || to >= rules.length) return;
+            reorder(i, to);
+            listBox.querySelectorAll(".rule")[to].focus();
+          } },
+        h("span", { class: "grip" }, icon("grip", 18)),
+        h("span", { class: "n" }, i + 1),
+        h("div", { class: "col grow", style: "gap: 6px" },
+          h("div", { class: "row" }, h("span", { class: "name" }, s.name), tag,
+            auto ? h("span", { class: "tag", style: "background: var(--line-soft); color: var(--text-2)" }, "servers by country") : null),
+          h("div", { class: "what" }, h("span", {}, ruleMatches(s)), icon("arrow", 14, { stroke: "var(--muted)" }),
+            auto ? h("span", { class: "dest" }, autoDest(auto, s)) : destChip(s))));
+      }),
+      h("div", { class: "rule-else" }, h("b", {}, "Everything else"), icon("arrow", 14, { stroke: "var(--muted)" }), h("span", {}, "Direct, not through podkop")),
+      h("button", { type: "button", class: "btn lg", onclick: () => {
+        let k = rules.length + 1;
+        while (bySection(w.config).has(`rule_${k}`)) k++;
+        w.config.sections.push({ name: `rule_${k}`, type: "section", anonymous: false,
+          options: { connection_type: "proxy", proxy_config_type: "urltest", user_domain_list_type: "dynamic" } });
+        touch(w);
+        location.hash = `#/r/${id}/rules/rule_${k}`;
+      } }, icon("plus", 15, { width: 1.6 }), "Add rule"));
+  };
+
+  const drawEditor = () => {
+    const s = selected();
+    if (!s) { put(editBox, h("div", { class: "card empty" }, "No rules yet. Add one to send some sites through a proxy, a VPN, block them or let them go direct.")); return; }
+    put(editBox, ruleEditor(w, s, { onRename: (name) => { location.hash = `#/r/${id}/rules/${name}`; } }));
+  };
+
+  drawList(); drawEditor();
+  S.view = {
+    leave: () => { w.drawBar = null; },
+    onRouter: (r) => {
+      if (r.id !== id || !r.status) return;
+      if (r.status.fingerprint !== w.fp) w.fp = r.status.fingerprint;
+      w.drawBar();
+    },
+  };
+}
+
+// "Proxy, PL servers, 4"
+const autoDest = (rule, sec) => `Proxy, ${rule.countries.length ? rule.countries.join(", ") : "any country"} servers, ${asList((sec.options || {}).urltest_proxy_links).length}`;
+
+function ruleEditor(w, s, { onRename }) {
+  const defs = S.schema.section;
+  const b = binder(w, s.name, defs, { defaults: false });
+  b.name = s.name;
+  const o = s.options || (s.options = {});
+  const rules = rulesOf(w.config);
+  const index = rules.indexOf(s);
+  const earlier = rules.slice(0, index);
+  const ct = o.connection_type || "proxy";
+  const pt = o.proxy_config_type || "url";
+  const auto = w.auto[s.name];
+
+  const rename = (name) => {
+    name = name.trim();
+    if (name === s.name) return;
+    if (!/^[A-Za-z0-9_]+$/.test(name)) { toast("A rule name has letters, digits and _ only", true); w.redraw(); return; }
+    if (bySection(w.config).has(name)) { toast(`There is already a rule ${name}`, true); w.redraw(); return; }
+    const old = s.name;
+    s.name = name;
+    if (w.auto[old]) {
+      api("PUT", `/api/routers/${w.id}/auto-rules/${name}`, w.auto[old])
+        .then((r) => api("DELETE", `/api/routers/${w.id}/auto-rules/${old}`).then(() => { delete w.auto[old]; w.auto[name] = r; }))
+        .catch((e) => toast(e.message, true));
+    }
+    touch(w);
+    onRename(name);
+  };
+
+  const duplicate = () => {
+    let name = `${s.name}_copy`, k = 2;
+    while (bySection(w.config).has(name)) name = `${s.name}_copy${k++}`;
+    const copy = clone(s); copy.name = name;
+    w.config.sections.splice(w.config.sections.indexOf(s) + 1, 0, copy);
+    if (auto) api("PUT", `/api/routers/${w.id}/auto-rules/${name}`, auto).then((r) => { w.auto[name] = r; }).catch((e) => toast(e.message, true));
+    touch(w);
+    onRename(name);
+  };
+
+  const remove = () => {
+    const m = modal({ title: `Delete rule ${s.name}?`, narrow: true,
+      body: h("p", { class: "small" }, "It goes away from the draft; the router keeps it until you apply."),
+      foot: [h("span"), h("div", { class: "row" },
+        h("button", { type: "button", class: "btn", onclick: () => m.close() }, "Cancel"),
+        h("button", { type: "button", class: "btn danger", onclick: () => {
+          m.close();
+          w.config.sections = sectionsOf(w.config).filter((x) => x !== s);
+          if (auto) api("DELETE", `/api/routers/${w.id}/auto-rules/${s.name}`).then(() => { delete w.auto[s.name]; }).catch(() => {});
+          touch(w);
+          location.hash = `#/r/${w.id}/rules`;
+        } }, "Delete rule"))] });
+  };
+
+  // community lists: toggles; lists an earlier rule already catches are dashed
+  const lists = asList(o.community_lists);
+  const caughtBy = (l) => earlier.findIndex((x) => asList((x.options || {}).community_lists).includes(l));
+  const allLists = [...new Set([...w.ctx.lists, ...lists])];
+  const listUi = w.ui[`${s.name}:lists`] || (w.ui[`${s.name}:lists`] = { all: false });
+  const visible = listUi.all ? allLists : allLists.filter((l, i) => i < 10 || lists.includes(l));
+  const shadowed = lists.filter((l) => caughtBy(l) >= 0);
+  const extraLists = ["remote_domain_lists", "remote_subnet_lists", "local_domain_lists", "local_subnet_lists"];
+  const extraCount = extraLists.reduce((n, k) => n + asList(o[k]).length, 0);
+  const extraUi = w.ui[`${s.name}:extra`] || (w.ui[`${s.name}:extra`] = { open: extraCount > 0 });
+
+  const matches = h("div", { class: "part" },
+    h("div", { class: "part-head" }, h("h3", {}, "Matches"),
+      h("span", {}, index > 0 ? `Any of these sends traffic here, unless rule${index > 1 ? "s" : ""} 1${index > 1 ? "–" + index : ""} above catch${index > 1 ? "" : "es"} it first` : "Any of these sends traffic to this rule")),
+    h("div", { class: "field" },
+      h("span", { class: "label" }, b.changed("community_lists") ? h("span", { class: "dot sm accent" }) : null, "Community lists"),
+      h("div", { class: "row", style: "gap: 6px" },
+        visible.map((l) => h("button", { type: "button", class: `toggle mono${caughtBy(l) >= 0 && !lists.includes(l) ? " dim" : ""}`,
+          "aria-pressed": String(lists.includes(l)), title: caughtBy(l) >= 0 ? `rule ${caughtBy(l) + 1} already catches ${l}` : null,
+          onclick: () => b.set("community_lists", lists.includes(l) ? lists.filter((x) => x !== l) : [...lists, l], true) }, l)),
+        allLists.length > visible.length || listUi.all ? h("button", { type: "button", class: "toggle mono dim",
+          onclick: () => { listUi.all = !listUi.all; w.redraw(); } }, listUi.all ? "fewer" : `${allLists.length - visible.length} more`) : null),
+      shadowed.length ? h("span", { class: "help" }, `${shadowed.join(", ")} ${shadowed.length === 1 ? "is" : "are"} already caught by rule ${caughtBy(shadowed[0]) + 1}, so ${shadowed.length === 1 ? "it never reaches" : "they never reach"} this one.`) : null,
+      b.problemEls("community_lists")),
+    userListField(b, "domain"),
+    h("div", { style: "display: grid; grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr)); gap: 10px" },
+      userListField(b, "subnet"),
+      !extraUi.open ? h("div", { class: "mini" }, h("span", {}, "Lists from URLs or files"),
+        h("span", { class: "row" }, extraCount ? h("span", { class: "small muted" }, plural(extraCount, "list")) : null,
+          h("button", { type: "button", class: "link-btn", onclick: () => { extraUi.open = true; w.redraw(); } }, extraCount ? "Edit" : "Add"))) : null),
+    extraUi.open ? h("div", { class: "stack", style: "gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 8px" },
+      h("div", { class: "row", style: "justify-content: space-between" }, h("span", { style: "font-size: 13px; font-weight: 500" }, "Lists from URLs or files"),
+        h("button", { type: "button", class: "link-btn", onclick: () => { extraUi.open = false; w.redraw(); } }, "Hide")),
+      [["remote_domain_lists", "Domain lists from URLs", "https://… list URL, Enter"], ["remote_subnet_lists", "Subnet lists from URLs", "https://… list URL, Enter"],
+        ["local_domain_lists", "Domain list files on the router", "/path/to/file, Enter"], ["local_subnet_lists", "Subnet list files on the router", "/path/to/file, Enter"]]
+        .map(([opt, text, ph]) => h("div", { class: "field" }, lbl(b, opt, text), tokenField(b, opt, { placeholder: ph, splitter: /[\s,]+/ }), b.problemEls(opt)))) : null);
+
+  const advanced = proxyAdvanced(w, b, s, ct, pt);
+  const sendsHelp = ct === "proxy" ? (auto ? "Proxy, fastest of the servers below" : "Where matching traffic goes")
+    : ct === "vpn" ? "Through a VPN interface of the router" : ct === "block" ? "Matching traffic is dropped" : "Matching traffic goes out directly, not through podkop";
+
+  const sends = h("div", { class: "part" },
+    h("div", { class: "part-head" }, h("h3", {}, "Sends to"), h("span", {}, sendsHelp)),
+    h("div", { class: "row", style: "gap: 14px 24px; align-items: flex-start" },
+      h("div", { class: "field", role: "group", "aria-label": "Connection" }, h("span", { class: "label xs muted", style: "font-size: 12px" }, b.dot("connection_type"), "Connection"),
+        seg(CONNECTIONS, ct, (v) => {
+          if (v !== "proxy" && auto) toggleAuto(w, s, false);
+          b.set("connection_type", v, true);
+        }, { label: "Connection" })),
+      null),
+    b.problemEls("connection_type"),
+    ct === "proxy" ? sourceCards(w, s, auto) : null,
+    ct === "proxy" && !auto ? h("div", { class: "field", role: "group", "aria-label": "Servers" }, h("span", { class: "label xs muted", style: "font-size: 12px" }, b.dot("proxy_config_type"), "Servers"),
+      seg(PROXY_TYPES, pt, (v) => b.set("proxy_config_type", v, true), { label: "Servers" })) : null,
+    b.problemEls("proxy_config_type"),
+    ct === "proxy" && auto ? autoRuleEditor(w, s, auto) : null,
+    ct === "proxy" && !auto ? h("p", { class: "xs muted", style: "margin-top: -6px" }, PROXY_HELP[pt]) : null,
+    ct === "proxy" && !auto && pt === "url" ? oneLinkField(b) : null,
+    ct === "proxy" && !auto && pt === "selector" ? serversField(w, b, "selector_proxy_links", { title: "Servers", probeLink: true }) : null,
+    ct === "proxy" && !auto && pt === "urltest" ? serversField(w, b, "urltest_proxy_links", { title: "Servers", probeLink: true }) : null,
+    ct === "proxy" && !auto && pt === "urltest" ? serversField(w, b, "urltest_fallback_links", { title: "Fallback servers",
+      help: "Used only when every server above fails", collapsible: true }) : null,
+    ct === "proxy" && !auto && pt === "outbound" ? h("div", { class: "field" }, lbl(b, "outbound_json", "sing-box outbound (JSON)"),
+      h("textarea", { class: "input", rows: 9, "data-k": "outbound_json", spellcheck: "false", oninput: (e) => b.set("outbound_json", e.target.value) }, o.outbound_json || ""),
+      b.problemEls("outbound_json")) : null,
+    ct === "vpn" ? h("div", { class: "form-grid" },
+      lbl(b, "interface", "VPN interface", "vpn-if"),
+      h("div", { class: "ctl" }, h("select", { id: "vpn-if", class: "input mid mono", "data-k": "interface", onchange: (e) => b.set("interface", e.target.value, true) },
+        h("option", { value: "" }, "—"), [...new Set([...w.ctx.devices, ...(o.interface ? [o.interface] : [])])].map((d) => h("option", { value: d, selected: d === o.interface }, d))),
+      b.was("interface"), b.problemEls("interface"))) : null,
+    ct === "vpn" ? flagField(b, "domain_resolver_enabled", "Resolve this rule's domains through its own DNS server") : null,
+    ct === "vpn" && b.val("domain_resolver_enabled") === "1" ? h("div", { class: "form-grid" },
+      h("span", { class: "lbl" }, b.dot("domain_resolver_dns_type"), "DNS protocol"), h("div", { class: "ctl" }, segField(b, "domain_resolver_dns_type", ["doh", "dot", "udp"], ["DoH", "DoT", "UDP"])),
+      lbl(b, "domain_resolver_dns_server", "DNS server"), h("div", { class: "ctl" }, comboField(b, "domain_resolver_dns_server", optionDef("x", "domain_resolver_dns_server").values), b.was("domain_resolver_dns_server"))) : null,
+    advanced);
+
+  return h("section", { class: "editor", "aria-label": `Edit rule ${s.name}` },
+    h("div", { class: "top" },
+      h("div", { class: "field", style: "flex: 1 1 220px" },
+        h("label", { for: "rule-name", class: "xs muted", style: "font-size: 12px" }, "Rule name"),
+        h("input", { id: "rule-name", class: "input mono", style: "height: 38px; font-size: 15px; font-weight: 500", value: s.name,
+          onchange: (e) => rename(e.target.value), onkeydown: (e) => { if (e.key === "Enter") e.target.blur(); } })),
+      h("div", { class: "row", style: "gap: 6px" },
+        h("button", { type: "button", class: "btn", onclick: duplicate }, "Duplicate"),
+        h("button", { type: "button", class: "btn danger", onclick: remove }, "Delete rule"))),
+    matches, sends);
+}
+
+function oneLinkField(b) {
+  const l = b.get("proxy_string") || "";
+  return h("div", { class: "field" }, lbl(b, "proxy_string", "Server link", "one-link"),
+    h("input", { id: "one-link", class: "input mono", "data-k": "proxy_string", value: l, placeholder: "vless://…",
+      oninput: (e) => b.set("proxy_string", e.target.value.trim()), onchange: () => b.set("proxy_string", b.get("proxy_string"), true) }),
+    isLink(l) ? h("span", { class: "row xs" }, h("span", { style: "font-weight: 500" }, linkName(l)), h("span", { class: "proto" }, linkProto(l)),
+      h("span", { class: "mono muted" }, linkDetails(l))) : null,
+    b.problemEls("proxy_string"), (b.indexProblem("proxy_string", 0) ? [h("span", { class: "field-problem" }, b.indexProblem("proxy_string", 0).message)] : []));
+}
+
+function proxyAdvanced(w, b, s, ct, pt) {
+  if (!["proxy", "vpn"].includes(ct)) return null;
+  const o = s.options;
+  const known = new Set([...S.schema.section.map((d) => d.name), ...S.schema.internal]);
+  const other = Object.keys(o).filter((k) => !known.has(k));
+  const opts = ["urltest_check_interval", "urltest_tolerance", "urltest_testing_url", "urltest_download_check", "urltest_download_url",
+    "enable_udp_over_tcp", "resolve_real_ip_for_routing", "mixed_proxy_enabled", "mixed_proxy_port", "fully_routed_ips"];
+  const changed = opts.filter((k) => b.changed(k)).length;
+  const nondef = opts.filter((k) => o[k] !== undefined).length;
+  const ui = w.ui[`${s.name}:adv`] || (w.ui[`${s.name}:adv`] = { open: changed > 0 });
+  const isUt = ct === "proxy" && pt === "urltest";
+  const det = h("details", { class: "adv", open: ui.open, ontoggle: (e) => { ui.open = e.currentTarget.open; } },
+    h("summary", {}, icon("right", 14, { width: 1.6, class: "chev" }), h("span", {}, isUt ? "Testing and proxy options" : "Proxy options"),
+      h("span", {}, changed ? `${changed} changed${nondef > changed ? ", others set" : ", others default"}` : nondef ? `${nondef} set` : "all default")),
+    h("div", { class: "adv-body" },
+      isUt ? h("div", { class: "field" }, h("span", { class: "label xs" }, b.dot("urltest_check_interval"), "Check every"),
+        segField(b, "urltest_check_interval", ["30s", "1m", "3m", "5m"]), b.was("urltest_check_interval")) : null,
+      isUt ? h("div", { class: "field" }, lbl(b, "urltest_tolerance", "Switch only if faster by", "tol"),
+        h("div", { class: "unit" }, h("input", { id: "tol", class: "input sm", style: "width: 80px", inputmode: "numeric", "data-k": "urltest_tolerance",
+          value: o.urltest_tolerance ?? "", placeholder: "50", oninput: (e) => b.set("urltest_tolerance", e.target.value.trim()) }), h("span", {}, "ms")),
+        b.was("urltest_tolerance"), b.problemEls("urltest_tolerance")) : null,
+      isUt ? h("div", { class: "field" }, lbl(b, "urltest_testing_url", "Testing URL"),
+        comboField(b, "urltest_testing_url", optionDef("x", "urltest_testing_url").values), b.was("urltest_testing_url")) : null,
+      isUt ? h("div", { class: "field" }, lbl(b, "urltest_download_check", "Download check"),
+        selectField(b, "urltest_download_check", ["default", "off", "custom"]), b.was("urltest_download_check")) : null,
+      isUt && b.val("urltest_download_check") === "custom" ? h("div", { class: "field" }, lbl(b, "urltest_download_url", "Download check URL"),
+        comboField(b, "urltest_download_url", optionDef("x", "urltest_download_url").values)) : null,
+      ct === "proxy" ? flagField(b, "enable_udp_over_tcp", "UDP over TCP") : null,
+      flagField(b, "resolve_real_ip_for_routing", "Resolve real IP for routing"),
+      flagField(b, "mixed_proxy_enabled", "Mixed proxy port"),
+      b.val("mixed_proxy_enabled") === "1" ? h("div", { class: "field" }, lbl(b, "mixed_proxy_port", "Port", "mport"),
+        h("input", { id: "mport", class: "input sm", style: "width: 100px", inputmode: "numeric", "data-k": "mixed_proxy_port", value: o.mixed_proxy_port ?? "",
+          oninput: (e) => b.set("mixed_proxy_port", e.target.value.trim()) }), b.problemEls("mixed_proxy_port")) : null,
+      h("div", { class: "field", style: "grid-column: 1 / -1" }, lbl(b, "fully_routed_ips", "Fully routed IPs"),
+        tokenField(b, "fully_routed_ips", { placeholder: "Device IP or subnet, Enter" }),
+        h("span", { class: "help" }, "All traffic of these devices goes through this rule")),
+      other.length ? h("div", { class: "field", style: "grid-column: 1 / -1" }, h("span", { class: "label" }, "Other options, kept as they are"),
+        other.map((k) => h("span", { class: "mono xs muted" }, `${k} = ${asList(o[k]).join(", ")}`))) : null));
+  return det;
+}
+
+// --- rules whose servers the probe picks by country ----------------------------------------------------------
+
+function sourceCards(w, s, auto) {
+  const card = (on, title, sub, onclick) => h("button", { type: "button", "aria-pressed": String(on), onclick,
+    class: "source", style: `display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding: 12px 14px; border-radius: 8px; text-align: left; cursor: pointer; ${on
+      ? "border: 1px solid var(--accent); background: var(--selected); box-shadow: 0 0 0 3px var(--accent-ring);" : "border: 1px solid var(--control); background: var(--surface);"}` },
+  h("span", { class: "row", style: "gap: 8px; font-size: 13.5px; font-weight: 500" }, on ? icon("check", 14, { stroke: "var(--accent)", width: 2 }) : null, title),
+  h("span", { class: "xs", style: `color: ${on ? "var(--text-2)" : "var(--muted)"}` }, sub));
+  return h("div", { role: "group", "aria-label": "Where servers come from",
+    style: "display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 10px" },
+  card(!auto, "Links I add", "You paste vless:// and other links, they stay as they are", () => auto && toggleAuto(w, s, false)),
+  card(!!auto, "From my subscriptions", "The probe picks servers that pass the filter and refreshes them on every run", () => !auto && toggleAuto(w, s, true)));
+}
+
+async function toggleAuto(w, s, on) {
+  try {
+    if (on) {
+      w.auto[s.name] = await api("PUT", `/api/routers/${w.id}/auto-rules/${s.name}`, { countries: [], protocols: [], top: 5, fallback: 2 });
+      const o = s.options;
+      o.proxy_config_type = "urltest";
+      touch(w);
+    } else {
+      await api("DELETE", `/api/routers/${w.id}/auto-rules/${s.name}`);
+      delete w.auto[s.name];
+    }
+  } catch (e) { toast(e.message, true); }
+  w.redraw();
+}
+
+// the filter of a rule by country, what it matches now, and its servers in the draft
+function autoRuleEditor(w, s, rule) {
+  const box = h("div", { class: "stack", style: "gap: 16px" });
+  const ui = w.ui[`${s.name}:auto`] || (w.ui[`${s.name}:auto`] = { preview: null, loading: false });
+  let saveTimer;
+
+  // the preview's servers go into the draft right away, so the rule can be applied now
+  const fillDraft = (p) => {
+    const links = p.matched.map((m) => m.link), fb = p.fallback.map((m) => m.link);
+    if (!links.length) return;
+    const o = s.options;
+    if (same(asList(o.urltest_proxy_links), links) && same(asList(o.urltest_fallback_links), fb)) return;
+    o.urltest_proxy_links = links;
+    if (fb.length) o.urltest_fallback_links = fb; else delete o.urltest_fallback_links;
+    touch(w);
+    w.redraw();
+  };
+  const preview = async () => {
+    ui.loading = true; draw();
+    try { ui.preview = await api("GET", `/api/routers/${w.id}/auto-rules/${s.name}/preview`); fillDraft(ui.preview); }
+    catch (e) { toast(e.message, true); }
+    ui.loading = false; draw();
+  };
+  const update = (patch, now) => {
+    Object.assign(rule, patch);
+    clearTimeout(saveTimer);
+    const go = async () => {
+      try { w.auto[s.name] = Object.assign(rule, await api("PUT", `/api/routers/${w.id}/auto-rules/${s.name}`, rule)); await preview(); }
+      catch (e) { toast(e.message, true); }
+    };
+    if (now) go(); else saveTimer = setTimeout(go, 600);
+    draw();
+  };
+
+  const draw = () => {
+    const p = ui.preview;
+    const seen = (p && p.countries) || [];
+    const opts = p ? p.probe_options : [];
+    const probeCountries = opts.includes("--countries") ? opts[opts.indexOf("--countries") + 1] : "all";
+    const matched = p ? p.matched : [], fb = p ? p.fallback : [];
+    put(box,
+      h("div", { class: "stack", style: "gap: 14px; padding: 16px; border: 1px solid var(--line); border-radius: 10px" },
+        h("div", { class: "part-head" }, h("span", { style: "font-size: 13.5px; font-weight: 600" }, "Take servers where"),
+          h("a", { href: `#/r/${w.id}/probe`, class: "xs" }, p ? `${plural(p.keys, "subscription")}, from Servers probe` : "Servers probe")),
+        h("div", { class: "form-grid", style: "grid-template-columns: minmax(110px, 140px) minmax(0, 1fr); align-items: start" },
+          h("span", { class: "lbl", style: "font-weight: 500; padding-top: 6px" }, "Exit country"),
+          h("div", { class: "ctl", style: "gap: 6px" },
+            h("div", { class: "row", style: "gap: 6px" },
+              rule.countries.map((c) => h("span", { class: "toggle", "aria-pressed": "true", style: "display: inline-flex; align-items: center; gap: 6px; padding: 0 4px 0 10px; height: 30px" },
+                `${c}, ${countryName(c)}`, h("button", { type: "button", class: "btn icon", style: "width: 22px; height: 22px; color: inherit", "aria-label": `Remove ${countryName(c)}`,
+                  onclick: () => update({ countries: rule.countries.filter((x) => x !== c) }, true) }, icon("close", 10, { width: 2 })))),
+              h("label", { class: "sr", for: "add-cc" }, "Add a country"),
+              h("select", { id: "add-cc", class: "input sm", style: "width: auto; height: 30px; border-style: dashed; border-radius: 15px",
+                onchange: (e) => {
+                  let v = e.target.value;
+                  if (v === "?") v = (prompt("Two-letter country code, e.g. PL") || "").trim().toUpperCase();
+                  if (/^[A-Z]{2}$/.test(v) && !rule.countries.includes(v)) update({ countries: [...rule.countries, v] }, true); else draw();
+                } },
+              h("option", { value: "" }, rule.countries.length ? "Add country" : "Any country, add one"),
+              seen.filter((c) => !rule.countries.includes(c)).map((c) => h("option", { value: c }, `${c}, ${countryName(c)}`)),
+              h("option", { value: "?" }, "Other…"))),
+            h("span", { class: "help" }, "The country of the IP that sites see, checked through each server. Relays whose exit is elsewhere are left out."),
+            probeCountries !== "all" && rule.countries.length ? h("span", { class: "help" }, `The probe tests only servers in ${probeCountries === "europe" ? "Europe" : probeCountries}; set its countries under Servers probe.`) : null),
+          h("span", { class: "lbl", style: "font-weight: 500; padding-top: 6px" }, "Protocol"),
+          h("div", { class: "row", style: "gap: 6px" }, ["vless", "trojan", "ss", "hysteria2", "socks"].map((x) =>
+            h("button", { type: "button", class: "toggle mono", "aria-pressed": String(rule.protocols.includes(x)),
+              onclick: () => update({ protocols: rule.protocols.includes(x) ? rule.protocols.filter((y) => y !== x) : [...rule.protocols, x] }, true) }, x))),
+          h("label", { for: "ipf", class: "lbl", style: "font-weight: 500; padding-top: 8px" }, "Exit IP"),
+          h("div", { class: "ctl" }, h("input", { id: "ipf", class: "input mid mono", style: "max-width: 360px; font-size: 12.5px", "data-k": "auto-ip",
+            placeholder: "Any. Or an IP or subnet, e.g. 203.0.113.0/24", value: rule.exit_ips.join(" "),
+            oninput: (e) => update({ exit_ips: e.target.value.split(/[\s,]+/).filter(Boolean) }) }),
+          h("span", { class: "help" }, "Use it to keep one IP the service already trusts. Several, separated by spaces.")),
+          h("label", { for: "namef", class: "lbl", style: "font-weight: 500; padding-top: 8px" }, "Name contains"),
+          h("div", { class: "ctl" }, h("input", { id: "namef", class: "input mid", style: "max-width: 360px", "data-k": "auto-name", placeholder: "Any, e.g. Warsaw",
+            value: rule.name_contains, oninput: (e) => update({ name_contains: e.target.value }) })),
+          h("span", { class: "lbl", style: "font-weight: 500; padding-top: 8px" }, "Keep"),
+          h("div", { class: "row small", style: "gap: 8px 10px" },
+            h("label", { class: "sr", for: "keep" }, "Fastest servers to keep"),
+            h("input", { id: "keep", class: "input mid", style: "width: 56px", inputmode: "numeric", "data-k": "auto-top", value: rule.top,
+              oninput: (e) => { const n = parseInt(e.target.value, 10); if (n >= 1) update({ top: n }); } }),
+            h("span", {}, "fastest and"),
+            h("label", { class: "sr", for: "fb" }, "Fallback servers"),
+            h("input", { id: "fb", class: "input mid", style: "width: 56px", inputmode: "numeric", "data-k": "auto-fb", value: rule.fallback,
+              oninput: (e) => { const n = parseInt(e.target.value, 10); if (n >= 0) update({ fallback: n }); } }),
+            h("span", {}, "fallback. Ping and speed limits come from the probe.")))),
+      h("div", { class: "servers" },
+        h("div", { class: "part-head", style: "padding: 12px 14px" },
+          h("span", { style: "font-size: 13.5px; font-weight: 600" }, ui.loading && !p ? "Matches now" : `Matches now: ${plural(matched.length + fb.length, "server")}`),
+          h("span", { class: "xs muted" }, ui.loading ? "Updating…" : p && p.finished
+            ? `From the probe at ${shortWhen(agentTime(p.finished))}.${p.schedule ? ` Next update at ${p.schedule}.` : " Updated after every probe run."}` : "")),
+        p && !p.has_links ? h("p", { class: "empty", style: "border-top: 1px solid var(--line-soft)" },
+          "The last probe run has no server links (podkop-probe before 1.12 does not save them). Run the probe again to fill this rule.") : null,
+        matched.length || fb.length ? h("div", { class: "scroll-x" }, h("table", {},
+          h("tr", {}, h("th", { scope: "col" }, "Server"), h("th", { scope: "col" }, "Protocol"), h("th", { scope: "col" }, "Exit IP"),
+            h("th", { scope: "col", class: "r" }, "Median"), h("th", { scope: "col", class: "r" }, "Mbit/s")),
+          [...matched.map((m) => [m, false]), ...fb.map((m) => [m, true])].map(([m, isFb]) => h("tr", {},
+            h("td", {}, m.name, isFb ? h("span", { class: "xs muted" }, " fallback") : null),
+            h("td", { class: "mono-cell" }, m.protocol), h("td", { class: "mono-cell", style: "color: var(--text-2)" }, m.exit_ip || "–"),
+            h("td", { class: "r num" }, Number.isFinite(parseFloat(m.median)) ? `${parseFloat(m.median).toFixed(2)} s` : "–"),
+            h("td", { class: "r num" }, m.mbit && m.mbit !== "-" ? Math.round(+m.mbit) : "–"))))) : null,
+        p && p.has_links && matched.length < rule.top ? h("div", { class: "row", style: "align-items: flex-start; flex-wrap: nowrap; gap: 10px; padding: 10px 14px; background: var(--warn-row); border-top: 1px solid var(--line-soft)" },
+          h("span", { class: "warn-text", style: "flex: none" }, "!"),
+          h("span", { class: "xs", style: "color: var(--warn-deep); line-height: 1.5" }, matched.length
+            ? `Only ${matched.length} match, so podkop gets ${matched.length === 1 ? "this one" : `these ${matched.length}`} and no fallback. Add a country or another protocol for more. If none match after a run, the rule keeps its last list and you get a warning.`
+            : "No server matches now. Widen the filter, or run the probe. If none match after a run, the rule keeps its last list and you get a warning.")) : null,
+        p && p.left_out.length ? h("details", { style: "border-top: 1px solid var(--line-soft)" },
+          h("summary", { style: "padding: 10px 14px; font-size: 13px; font-weight: 500" }, icon("right", 14, { width: 1.6, class: "chev" }),
+            `${plural(p.left_out.length, "server")}${rule.countries.length === 1 ? ` in ${countryName(rule.countries[0])}` : ""} left out, and why`),
+          h("div", { style: "padding: 0 14px 12px" }, p.left_out.map((x) => h("div", { class: "row xs", style: "padding: 4px 0; flex-wrap: nowrap" },
+            h("span", { style: "font-weight: 500; flex: none" }, x.name), h("span", { class: "muted" }, x.reason))))) : null));
+  };
+
+  draw();
+  if (!ui.preview) preview();
+  return box;
+}
+
+// --- global settings ----------------------------------------------------------------------------------------
+
+async function viewGlobal(main, id) {
+  const w = await loadWork(id);
+  w.ui = w.ui || {};
+  const page = h("div", { class: "page" });
+  put(main, page);
+  const defs = S.schema.settings;
+  const headBtn = h("span", { style: "display: contents" });
+  w.drawBar = () => {
+    const n = workChanges(w).length;
+    put(headBtn, n ? h("button", { type: "button", class: "btn primary", disabled: w.base !== w.fp, onclick: () => reviewWork(w) }, `Review and apply, ${n}`) : null);
+  };
+  w.redraw = () => keepFocus(draw);
+
+  const draw = () => {
+    if (!bySection(w.config).has("settings")) {
+      put(page, h("div", { class: "card empty" }, "podkop has no settings section on this router."));
+      return;
+    }
+    const b = binder(w, "settings", defs);
+    const o = sectionsOf(w.config).find((s) => s.name === "settings").options;
+    const proxyRules = rulesOf(w.config).filter((s) => ["proxy", "vpn"].includes((s.options || {}).connection_type)).map((s) => s.name);
+    const card = (title, sub, ...body) => h("section", { class: "card sect", "aria-label": title },
+      h("div", { class: "col" }, h("h2", {}, title), sub ? h("span", {}, sub) : null), body);
+    const row = (opt, label, control, forId) => [h(forId ? "label" : "span", { class: "lbl", for: forId || null }, b.dot(opt), label),
+      h("div", { class: "ctl" }, control, b.was(opt), b.problemEls(opt))];
+    const devices = asList(b.val("source_network_interfaces"));
+    put(page,
+      pageHead("Global settings", "Options for every rule. Changes join the same draft as the rules. Dots mark values that differ from podkop's defaults.", headBtn),
+      w.base !== w.fp ? h("div", { class: "banner bad" }, h("span", { class: "dot bad" }),
+        h("span", { class: "small bad-text grow" }, "podkop's settings changed on the router after this draft was started. Applying it would undo that, so the router refuses it."),
+        h("button", { type: "button", class: "btn ghost", onclick: () => discardWork(w) }, "Discard draft")) : null,
+      h("div", { class: "cards-2" },
+        card("DNS", "How podkop resolves names for routed traffic",
+          h("div", { class: "form-grid" },
+            row("dns_type", "Protocol", segField(b, "dns_type", ["doh", "dot", "udp"], ["DoH", "DoT", "UDP"])),
+            row("dns_server", "DNS server", comboField(b, "dns_server", optionDef("settings", "dns_server").values)),
+            row("bootstrap_dns_server", "Bootstrap server", comboField(b, "bootstrap_dns_server", optionDef("settings", "bootstrap_dns_server").values)),
+            row("dns_rewrite_ttl", "Rewrite TTL", h("div", { class: "unit" }, h("input", { class: "input mid", style: "width: 90px", inputmode: "numeric",
+              "data-k": "dns_rewrite_ttl", value: o.dns_rewrite_ttl ?? "", placeholder: "60", oninput: (e) => b.set("dns_rewrite_ttl", e.target.value.trim()) }),
+            h("span", {}, "seconds"))))),
+        card("Which devices", "Traffic from these networks goes through the rules",
+          h("div", { class: "row" }, b.changed("source_network_interfaces") ? h("span", { class: "dot sm accent" }) : null,
+            [...new Set([...w.ctx.devices.filter((d) => /^br-|^wg|^tun|^lan|^eth/.test(d)), ...devices])].map((d) => h("label", { class: "box-check" },
+              h("input", { type: "checkbox", checked: devices.includes(d), onchange: (e) => b.set("source_network_interfaces",
+                e.target.checked ? [...devices, d] : devices.filter((x) => x !== d), true) }), d))),
+          b.problemEls("source_network_interfaces"),
+          h("div", { class: "stack sep", style: "gap: 10px" },
+            flagField(b, "enable_output_network_interface", "Send through a set output interface", "Off: podkop uses the default route"),
+            b.val("enable_output_network_interface") === "1" ? h("div", { class: "form-grid" }, row("output_network_interface", "Interface",
+              h("select", { class: "input mid mono", onchange: (e) => b.set("output_network_interface", e.target.value, true) },
+                h("option", { value: "" }, "—"), [...new Set([...w.ctx.devices, ...(o.output_network_interface ? [o.output_network_interface] : [])])]
+                  .map((d) => h("option", { value: d, selected: d === o.output_network_interface }, d))))) : null,
+            flagField(b, "enable_badwan_interface_monitoring", "Restart podkop when WAN goes down and up", "Bad WAN monitoring"),
+            b.val("enable_badwan_interface_monitoring") === "1" ? h("div", { class: "form-grid" },
+              row("badwan_monitored_interfaces", "Interfaces", h("div", { class: "row" }, w.ctx.interfaces.map((x) => {
+                const cur = asList(o.badwan_monitored_interfaces);
+                return h("label", { class: "box-check" }, h("input", { type: "checkbox", checked: cur.includes(x),
+                  onchange: (e) => b.set("badwan_monitored_interfaces", e.target.checked ? [...cur, x] : cur.filter((y) => y !== x), true) }), x);
+              }))),
+              row("badwan_reload_delay", "Delay", h("div", { class: "unit" }, h("input", { class: "input mid", style: "width: 100px", inputmode: "numeric",
+                "data-k": "badwan_reload_delay", value: o.badwan_reload_delay ?? "", placeholder: "2000",
+                oninput: (e) => b.set("badwan_reload_delay", e.target.value.trim()) }), h("span", {}, "ms")))) : null)),
+        card("Lists", "Community and remote lists used by the rules",
+          h("div", { class: "form-grid" },
+            row("update_interval", "Update every", segField(b, "update_interval", ["1h", "3h", "12h", "1d", "3d"])),
+            h("span", { class: "lbl" }, b.dot("download_lists_via_proxy"), "Download"),
+            h("div", { class: "ctl", style: "flex-direction: row; align-items: center; flex-wrap: wrap; gap: 8px 12px" },
+              h("label", { class: "check inline" }, h("input", { type: "checkbox", checked: b.val("download_lists_via_proxy") === "1",
+                onchange: (e) => b.set("download_lists_via_proxy", e.target.checked ? "1" : "0", true) }), "through rule"),
+              h("label", { class: "sr", for: "via" }, "Rule to download lists through"),
+              h("select", { id: "via", class: "input sm mono", style: "width: auto", disabled: b.val("download_lists_via_proxy") !== "1",
+                onchange: (e) => b.set("download_lists_via_proxy_section", e.target.value, true) },
+              h("option", { value: "" }, "—"), [...new Set([...proxyRules, ...(o.download_lists_via_proxy_section ? [o.download_lists_via_proxy_section] : [])])]
+                .map((n) => h("option", { value: n, selected: n === o.download_lists_via_proxy_section }, n))),
+              b.problemEls("download_lists_via_proxy_section")))),
+        card("Traffic", "Fixes for sites and devices that misbehave",
+          h("div", { style: "display: grid; grid-template-columns: repeat(auto-fit, minmax(min(190px, 100%), 1fr)); gap: 12px 20px" },
+            flagField(b, "disable_quic", "Disable QUIC"), flagField(b, "enable_utls_fallback", "uTLS fallback"),
+            flagField(b, "exclude_ntp", "Exclude NTP"), flagField(b, "dont_touch_dhcp", "Don't touch DHCP")),
+          h("div", { class: "field sep" }, lbl(b, "routing_excluded_ips", "IPs never routed"),
+            tokenField(b, "routing_excluded_ips", { placeholder: "IP or subnet, Enter" }), b.problemEls("routing_excluded_ips"))),
+        card("sing-box", "Files and log level",
+          h("div", { class: "form-grid" },
+            row("config_path", "Config file", selectField(b, "config_path", optionDef("settings", "config_path").values, { mono: true })),
+            row("cache_path", "Cache file", textField(b, "cache_path", { mono: true })),
+            row("log_level", "Log level", selectField(b, "log_level", optionDef("settings", "log_level").values)))),
+        card("YACD dashboard", "sing-box's own web dashboard on the router",
+          flagField(b, "enable_yacd", "Turn on"),
+          flagField(b, "enable_yacd_wan_access", "Reachable from WAN, with a secret", null, { disabled: b.val("enable_yacd") !== "1" }),
+          b.val("enable_yacd_wan_access") === "1" ? h("div", { class: "form-grid" }, row("yacd_secret_key", "Secret", textField(b, "yacd_secret_key", { mono: true }))) : null,
+          h("p", { class: "xs muted" }, "The Clash API it uses is closed to the LAN by podkop-agent, except for the computers listed when the router was added."))),
+      settingsOther(o, defs));
+    w.drawBar();
+  };
+
+  draw();
+  S.view = { leave: () => { w.drawBar = null; }, onRouter: (r) => { if (r.id === id && r.status && r.status.fingerprint !== w.fp) { w.fp = r.status.fingerprint; draw(); } } };
+}
+
+function settingsOther(o, defs) {
+  const known = new Set([...defs.map((d) => d.name), ...S.schema.internal]);
+  const other = Object.keys(o).filter((k) => !known.has(k));
+  return h("p", { class: "small muted" }, "Options this manager does not know are kept on the router as they are",
+    other.length ? `: ${other.join(", ")}.` : ".");
+}
+
+// --- review and apply ------------------------------------------------------------------------------------
+
+S.jobWatch = new Map();   // version id -> fn(job) for live job updates
+
+// how many server links podkop's parser reads in a config
+const linkCount = (config) => rulesOf(config).filter((s) => (s.options || {}).connection_type === "proxy").reduce((n, s) => {
+  const o = s.options, pt = o.proxy_config_type || "url";
+  return n + (pt === "url" ? (o.proxy_string ? 1 : 0) : pt === "selector" ? asList(o.selector_proxy_links).length
+    : pt === "urltest" ? asList(o.urltest_proxy_links).length + asList(o.urltest_fallback_links).length : 0);
+}, 0);
+
+// the diff, one block per rule in the new order
+function changesBlock(diff, config) {
+  const rules = rulesOf(config).map((s) => s.name);
+  const groups = new Map();
+  for (const d of diff) {
+    const k = d.change === "order" ? "\u0000order" : d.section;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(d);
+  }
+  const keys = [...groups.keys()].sort((a, b) => {
+    const r = (k) => (k === "settings" ? -1 : k === "\u0000order" ? 1e6 : rules.includes(k) ? rules.indexOf(k) : 1e5);
+    return r(a) - r(b);
+  });
+  return h("section", { class: "dchanges", "aria-label": "Changes" }, keys.map((k) => {
+    const items = groups.get(k);
+    if (k === "\u0000order") {
+      return [h("div", { class: "sec" }, h("span", {}, "Rule order"), h("span", { class: "muted" }, "first match wins")),
+        h("div", { class: "rows" }, h("span", {}, "New order"), h("span", { class: "mono xs" }, items[0].new.filter((n) => rules.includes(n)).join(" → ")))];
+    }
+    const added = items.find((d) => d.change === "added"), removed = items.find((d) => d.change === "removed");
+    const pos = rules.indexOf(k) + 1;
+    const head = h("div", { class: "sec" }, h("span", {}, k),
+      added ? h("span", { class: "tag ok" }, "new rule") : removed ? h("span", { class: "tag bad" }, "removed") : null,
+      h("span", { class: "muted" }, added ? `added as rule ${pos}` : removed ? "this rule goes away"
+        : k === "settings" ? `global settings, ${plural(items.length, "setting")}` : `rule ${pos}, ${plural(items.length, "setting")}`));
+    if (removed) return [head];
+    if (added) {
+      const sec = { name: k, options: added.options };
+      const domains = asList(added.options.user_domains);
+      return [head, h("div", { class: "rows" },
+        h("span", {}, "Sends to"), h("span", {}, ruleDest(sec)[1] === "direct" && added.options.connection_type === "exclusion" ? "Direct, not through podkop" : ruleDest(sec)[0]),
+        h("span", {}, "Matches"), domains.length ? chipList(domains, "add") : h("span", {}, ruleMatches(sec)))];
+    }
+    return [head, h("div", { class: "rows" }, changeRows(items, config).map(([, label, val]) => [h("span", {}, label), val]))];
+  }));
+}
+
+const STEP_TEXT = {
+  check: ["Checking the settings on the router", "Checked the settings on the router", "The router refused these settings"],
+  write: ["Saving a backup and writing the new settings", "Saved a backup and wrote the new settings", "Could not write the new settings"],
+  restart: ["Restarting podkop and checking that it runs", "Restarted podkop, it runs", "podkop did not come up"],
+  revert: ["Putting the old settings back", "Put the old settings back", "podkop does not run with the old settings either"],
+};
+
+// steps [key, status (todo, now, done, fail), seconds] from the job's state and when each state began
+function jobSteps(state, marks, now) {
+  const secs = (a, b) => (marks[a] ? Math.round(((marks[b] || now) - marks[a]) / 1000) : null);
+  const s = (key, status, from, to) => ({ key, status, t: status === "todo" ? null : secs(from, to) });
+  switch (state) {
+    case "pending": case "queued": case "checking":
+      return [s("check", "now", "check"), s("write", "todo"), s("restart", "todo")];
+    case "restarting": return [s("check", "done", "check", "restart"), s("write", "done"), s("restart", "now", "restart")];
+    case "reverting": return [s("check", "done", "check", "restart"), s("write", "done"), s("restart", "fail", "restart", "revert"), s("revert", "now", "revert")];
+    case "applied": return [s("check", "done", "check", "restart"), s("write", "done"), s("restart", "done", "restart", "end")];
+    case "saved": return [s("check", "done", "check", "end"), s("write", "done"), { key: "saved", status: "done", t: null }];
+    case "unchanged": return [s("check", "done", "check", "end"), { key: "unchanged", status: "done", t: null }];
+    case "rejected": return [s("check", "fail", "check", "end")];
+    case "reverted": return [s("check", "done", "check", "restart"), s("write", "done"), s("restart", "fail", "restart", "revert"), s("revert", "done", "revert", "end")];
+    case "failed": return marks.revert ? [s("check", "done", "check", "restart"), s("write", "done"), s("restart", "fail", "restart", "revert"), s("revert", "fail", "revert", "end")]
+      : [s("check", "done", "check", "end"), s("write", "fail")];
+    default: return [s("check", "now", "check")];
+  }
+}
+
+function stepRow(st) {
+  const text = st.key === "saved" ? ["", "podkop is stopped, so it was not restarted", ""] : st.key === "unchanged" ? ["", "Nothing to change on the router", ""] : STEP_TEXT[st.key];
+  const label = st.status === "done" ? text[1] : st.status === "fail" ? text[2] : text[0];
+  const ic = st.status === "now" ? spinner() : h("span", { class: `step-icon ${st.status}` },
+    st.status === "done" ? icon("check", 12, { stroke: "#FFFFFF", width: 2.4 }) : st.status === "fail" ? icon("close", 12, { stroke: "#FFFFFF", width: 2.4 }) : null);
+  return h("div", { class: `step ${st.status}` }, h("span", { style: "display: inline-flex; width: 20px; justify-content: center" }, ic),
+    h("span", {}, label), h("span", {}, st.t !== null && st.t !== undefined ? `${st.t} s` : ""));
+}
+
+async function openApply(id, { base, config, note, trigger, done }) {
+  const rt = S.routers[id];
+  let d, versions;
+  try {
+    [d, versions] = await Promise.all([api("POST", `/api/routers/${id}/diff`, { config }),
+      api("GET", `/api/routers/${id}/versions?limit=50`).catch(() => [])]);
+  } catch (e) { toast(e.message, true); return; }
+  if (!d.diff.length) { toast("Nothing to apply: the router already has these settings"); return; }
+  const running = runningVersion(rt, versions);
+  const stale = d.fingerprint !== base;
+  const n = d.diff.length;
+
+  const checks = h("section", { class: "checks wait", "aria-label": "Checks" }, h("span", {}, "Checking on the router…"));
+  const noteInput = h("input", { id: "apply-note", class: "input", value: note || "", placeholder: diffSummary(d.diff) });
+  const steps = h("section", { class: "steps", "aria-label": "Progress", "aria-live": "polite", hidden: true });
+  const result = h("div", { "aria-live": "polite" });
+  const info = h("span", {}, "Will be saved in History");
+  const close = h("button", { type: "button", class: "btn" }, "Close, keep going");
+  const go = h("button", { type: "button", class: "btn primary", disabled: true }, "Apply");
+  let problems = null, finished = false;
+
+  const m = modal({
+    title: `Apply ${plural(n, "change")} to ${rt.name}`,
+    sub: stale ? "podkop's settings changed on the router after this draft was started. Applying it would undo that, so the router will refuse it."
+      : `Compared with what the router runs now${running ? ` (#${running.id})` : ""}. Nobody changed it on the router in the meantime.`,
+    body: [changesBlock(d.diff, config), checks,
+      h("div", { class: "field" }, h("label", { for: "apply-note" }, "Note for history"), noteInput),
+      steps, result,
+      h("div", { class: "assure" }, icon("shield", 18, { stroke: "var(--info)", width: 1.6 }),
+        h("p", {}, `If podkop does not come up, the router puts ${running ? `#${running.id}` : "the current settings"} back by itself within about 30 s. This works even if you close this page or the manager goes offline.`))],
+    foot: [info, h("div", { class: "row" }, close, go)],
+  });
+  close.onclick = () => m.close();
+
+  const showChecks = () => {
+    if (problems === null) return;
+    if (problems.length) {
+      put(checks, h("span", {}, "podkop would not start with these settings"),
+        problems.map((p) => h("span", { class: "bad-text" }, problemText(p))));
+      checks.className = "checks bad";
+    } else {
+      const links = linkCount(config);
+      put(checks, h("span", {}, "Checked on the router, podkop accepts these settings"),
+        links ? h("span", {}, icon("check", 14, { stroke: "var(--ok)", width: 2 }), `${plural(links, "link")} read by podkop's parser`) : null,
+        h("span", {}, icon("check", 14, { stroke: "var(--ok)", width: 2 }), "Required fields set"),
+        h("span", {}, icon("check", 14, { stroke: "var(--ok)", width: 2 }), "Lists and domains valid"));
+      checks.className = "checks";
+    }
+    go.disabled = stale || problems.length > 0 || finished;
+  };
+  api("POST", `/api/routers/${id}/validate`, { config }).then((r) => { problems = r.problems; showChecks(); })
+    .catch((e) => { put(checks, h("span", {}, `Could not check: ${e.message}`)); checks.className = "checks bad"; go.disabled = stale; });
+
+  go.onclick = async () => {
+    go.disabled = true; go.textContent = "Applying"; noteInput.disabled = true;
+    steps.hidden = false;
+    const marks = { check: Date.now() };
+    let state = "pending", timer, vid;
+    const draw = () => put(steps, jobSteps(state, marks, Date.now()).map(stepRow));
+    const onJob = (job) => {
+      if (finished || !job || !job.state || job.state === state) return;
+      state = job.state;
+      const t = Date.now();
+      if (state === "restarting") marks.restart = marks.restart || t;
+      if (state === "reverting") { marks.restart = marks.restart || marks.check; marks.revert = t; }
+      if (FINAL_STATES.includes(state)) end(job, t);
+      draw();
+    };
+    const end = (job, t) => {
+      finished = true; marks.end = t; clearInterval(timer); S.jobWatch.delete(vid);
+      const ok = ["applied", "saved", "unchanged"].includes(job.state);
+      if (job.problems && job.problems.length) { problems = job.problems; showChecks(); }
+      put(result, h("div", { class: `result ${ok ? "ok" : "bad"}` }, ok ? (job.state === "applied" ? "Applied, podkop is running." : job.message)
+        : job.state === "reverted" ? `podkop did not start with these settings, so the router put the old ones back: ${job.reason || job.message}` : job.message));
+      go.textContent = ok ? "Done" : "Applying failed";
+      close.textContent = "Close";
+      go.disabled = !ok;
+      go.onclick = () => m.close();
+      done && done(ok);
+    };
+    draw();
+    timer = setInterval(draw, 1000);
+    try {
+      const r = await api("POST", `/api/routers/${id}/apply`, { base, config, note: noteInput.value.trim() || diffSummary(d.diff), trigger });
+      vid = r.version;
+      put(info, h("span", {}, `Saved as version #${vid} in `, h("a", { href: `#/r/${id}/history`, onclick: () => m.close() }, "History")));
+      S.jobWatch.set(vid, onJob);
+      const poll = async () => {
+        if (finished) return;
+        const v = await api("GET", `/api/versions/${vid}`).catch(() => null);
+        if (v && !["pending", "running"].includes(v.state)) onJob(Object.assign({}, v.details || {}, { state: v.state, message: v.message }));
+        else setTimeout(poll, 3000);
+      };
+      setTimeout(poll, 3000);
+    } catch (e) {
+      clearInterval(timer); finished = true;
+      put(result, h("div", { class: "result bad" }, e.message));
+      go.textContent = "Apply"; close.textContent = "Close";
+    }
+  };
+}
+
+// --- settings (the manager's) -------------------------------------------------------------------------------
+
+const splitIps = (v) => v.split(/[\s,]+/).filter(Boolean).join(" ");
+
+async function viewSettings(main) {
+  const info = S.manager || (S.manager = await api("GET", "/api/manager"));
+  const page = h("div", { class: "page" });
+  put(main, page);
+
+  const rename = (rt) => {
+    const input = h("input", { class: "input", id: "rn", value: rt.name });
+    const save = async () => {
+      try { S.routers[rt.id] = await api("PATCH", `/api/routers/${rt.id}`, { name: input.value.trim() }); m.close(); draw(); drawSide(); }
+      catch (e) { toast(e.message, true); }
+    };
+    input.onkeydown = (e) => { if (e.key === "Enter") save(); };
+    const m = modal({ title: `Rename ${rt.name}`, narrow: true, body: h("div", { class: "field" }, h("label", { for: "rn" }, "Name"), input),
+      foot: [h("span"), h("div", { class: "row" }, h("button", { type: "button", class: "btn", onclick: () => m.close() }, "Cancel"),
+        h("button", { type: "button", class: "btn primary", onclick: save }, "Rename"))] });
+    input.select();
+  };
+
+  const reinstall = (rt) => {
+    const pw = h("input", { class: "input", id: "ri-pw", type: "password", autocomplete: "off" });
+    const allow = h("input", { class: "input mono", id: "ri-allow", placeholder: "e.g. 192.168.1.10, optional" });
+    const out = h("div");
+    const go = h("button", { type: "button", class: "btn primary" }, "Reinstall");
+    go.onclick = async () => {
+      go.disabled = true; put(out, h("p", { class: "small muted" }, "Installing, up to a minute…"));
+      try {
+        await api("POST", `/api/routers/${rt.id}/reinstall`, { password: pw.value, allow_clash: splitIps(allow.value) });
+        pw.value = ""; m.close(); toast(`podkop-agent reinstalled on ${rt.name}`);
+      } catch (e) { put(out, h("p", { class: "problem-box" }, e.message)); go.disabled = false; }
+    };
+    const m = modal({ title: `Reinstall podkop-agent on ${rt.name}`, narrow: true,
+      sub: "Puts this manager's podkop-agent, podkop-probe and key on the router again. podkop's settings stay as they are.",
+      body: [h("div", { class: "field" }, h("label", { for: "ri-pw" }, "Root password"), pw, h("span", { class: "help" }, "Used once, not stored")),
+        h("div", { class: "field" }, h("label", { for: "ri-allow" }, "Computers that may still reach the Clash API"), allow), out],
+      foot: [h("span"), h("div", { class: "row" }, h("button", { type: "button", class: "btn", onclick: () => m.close() }, "Cancel"), go)] });
+  };
+
+  const remove = (rt) => {
+    const also = h("input", { type: "checkbox", checked: true });
+    const go = h("button", { type: "button", class: "btn danger" }, "Remove");
+    go.onclick = async () => {
+      go.disabled = true;
+      try {
+        const r = await api("DELETE", `/api/routers/${rt.id}?uninstall=${also.checked ? 1 : 0}`);
+        delete S.routers[rt.id];
+        m.close(); toast(r.note || `${rt.name} removed`, !!r.note);
+        draw(); drawSide();
+      } catch (e) { toast(e.message, true); go.disabled = false; }
+    };
+    const m = modal({ title: `Remove ${rt.name}?`, narrow: true,
+      body: [h("label", { class: "check" }, also, h("span", { class: "col" }, h("span", {}, "Also remove podkop-agent from the router"),
+        h("span", {}, "Its key, firewall rules and watchdog go too. podkop and its settings stay."))),
+      h("p", { class: "small muted" }, "History, logs and probe settings of this router are deleted from the manager.")],
+      foot: [h("span"), h("div", { class: "row" }, h("button", { type: "button", class: "btn", onclick: () => m.close() }, "Cancel"), go)] });
+  };
+
+  const f = {
+    name: h("input", { class: "input", id: "a-name", placeholder: "e.g. country-house" }),
+    host: h("input", { class: "input mono", id: "a-host", placeholder: "192.168.1.1" }),
+    port: h("input", { class: "input", id: "a-port", value: "22", inputmode: "numeric" }),
+    pass: h("input", { class: "input", id: "a-pass", type: "password", autocomplete: "off" }),
+    allow: h("input", { class: "input mono", id: "a-clash", placeholder: "e.g. 192.168.1.10, optional" }),
+  };
+  const addOut = h("div");
+  const addBtn = h("button", { type: "submit", class: "btn primary lg" }, "Install and add");
+  const addForm = h("form", { class: "card pad", "aria-labelledby": "s-add", onsubmit: async (e) => {
+    e.preventDefault();
+    if (!f.host.value.trim()) { f.host.focus(); return; }
+    addBtn.disabled = true; put(addOut, h("p", { class: "small muted" }, "Installing podkop-agent, up to a minute…"));
+    try {
+      const r = await api("POST", "/api/routers", { name: f.name.value.trim(), host: f.host.value.trim(), port: +f.port.value || 22,
+        password: f.pass.value, allow_clash: splitIps(f.allow.value) });
+      f.pass.value = "";
+      await loadRouters();
+      location.hash = `#/r/${r.id}`;
+    } catch (err) { put(addOut, h("p", { class: "problem-box" }, err.message)); addBtn.disabled = false; }
+  } },
+  h("div", { class: "col" }, h("h2", { id: "s-add" }, "Add router"),
+    h("span", { class: "small muted" }, "Needs podkop and podkop-engine on the router. Installs podkop-agent, podkop-probe, a key that may run only podkop-agent, and two firewall rules.")),
+  h("div", { class: "auto-grid", style: "grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr))" },
+    h("div", { class: "field" }, h("label", { for: "a-name" }, "Name"), f.name),
+    h("div", { class: "field" }, h("label", { for: "a-host" }, "Address"), f.host),
+    h("div", { class: "field" }, h("label", { for: "a-port" }, "SSH port"), f.port),
+    h("div", { class: "field" }, h("label", { for: "a-pass" }, "Root password"), f.pass, h("span", { class: "help" }, "Used once to install, not stored"))),
+  h("div", { class: "field", style: "max-width: 560px" }, h("label", { for: "a-clash" }, "Computers that may still reach the Clash API"), f.allow,
+    h("span", { class: "help" }, "Port 9090 gets closed to the LAN. Add a computer here if you use the YACD dashboard from it.")),
+  addOut, h("div", {}, addBtn));
+
+  const pw = h("input", { class: "input", id: "pw1", type: "password", autocomplete: "new-password" });
+
+  const draw = () => {
+    const list = routerList();
+    put(page,
+      pageHead("Settings", "Routers this manager controls, its SSH key and your login"),
+      h("section", { class: "card clip", "aria-labelledby": "s-routers" },
+        h("div", { class: "card-head" }, h("div", { class: "col" }, h("h2", { id: "s-routers" }, "Routers"),
+          h("span", { class: "small muted" }, list.length ? "Switch between them at the top of the menu" : "None yet: add your first router below"))),
+        list.length ? h("div", { class: "scroll-x" }, h("table", { class: "wide" },
+          h("tr", {}, h("th", { scope: "col" }, "Name"), h("th", { scope: "col" }, "Address"), h("th", { scope: "col" }, "State"),
+            h("th", { scope: "col" }, "podkop-agent"), h("th", { scope: "col", class: "r" }, h("span", { class: "sr" }, "Actions"))),
+          list.map((rt) => {
+            const st = routerState(rt);
+            const label = !rt.online && rt.down_since ? `offline since ${shortWhen(rt.down_since)}` : st.label;
+            return h("tr", {},
+              h("td", { style: "font-weight: 500" }, h("a", { href: `#/r/${rt.id}`, style: "color: inherit" }, rt.name)),
+              h("td", { class: "mono-cell", style: "color: var(--text-2)" }, `${rt.host}:${rt.port}`),
+              h("td", {}, h("span", { class: `pill ${st.cls}` }, label)),
+              h("td", { style: "color: var(--text-2)" }, rt.status ? rt.status.agent.version : "–"),
+              h("td", { class: "r nowrap" }, h("span", { class: "row", style: "gap: 6px; justify-content: flex-end; flex-wrap: nowrap" },
+                h("button", { type: "button", class: "btn xs", onclick: () => rename(rt) }, "Rename"),
+                h("button", { type: "button", class: "btn xs", onclick: () => reinstall(rt) }, "Reinstall agent"),
+                h("button", { type: "button", class: "btn xs danger", onclick: () => remove(rt) }, "Remove"))));
+          }))) : null),
+      addForm,
+      h("div", { style: "display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 16px; align-items: start" },
+        h("section", { class: "card pad", "aria-labelledby": "s-mgr", style: "gap: 12px" },
+          h("div", { class: "col" }, h("h2", { id: "s-mgr" }, "This manager"), h("span", { class: "small muted" }, `podkop-manager ${info.version}`)),
+          h("span", { style: "font-size: 13px; font-weight: 500" }, "SSH key the routers accept"),
+          h("div", { class: "row", style: "align-items: flex-start; flex-wrap: nowrap; padding: 10px 12px; border-radius: 6px; background: var(--chip)" },
+            h("code", { class: "grow", style: "font-size: 12px; line-height: 1.5; color: var(--text-2); word-break: break-all" }, info.public_key),
+            h("button", { type: "button", class: "btn xs", onclick: async () => {
+              try { await navigator.clipboard.writeText(info.public_key); toast("Key copied"); } catch { toast("Select the key and copy it", true); }
+            } }, "Copy")),
+          h("span", { class: "xs muted" }, "Restricted on each router to running podkop-agent: no shell, no port forwarding.")),
+        h("section", { class: "card pad", "aria-labelledby": "s-acc", style: "gap: 12px" },
+          h("h2", { id: "s-acc" }, "Login"),
+          h("div", { class: "field" }, h("label", { for: "pw1" }, "New password"), pw, h("span", { class: "help" }, "At least 8 characters")),
+          h("div", { class: "row" },
+            h("button", { type: "button", class: "btn", onclick: async () => {
+              try { await api("POST", "/api/password", { password: pw.value }); pw.value = ""; toast("Password changed"); }
+              catch (e) { toast(e.message, true); }
+            } }, "Change password"),
+            h("form", { method: "post", action: "/logout", style: "display: contents" }, h("button", { type: "submit", class: "btn ghost" }, "Log out"))))));
+  };
+
+  draw();
+  S.view = { onRouter: () => { if (!page.querySelector(":focus")) draw(); } };
+}
+
+// --- start --------------------------------------------------------------------------------
 
 async function loadRouters() {
+  S.routers = {};
   for (const r of await api("GET", "/api/routers")) S.routers[r.id] = r;
 }
 
 function connect() {
-  const live = document.getElementById("live");
   const es = new EventSource("/api/stream");
-  es.onopen = () => live.classList.add("on");
-  es.onerror = () => live.classList.remove("on");
+  const live = (on) => {
+    if (S.live === on) return;
+    S.live = on; drawSide();
+    S.view && S.view.onLive && S.view.onLive();
+  };
+  es.onopen = () => live(true);
+  es.onerror = () => live(false);
   es.onmessage = (e) => {
     const m = JSON.parse(e.data);
     const v = S.view || {};
-    if (m.type === "router") { S.routers[m.router.id] = m.router; v.onRouter && v.onRouter(m.router); }
-    else if (m.type === "event") { v.onEvent && v.onEvent(m); if (["reverted", "revert_failed", "podkop_down", "recovery_failed"].includes(m.event)) toast(`${S.routers[m.router_id]?.name}: ${eventText(m.event, m.data).textContent}`, true); }
-    else if (m.type === "log") v.onLog && v.onLog(m);
+    if (m.type === "router") {
+      S.routers[m.router.id] = m.router;
+      if (!switchOpen) drawSide();
+      v.onRouter && v.onRouter(m.router);
+    } else if (m.type === "event") {
+      v.onEvent && v.onEvent(m);
+      if (["reverted", "revert_failed", "podkop_down", "recovery_failed"].includes(m.event)) {
+        toast(`${(S.routers[m.router_id] || {}).name}: ${eventText(m.event, m.data)}`, true);
+      }
+    } else if (m.type === "log") v.onLog && v.onLog(m);
     else if (m.type === "probe") v.onProbe && v.onProbe(m);
+    else if (m.type === "job") {
+      const fn = S.jobWatch.get(m.version);
+      if (fn) fn(m.job);
+      v.onJob && v.onJob(m);
+    }
   };
 }
 
 (async () => {
-  await loadRouters();
+  [S.schema] = await Promise.all([api("GET", "/api/schema"), loadRouters()]);
   connect();
   window.addEventListener("hashchange", render);
   render();

@@ -36,10 +36,9 @@ settings stay. Log: `/tmp/podkop-probe.log`. Remove: `podkop-probe --uninstall`.
 
 ## Manage from a server
 
-[podkop-manager](manager/README.md) is a web interface on an Ubuntu server for
-all podkop settings on one or more routers: changes are checked first and
-undone automatically if podkop doesn't start, plus server pinning, the
-nightly probe, live logs and a history of changes.
+[podkop-manager](manager/README.md): a web interface on a Linux server for
+podkop on one or more routers. Every change is checked first and undone if
+podkop doesn't start.
 
 ## Good to know
 
@@ -54,6 +53,7 @@ nightly probe, live logs and a history of changes.
 - "Device limit reached": free a device in your provider's bot.
 - Backup before every change: `/etc/config/podkop.probe-backup.<date>`.
 - `-v` shows every server and why it failed; `-h` lists all options.
+- What changed: [CHANGELOG.md](CHANGELOG.md).
 
 ## Коротко по-русски
 
