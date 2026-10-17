@@ -39,7 +39,9 @@ def check_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(hash_password(password, salt), stored)
 
 
-def create_app(db: DB, hub: Hub, public_key: str) -> FastAPI:
+def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password: str = "") -> FastAPI:
+    """password: the web login; router_password: routers' root password, used
+    when the form leaves it empty. Both come from the environment, not stored."""
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI):
         await hub.start()
@@ -51,6 +53,9 @@ def create_app(db: DB, hub: Hub, public_key: str) -> FastAPI:
     if not secret:
         secret = secrets.token_hex(32)
         db.set_setting("session_secret", secret)
+    password_hash = hash_password(password)
+    # a new password logs everyone out
+    secret += hashlib.sha256(password.encode()).hexdigest()
     app.add_middleware(SessionMiddleware, secret_key=secret, session_cookie="podkop_manager",
                        max_age=14 * 86400, same_site="strict", https_only=False)
 
@@ -87,8 +92,7 @@ def create_app(db: DB, hub: Hub, public_key: str) -> FastAPI:
     @app.post("/login")
     async def login(request: Request):
         form = await request.form()
-        stored = db.get_setting("password_hash")
-        if stored and check_password(str(form.get("password", "")), stored):
+        if check_password(str(form.get("password", "")), password_hash):
             request.session["auth"] = True
             return RedirectResponse("/", status_code=303)
         await asyncio.sleep(1)
@@ -104,15 +108,7 @@ def create_app(db: DB, hub: Hub, public_key: str) -> FastAPI:
 
     @app.get("/api/manager", dependencies=[api])
     async def manager_info():
-        return {"version": __version__, "public_key": public_key}
-
-    @app.post("/api/password", dependencies=[api])
-    async def change_password(body: dict):
-        pw = str(body.get("password", ""))
-        if len(pw) < 8:
-            raise HTTPException(400, "the password needs at least 8 characters")
-        db.set_setting("password_hash", hash_password(pw))
-        return {"ok": True}
+        return {"version": __version__, "public_key": public_key, "router_password": bool(router_password)}
 
     @app.get("/api/schema", dependencies=[api])
     async def schema():
@@ -129,7 +125,7 @@ def create_app(db: DB, hub: Hub, public_key: str) -> FastAPI:
             raise HTTPException(400, "host is required")
         port = int(body.get("port") or 22)
         allow = [x.strip() for x in str(body.get("allow_clash", "")).replace(",", " ").split() if x.strip()]
-        host_key = await install(host, port, str(body.get("password", "")), public_key, hub.src, allow)
+        host_key = await install(host, port, str(body.get("password") or router_password), public_key, hub.src, allow)
         rid = db.add_router(str(body.get("name") or host), host, port, host_key)
         hub.add_router(db.router(rid))
         return {"id": rid}
@@ -138,7 +134,7 @@ def create_app(db: DB, hub: Hub, public_key: str) -> FastAPI:
     async def reinstall(rid: int, body: dict):
         rt = router_or_404(rid)
         allow = [x.strip() for x in str(body.get("allow_clash", "")).replace(",", " ").split() if x.strip()]
-        host_key = await install(rt.row["host"], rt.row["port"], str(body.get("password", "")), public_key,
+        host_key = await install(rt.row["host"], rt.row["port"], str(body.get("password") or router_password), public_key,
                                  hub.src, allow)
         if host_key != rt.row["host_key"]:
             raise HTTPException(400, "the router's host key changed; remove and add the router again")

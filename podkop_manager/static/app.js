@@ -2427,6 +2427,7 @@ const splitIps = (v) => v.split(/[\s,]+/).filter(Boolean).join(" ");
 
 async function viewSettings(main) {
   const info = S.manager || (S.manager = await api("GET", "/api/manager"));
+  const pwHelp = (text) => info.router_password ? "Empty: the one from .env. Used once, not stored" : text;
   const page = h("div", { class: "page" });
   put(main, page);
 
@@ -2457,7 +2458,7 @@ async function viewSettings(main) {
     };
     const m = modal({ title: `Reinstall podkop-agent on ${rt.name}`, narrow: true,
       sub: "Puts this manager's podkop-agent, podkop-probe and key on the router again. podkop's settings stay as they are.",
-      body: [h("div", { class: "field" }, h("label", { for: "ri-pw" }, "Root password"), pw, h("span", { class: "help" }, "Used once, not stored")),
+      body: [h("div", { class: "field" }, h("label", { for: "ri-pw" }, "Root password"), pw, h("span", { class: "help" }, pwHelp("Used once, not stored"))),
         h("div", { class: "field" }, h("label", { for: "ri-allow" }, "Computers that may still reach the Clash API"), allow), out],
       foot: [h("span"), h("div", { class: "row" }, h("button", { type: "button", class: "btn", onclick: () => m.close() }, "Cancel"), go)] });
   };
@@ -2508,12 +2509,10 @@ async function viewSettings(main) {
     h("div", { class: "field" }, h("label", { for: "a-name" }, "Name"), f.name),
     h("div", { class: "field" }, h("label", { for: "a-host" }, "Address"), f.host),
     h("div", { class: "field" }, h("label", { for: "a-port" }, "SSH port"), f.port),
-    h("div", { class: "field" }, h("label", { for: "a-pass" }, "Root password"), f.pass, h("span", { class: "help" }, "Used once to install, not stored"))),
+    h("div", { class: "field" }, h("label", { for: "a-pass" }, "Root password"), f.pass, h("span", { class: "help" }, pwHelp("Used once to install, not stored")))),
   h("div", { class: "field", style: "max-width: 560px" }, h("label", { for: "a-clash" }, "Computers that may still reach the Clash API"), f.allow,
     h("span", { class: "help" }, "Port 9090 gets closed to the LAN. Add a computer here if you use the YACD dashboard from it.")),
   addOut, h("div", {}, addBtn));
-
-  const pw = h("input", { class: "input", id: "pw1", type: "password", autocomplete: "new-password" });
 
   const draw = () => {
     const list = routerList();
@@ -2551,13 +2550,9 @@ async function viewSettings(main) {
           h("span", { class: "xs muted" }, "Restricted on each router to running podkop-agent: no shell, no port forwarding.")),
         h("section", { class: "card pad", "aria-labelledby": "s-acc", style: "gap: 12px" },
           h("h2", { id: "s-acc" }, "Login"),
-          h("div", { class: "field" }, h("label", { for: "pw1" }, "New password"), pw, h("span", { class: "help" }, "At least 8 characters")),
+          h("span", { class: "small muted" }, "The password is PODKOP_MANAGER_PASSWORD in .env. Change it there and restart: everyone is logged out."),
           h("div", { class: "row" },
-            h("button", { type: "button", class: "btn", onclick: async () => {
-              try { await api("POST", "/api/password", { password: pw.value }); pw.value = ""; toast("Password changed"); }
-              catch (e) { toast(e.message, true); }
-            } }, "Change password"),
-            h("form", { method: "post", action: "/logout", style: "display: contents" }, h("button", { type: "submit", class: "btn ghost" }, "Log out"))))));
+            h("form", { method: "post", action: "/logout", style: "display: contents" }, h("button", { type: "submit", class: "btn" }, "Log out"))))));
   };
 
   draw();

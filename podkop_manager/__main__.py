@@ -1,15 +1,17 @@
 """podkop-manager command line:
 
   podkop-manager serve [--listen 0.0.0.0:8080] [--data /var/lib/podkop-manager]
-  podkop-manager set-password [--data DIR]
   podkop-manager public-key [--data DIR]
-  podkop-manager check [--data DIR]       exit 0 when a password is set
+
+Credentials come from the environment (.env with Docker Compose):
+  PODKOP_MANAGER_PASSWORD         the web login, at least 8 characters
+  PODKOP_MANAGER_ROUTER_PASSWORD  routers' root password, used when adding a
+                                  router with the password field left empty
 """
 
 from __future__ import annotations
 
 import argparse
-import getpass
 import logging
 import os
 import sys
@@ -49,27 +51,12 @@ def source_dir() -> Path:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="podkop-manager")
-    p.add_argument("command", choices=["serve", "set-password", "public-key", "check"])
+    p.add_argument("command", choices=["serve", "public-key"])
     p.add_argument("--data", help="data directory (default /var/lib/podkop-manager)")
     p.add_argument("--listen", default=os.environ.get("PODKOP_MANAGER_LISTEN", "0.0.0.0:8080"))
     a = p.parse_args(argv)
     d = data_dir(a.data)
     db = DB(d / "manager.db")
-
-    if a.command == "set-password":
-        from .web import hash_password
-        pw = getpass.getpass("New password: ")
-        if len(pw) < 8 or pw != getpass.getpass("Again: "):
-            print("passwords differ or shorter than 8 characters", file=sys.stderr)
-            return 1
-        db.set_setting("password_hash", hash_password(pw))
-        print("password set")
-        return 0
-
-    if a.command == "check":
-        ok = bool(db.get_setting("password_hash"))
-        print("ok" if ok else "no password set")
-        return 0 if ok else 1
 
     key_path, public_key = ssh_key(d)
     if a.command == "public-key":
@@ -87,13 +74,15 @@ def main(argv: list[str] | None = None) -> int:
     if missing:
         print(f"cannot find {', '.join(missing)} in {src} (set PODKOP_MANAGER_SRC)", file=sys.stderr)
         return 1
-    if not db.get_setting("password_hash"):
-        print("no password yet: run 'podkop-manager set-password' first", file=sys.stderr)
+    password = os.environ.get("PODKOP_MANAGER_PASSWORD", "")
+    if len(password) < 8:
+        print("set PODKOP_MANAGER_PASSWORD (at least 8 characters), e.g. in .env", file=sys.stderr)
         return 1
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("asyncssh").setLevel(logging.WARNING)
     host, _, port = a.listen.rpartition(":")
-    app = create_app(db, Hub(db, key_path, src), public_key)
+    app = create_app(db, Hub(db, key_path, src), public_key, password,
+                     os.environ.get("PODKOP_MANAGER_ROUTER_PASSWORD", ""))
     uvicorn.run(app, host=host or "0.0.0.0", port=int(port), log_level="warning", proxy_headers=False)
     return 0
 

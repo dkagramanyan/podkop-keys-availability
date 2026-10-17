@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from podkop_manager.agent import AgentError
 from podkop_manager.db import DB
 from podkop_manager.hub import Hub
+from podkop_manager import web
 from podkop_manager.web import create_app, hash_password, check_password
 
 
@@ -54,12 +55,12 @@ class FakeHub:
         return self.routers[rid]
 
 
-def client(tmp_path, with_router=False):
+def client(tmp_path, with_router=False, router_password=""):
     db = DB(tmp_path / "m.db")
-    db.set_setting("password_hash", hash_password("secret-pass"))
     if with_router:
         db.add_router("home", "192.168.1.1", 22, "ssh-ed25519 AAAA host")
-    c = TestClient(create_app(db, FakeHub(db if with_router else None), "ssh-ed25519 AAAA test"))
+    c = TestClient(create_app(db, FakeHub(db if with_router else None), "ssh-ed25519 AAAA test",
+                              "secret-pass", router_password))
     c.db = db
     return c
 
@@ -133,14 +134,20 @@ def test_versions_trigger_reason_and_paging(tmp_path):
         assert [v["id"] for v in c.get(f"/api/routers/1/versions?before={v2}").json()] == [v1]
 
 
-def test_change_password(tmp_path):
-    with client(tmp_path) as c:
+def test_router_password_from_env(tmp_path, monkeypatch):
+    used = []
+
+    async def fake_install(host, port, password, *rest):
+        used.append(password)
+        raise AgentError("auth", "wrong root password")
+
+    monkeypatch.setattr(web, "install", fake_install)
+    with client(tmp_path, router_password="env-root-pass") as c:
         c.post("/login", data={"password": "secret-pass"})
-        assert c.post("/api/password", json={"password": "short"}, headers=H).status_code == 400
-        assert c.post("/api/password", json={"password": "new-password-1"}, headers=H).json() == {"ok": True}
-        c.post("/logout", headers=H)
-        r = c.post("/login", data={"password": "new-password-1"}, follow_redirects=False)
-        assert r.headers["location"] == "/"
+        assert c.get("/api/manager").json()["router_password"] is True
+        c.post("/api/routers", json={"host": "192.168.1.1", "password": ""}, headers=H)
+        c.post("/api/routers", json={"host": "192.168.1.1", "password": "typed-pass"}, headers=H)
+    assert used == ["env-root-pass", "typed-pass"]
 
 
 def test_old_database_gets_new_columns(tmp_path):
