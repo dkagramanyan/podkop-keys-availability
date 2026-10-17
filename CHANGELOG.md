@@ -3,6 +3,10 @@
 Versions are podkop-probe's (`probe.sh`); a release also carries
 podkop-agent and podkop-manager.
 
+## 1.14.1 — 2026-10-18
+
+- The web interface's port is `PODKOP_MANAGER_PORT` in `.env` (default 8080).
+
 ## 1.14.0 — 2026-10-18
 
 - Manager 0.4.0: credentials come from `.env`: `PODKOP_MANAGER_PASSWORD`

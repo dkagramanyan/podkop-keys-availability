@@ -27,9 +27,9 @@ cp .env.example .env && chmod 600 .env   # set the passwords in it
 docker compose up -d --build
 ```
 
-Open `http://<server>:8080`. Credentials live only in `.env`: the web
-password, and optionally the routers' root password. After changing it:
-`docker compose up -d`. Update: `git pull && docker compose up -d --build`.
+Open `http://<server>:8080`. Everything you set lives in `.env`: the port,
+the web password, and optionally the routers' root password. After changing
+it: `docker compose up -d`. Update: `git pull && docker compose up -d --build`.
 Data (database, SSH key) is in the `podkop-manager_data` volume. Logs:
 `docker compose logs -f`.
 
@@ -94,7 +94,8 @@ doesn't start with the new lists, the old settings stay. Log:
 ## Коротко по-русски
 
 Веб-интерфейс для podkop на сервере: `git clone`, `cp .env.example .env`,
-впишите пароли в `.env`, `docker compose up -d --build`, откройте `http://<сервер>:8080` и добавьте роутер. Без сервера: выполните
+впишите порт и пароли в `.env`, `docker compose up -d --build`, откройте
+`http://<сервер>:<порт>` и добавьте роутер. Без сервера: выполните
 команду из **podkop-probe without the manager** на роутере, вставьте ключи,
 Enter — лучшие серверы попадут в podkop (`main`, `youtube` и по 5 резервных).
 Каждую ночь: **Система → Планировщик**, строка `30 4 * * * podkop-probe --cron`.
