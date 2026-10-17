@@ -12,7 +12,7 @@
 # --src DIR      take podkop-agent, podkop-agent.init and probe.sh from DIR
 #                instead of the latest release
 
-REPO_URL="https://github.com/dkagramanyan/podkop-keys-availability"
+REPO_URL="https://github.com/dkagramanyan/podkop-manager"
 RELEASE="$REPO_URL/releases/latest/download"
 KEYS=/etc/dropbear/authorized_keys
 MARK=podkop-agent

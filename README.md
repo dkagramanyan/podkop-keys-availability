@@ -1,51 +1,79 @@
-# podkop-probe
+# podkop-manager
 
-Tests every server from your VPN subscriptions ("keys") on your OpenWrt
-router and puts the best into [podkop](https://github.com/itdoginfo/podkop):
-10 fastest servers into section `main`, 10 fastest where YouTube sees Russia
-(no ads) into section `youtube`, each with 5 fallback servers.
-Needs podkop and [podkop-engine](https://github.com/FiyeroT/podkop-engine).
+A web interface on a Linux server for [podkop](https://github.com/itdoginfo/podkop)
+on one or more OpenWrt routers: rules and settings, servers, a nightly test of
+your VPN subscriptions ("keys"), logs and a history of every change. Needs
+podkop and [podkop-engine](https://github.com/FiyeroT/podkop-engine) on the
+router.
 
-## Run
+```
+server: podkop-manager ── SSH, a key that may run only podkop-agent ──▶ router: podkop-agent
+  web UI, schedule, history                                            checks, applies, undoes,
+                                                                       watchdog, pins, probe
+```
 
-On the router:
+Every change is checked before podkop is touched. If podkop doesn't come up
+with it, the router puts the old settings back within about 30 s, even when
+the manager is offline.
+
+## Install on the server
+
+Needs Docker with the compose plugin.
 
 ```sh
-sh <(wget -O - https://github.com/dkagramanyan/podkop-keys-availability/releases/latest/download/probe.sh)
+git clone https://github.com/dkagramanyan/podkop-manager
+cd podkop-manager
+docker compose build
+docker compose run --rm podkop-manager set-password
+docker compose up -d
+```
+
+Open `http://<server>:8080`. Update: `git pull && docker compose up -d --build`.
+Data (database, SSH key) is in the `podkop-manager_data` volume. Logs:
+`docker compose logs -f`.
+
+## Add a router
+
+**Add router** → address, root password (used once, not stored). It installs
+podkop-agent with a watchdog, podkop-probe, the manager's key (allowed to run
+only podkop-agent) and firewall rules that close podkop's Clash API (port
+9090) to the LAN, except the computers you list. **Settings → Remove** undoes
+all of it.
+
+## Good to know
+
+- Changes collect in a draft until **Review and apply**.
+- A rule can take servers **from your subscriptions** by exit country,
+  protocol, exit IP or name; they are refreshed after every probe run.
+- Nightly probe: **Servers probe** → time and "Apply the nightly result by itself".
+- To stop podkop, use **Stop**: otherwise the watchdog starts it again within
+  about 30 s (**Disable** in LuCI turns that off).
+
+## podkop-probe without the manager
+
+Tests every server of your keys on the router and puts the best into podkop:
+10 fastest into section `main`, 10 fastest where YouTube sees Russia (no ads)
+into section `youtube`, each with 5 fallback servers. On the router:
+
+```sh
+sh <(wget -O - https://github.com/dkagramanyan/podkop-manager/releases/latest/download/probe.sh)
 ```
 
 1. **Enter**, paste your keys (one per line), then an empty line.
 2. **Enter** for "Europe only". Wait 2–7 minutes.
-3. Tables: `*` = main, `y` = YouTube, `f` = fallback.
-   **Enter** puts both lists into podkop and restarts it
-   (`1` only main, `2` only YouTube, `3` other sections, `n` nothing).
-4. "Repeat this every night?" **Enter** installs `podkop-probe` and saves
-   your keys. Add `--install` to the command above to install without testing.
+3. Tables: `*` = main, `y` = YouTube, `f` = fallback. **Enter** puts both
+   lists into podkop and restarts it (`1` only main, `2` only YouTube,
+   `3` other sections, `n` nothing).
+4. "Repeat this every night?" **Enter** installs `podkop-probe` with your
+   keys. Then in LuCI → **System → Scheduled Tasks** add
+   `30 4 * * * podkop-probe --cron`.
 
-## Every night
-
-LuCI → **System → Scheduled Tasks**, add and **Save**:
-
-```
-30 4 * * * podkop-probe --cron
-```
-
-Each night it updates itself, tests the saved keys and updates podkop. If
-nothing works, or podkop does not start with the new lists, your old
-settings stay. Log: `/tmp/podkop-probe.log`. Remove: `podkop-probe --uninstall`.
-
-## Manage from a server
-
-[podkop-manager](manager/README.md): a web interface on a Linux server for
-podkop on one or more routers. Every change is checked first and undone if
-podkop doesn't start.
-
-## Good to know
+Each night it updates itself, tests the keys and updates podkop; if podkop
+doesn't start with the new lists, the old settings stay. Log:
+`/tmp/podkop-probe.log`. Remove: `podkop-probe --uninstall`.
 
 - Never picked: ping 700 ms or more, or 40 Mbit/s or less
   (`--max-ping`, `--min-speed`).
-- The `youtube` section is created above `main` with podkop's YouTube list:
-  the first matching section wins.
 - Servers are built by podkop itself: vless, trojan, ss, hysteria2 and socks
   over tcp, ws, grpc or xhttp. Others (vmess, ...) are skipped.
 - "Europe only" checks the name, the server IP and the exit IP, so relays
@@ -53,14 +81,20 @@ podkop doesn't start.
 - "Device limit reached": free a device in your provider's bot.
 - Backup before every change: `/etc/config/podkop.probe-backup.<date>`.
 - `-v` shows every server and why it failed; `-h` lists all options.
-- What changed: [CHANGELOG.md](CHANGELOG.md).
+
+## Layout
+
+- `podkop_manager/`: the server (Python, FastAPI) and its web interface
+- `router/`: files installed on the router: `podkop-agent`, its init script,
+  `install.sh`, `probe.sh`
+- `tools/sub-check.sh`: what a subscription returns to each client app
+- [CHANGELOG.md](CHANGELOG.md)
 
 ## Коротко по-русски
 
-Выполните команду из **Run** на роутере: Enter, вставьте ключи, пустая
-строка, Enter («только Европа»), через несколько минут Enter — серверы
-попадут в podkop (`main`, `youtube` и по 5 резервных). На «Repeat this every
-night?» Enter. Каждую ночь: **Система → Планировщик**, строка
-`30 4 * * * podkop-probe --cron`. Не берутся серверы с пингом от 700 мс или
-скоростью до 40 Мбит/с. Лог: `/tmp/podkop-probe.log`. Веб-интерфейс для
-управления podkop с сервера: [podkop-manager](manager/README.md).
+Веб-интерфейс для podkop на сервере: `git clone`, затем `docker compose build`,
+`docker compose run --rm podkop-manager set-password`, `docker compose up -d`,
+откройте `http://<сервер>:8080` и добавьте роутер. Без сервера: выполните
+команду из **podkop-probe without the manager** на роутере, вставьте ключи,
+Enter — лучшие серверы попадут в podkop (`main`, `youtube` и по 5 резервных).
+Каждую ночь: **Система → Планировщик**, строка `30 4 * * * podkop-probe --cron`.

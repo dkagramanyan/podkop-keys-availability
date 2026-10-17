@@ -1,0 +1,14 @@
+services:
+  podkop-manager:
+    build: .
+    image: podkop-manager
+    # no Docker bridge: the routers see this server's own IP, port 8080 is the server's
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      PODKOP_MANAGER_LISTEN: 0.0.0.0:8080
+    volumes:
+      - data:/data
+
+volumes:
+  data:
