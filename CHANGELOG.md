@@ -3,6 +3,13 @@
 Versions are podkop-probe's (`probe.sh`); a release also carries
 podkop-agent and podkop-manager.
 
+## 1.14.0 — 2026-10-18
+
+- Manager 0.4.0: credentials come from `.env`: `PODKOP_MANAGER_PASSWORD`
+  (web login) and optionally `PODKOP_MANAGER_ROUTER_PASSWORD` (used when the
+  root password field is left empty). `set-password` and the password change
+  in Settings are gone; a new password logs everyone out.
+
 ## 1.13.0 — 2026-10-18
 
 - The repository is now `podkop-manager` (old links redirect).
