@@ -34,6 +34,13 @@ Each night it updates itself, tests the saved keys and updates podkop. If
 nothing works, or podkop does not start with the new lists, your old
 settings stay. Log: `/tmp/podkop-probe.log`. Remove: `podkop-probe --uninstall`.
 
+## Manage from a server
+
+[podkop-manager](manager/README.md) is a web interface on an Ubuntu server for
+all podkop settings on one or more routers: changes are checked first and
+undone automatically if podkop doesn't start, plus server pinning, the
+nightly probe, live logs and a history of changes.
+
 ## Good to know
 
 - Never picked: ping 700 ms or more, or 40 Mbit/s or less
@@ -55,4 +62,5 @@ settings stay. Log: `/tmp/podkop-probe.log`. Remove: `podkop-probe --uninstall`.
 попадут в podkop (`main`, `youtube` и по 5 резервных). На «Repeat this every
 night?» Enter. Каждую ночь: **Система → Планировщик**, строка
 `30 4 * * * podkop-probe --cron`. Не берутся серверы с пингом от 700 мс или
-скоростью до 40 Мбит/с. Лог: `/tmp/podkop-probe.log`.
+скоростью до 40 Мбит/с. Лог: `/tmp/podkop-probe.log`. Веб-интерфейс для
+управления podkop с сервера: [podkop-manager](manager/README.md).

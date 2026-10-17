@@ -1,0 +1,24 @@
+[Unit]
+Description=podkop-manager: manage podkop on OpenWrt routers
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=podkop-manager
+Group=podkop-manager
+Environment=PODKOP_MANAGER_DATA=/var/lib/podkop-manager
+Environment=PODKOP_MANAGER_LISTEN=0.0.0.0:8080
+Environment=PODKOP_MANAGER_SRC=/opt/podkop-manager/src
+ExecStart=/opt/podkop-manager/venv/bin/podkop-manager serve
+Restart=always
+RestartSec=5
+StateDirectory=podkop-manager
+StateDirectoryMode=0700
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -12,7 +12,7 @@
 #
 # https://github.com/dkagramanyan/podkop-keys-availability
 
-VERSION="1.10.1"
+VERSION="1.11.0"
 REPO_URL="https://github.com/dkagramanyan/podkop-keys-availability"
 RELEASE_URL="$REPO_URL/releases/latest/download/probe.sh"
 BIN=/usr/bin/podkop-probe            # installed copy, used by the nightly run

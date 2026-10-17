@@ -1,6 +1,7 @@
 name: release
 
-# Publishes probe.sh as a GitHub release asset:
+# Publishes probe.sh and podkop-agent's files (podkop-agent, podkop-agent.init,
+# install.sh) as GitHub release assets:
 #  - automatically on every push to main that changes probe.sh, when the
 #    VERSION inside it has no release yet (so merging a version bump = release)
 #  - on a pushed v* tag
@@ -9,7 +10,7 @@ name: release
 on:
   push:
     branches: [main]
-    paths: [probe.sh]
+    paths: [probe.sh, "agent/**"]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
@@ -27,7 +28,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Lint
-        run: shellcheck -s dash probe.sh
+        run: shellcheck -s dash probe.sh agent/podkop-agent agent/podkop-agent.init agent/install.sh
 
       - name: Resolve tag
         id: tag
@@ -44,14 +45,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
+          ASSETS: probe.sh agent/podkop-agent agent/podkop-agent.init agent/install.sh
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
             if [ "${{ github.event_name }}" = push ] && [ "${{ github.ref_type }}" = branch ]; then
               echo "release $TAG already exists; bump VERSION in probe.sh to publish a new one"
               exit 0
             fi
-            gh release upload "$TAG" probe.sh --clobber
+            gh release upload "$TAG" $ASSETS --clobber
           else
-            gh release create "$TAG" probe.sh --target "$GITHUB_SHA" \
+            gh release create "$TAG" $ASSETS --target "$GITHUB_SHA" \
               --title "podkop-probe $TAG" --generate-notes
           fi
