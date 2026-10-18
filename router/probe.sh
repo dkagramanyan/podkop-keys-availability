@@ -12,7 +12,7 @@
 #
 # https://github.com/dkagramanyan/podkop-manager
 
-VERSION="1.20.0"
+VERSION="1.21.0"
 REPO_URL="https://github.com/dkagramanyan/podkop-manager"
 RELEASE_URL="$REPO_URL/releases/latest/download/probe.sh"
 BIN=/usr/bin/podkop-probe            # installed copy, used by the nightly run
@@ -30,14 +30,14 @@ PODKOP_LIB=/usr/lib/podkop
 set -u
 export LC_ALL=C
 
-N=40; C=4; J=""; T=8
+N=20; C=4; J=""; T=8
 URL="https://www.gstatic.com/generate_204"
-BASEPORT=39000
+BASEPORT=20000                       # local ports for the test: below the ones Linux gives outgoing connections (32768-60999)
 FILE=""; SUBS=""; CONFIG=""; CSV=""
 VERBOSE=0; ASSUME_YES=0; COLOR=auto; SOURCE=""
 TOP=10; APPLY=ask; SECTION=main
 FALLBACK=5                           # servers after the top ones: podkop's fallback links
-SPEED=1; SPEED_URL=""; SPEED_T=8; SPEED_J=""; SPEED_J_USER=""; ENTRY_CHECK=1; FIX_FP=0
+SPEED=1; SPEED_URL=""; SPEED_T=5; SPEED_J=""; SPEED_J_USER=""; ENTRY_CHECK=1; FIX_FP=0
 # direct download used to measure the router's own line (not Cloudflare,
 # which some providers block without a VPN)
 LINE_URL="https://fsn1-speed.hetzner.com/100MB.bin"
@@ -108,8 +108,9 @@ Sources:
 Test:
   -n N              requests per node               (default $N)
   -c N              requests in flight per node     (default $C)
-  -j N              nodes tested at the same time   (default 6, fewer if
-                    RAM is short; speed tests use --speed-jobs)
+  -j N              nodes tested at the same time   (default: one per CPU
+                    core; more makes pings look slower; speed tests use
+                    --speed-jobs)
   -t SEC            timeout per request, seconds    (default $T)
   -u URL            target URL                      (default $URL)
   -q                quick run:    -n 12, 4 s speed test
@@ -301,6 +302,8 @@ b64d() {
 }
 
 fetch() {
+  # only web addresses: anything else could be taken for a curl option or a file
+  case "$1" in http://*|https://*) ;; *) echo "not an http(s) address: $1" >&2; return 1 ;; esac
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL --max-time 30 -A "$UA" "$1"
   else
@@ -387,6 +390,7 @@ ROUTER_MODEL=$( { tr -d '\n' < /tmp/sysinfo/model; } 2>/dev/null)
 # sub_fetch <url> <user-agent> <out>: download the way the client app would.
 # Panels with a device limit want a stable x-hwid; the router gets one.
 sub_fetch() {
+  case "$1" in http://*|https://*) ;; *) echo "not an http(s) address" > "$3"; return 1 ;; esac
   if [ -z "$HWID" ]; then
     HWID=$( { cat /sys/class/net/br-lan/address /sys/class/net/eth0/address 2>/dev/null
               cat /proc/sys/kernel/hostname 2>/dev/null; } | md5sum 2>/dev/null | cut -c 1-16)
@@ -774,40 +778,129 @@ entry_countries() {
 
 # --- per-node worker ---------------------------------------------------------
 
-port_busy() { grep -q ":$(printf '%04X' "$1") 00000000:0000 0A" /proc/net/tcp 2>/dev/null; }
+# port_busy <port>: some socket has it as its local port (listening, or an
+# open or closing connection: either stops sing-box from listening on it), or
+# sing-box failed to listen on it in this run
+port_busy() {
+  grep -qx "$1" "$WORK/ports.bad" 2>/dev/null && return 0
+  awk -v p=":$(printf '%04X' "$1")" 'substr($2, length($2) - 4) == p { f = 1; exit } END { exit !f }' \
+    /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
 
-# sb_start <idx>: run sing-box for node idx on a free local port.
-# Sets _pid and _port; fails if sing-box did not come up.
-sb_start() {
-  _sd="$WORK/n/$1"; _port=$((BASEPORT + $1)); _try=0
+# One sing-box runs every node: node n is outbound n-<n> behind its own local
+# port (inbound in-<n>). Starting it once instead of once per node saves the
+# start-up of each node and ~40 MB of RAM per node tested at the same time.
+SB_PID=""
+
+# sb_config: the config for every node with a port in $WORK/ports
+sb_config() {
+  printf '{"log":{"level":"error"},"dns":{"servers":[{"type":"local","tag":"local"}]},"inbounds":['
+  awk -F "$TAB" '{ printf "%s{\"type\":\"mixed\",\"tag\":\"in-%s\",\"listen\":\"127.0.0.1\",\"listen_port\":%s}", (NR > 1 ? "," : ""), $1, $2 }' "$WORK/ports"
+  printf '],"outbounds":['
+  _bsep=""
+  while IFS="$TAB" read -r _bn _bpp; do
+    printf '%s' "$_bsep"; jq -c --arg t "n-$_bn" '.tag = $t' "$WORK/n/$_bn/ob.json"; _bsep=","
+  done < "$WORK/ports"
+  printf '%s{"type":"direct","tag":"direct"}],"route":{"rules":[' "$_bsep"
+  awk -F "$TAB" '{ printf "%s{\"inbound\":[\"in-%s\"],\"outbound\":\"n-%s\"}", (NR > 1 ? "," : ""), $1, $1 }' "$WORK/ports"
+  printf '],"final":"n-%s","default_domain_resolver":"local"}}\n' "$(head -n 1 "$WORK/ports" | cut -f 1)"
+}
+
+# sb_all_start: start that sing-box. A node it refuses gets <dir>/nostart
+# with sing-box's message, and it starts again without that node. Fails
+# when no node is left or sing-box does not come up.
+sb_all_start() {
+  _btry=0
   while :; do
-    while port_busy "$_port"; do _port=$((_port + 500)); done
-    printf '{"log":{"level":"error"},"dns":{"servers":[{"type":"local","tag":"local"}]},"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":%s}],"outbounds":[%s,{"type":"direct","tag":"direct"}],"route":{"final":"node","default_domain_resolver":"local"}}\n' \
-      "$_port" "$(cat "$_sd/ob.json")" > "$_sd/config.json"
-    sing-box run -c "$_sd/config.json" > "$_sd/sb.log" 2>&1 &
-    _pid=$!; echo "$_pid" > "$WORK/pids/$1"
-    _sk=0
-    while :; do
-      if ! kill -0 "$_pid" 2>/dev/null; then
-        # port taken between our check and sing-box's bind (another run?)
-        _try=$((_try + 1))
-        grep -q 'address already in use' "$_sd/sb.log" && [ "$_try" -lt 4 ] && break
-        return 1
-      fi
-      port_busy "$_port" && return 0
-      _sk=$((_sk + 1)); [ "$_sk" -ge "$WAIT_TICKS" ] && return 1
+    : > "$WORK/ports"
+    _bi=0; _bp=$BASEPORT
+    while [ "$_bi" -lt "$COUNT" ]; do
+      _bi=$((_bi + 1)); _bd="$WORK/n/$_bi"; rm -f "$_bd/port"
+      { [ -f "$_bd/ob.json" ] && [ ! -f "$_bd/skip" ] && [ ! -f "$_bd/nostart" ]; } || continue
+      while port_busy "$_bp"; do _bp=$((_bp + 1)); done
+      printf '%s\t%s\n' "$_bi" "$_bp" >> "$WORK/ports"
+      _bp=$((_bp + 1))
+    done
+    [ -s "$WORK/ports" ] || return 1
+    sb_config > "$WORK/sb.json"
+    # started from a subshell, so the "wait" for the test jobs doesn't wait for it
+    ( sing-box run -c "$WORK/sb.json" > "$WORK/sb.log" 2>&1 & echo $! > "$WORK/pids/sing-box" )
+    SB_PID=$(cat "$WORK/pids/sing-box")
+    _blast=$(tail -n 1 "$WORK/ports" | cut -f 2); _bsk=0
+    # inbounds open in order: the last port listening means all are
+    while kill -0 "$SB_PID" 2>/dev/null && ! port_busy "$_blast"; do
+      _bsk=$((_bsk + 1)); [ "$_bsk" -ge "$WAIT_TICKS" ] && break
       sleep "$NAP"
     done
-    _port=$((_port + 500))
+    if kill -0 "$SB_PID" 2>/dev/null && port_busy "$_blast"; then
+      while IFS="$TAB" read -r _bn _bpp; do echo "$_bpp" > "$WORK/n/$_bn/port"; done < "$WORK/ports"
+      return 0
+    fi
+    sb_kill
+    _btry=$((_btry + 1)); [ "$_btry" -lt 30 ] || return 1
+    # "outbounds[3]": the 4th node in the config; a port taken meanwhile: again
+    _bk=$(grep -o 'outbounds\{0,1\}\[[0-9]*\]' "$WORK/sb.log" | head -n 1 | tr -dc '0-9')
+    if [ -n "$_bk" ]; then
+      _bn=$(sed -n "$((_bk + 1))p" "$WORK/ports" | cut -f 1)
+      [ -n "$_bn" ] || return 1
+      sed -n 's/^.*FATAL[^ ]* *//p' "$WORK/sb.log" | head -n 1 | sed 's/^/sing-box: /' > "$WORK/n/$_bn/nostart"
+      [ -s "$WORK/n/$_bn/nostart" ] || echo "sing-box did not start it" > "$WORK/n/$_bn/nostart"
+    elif grep -q 'address already in use' "$WORK/sb.log"; then
+      # taken since we looked (by a connection): never that one again
+      sed -n 's/.*listen tcp [0-9.]*:\([0-9]*\): bind: address already in use.*/\1/p' "$WORK/sb.log" >> "$WORK/ports.bad"
+    else
+      sb_find_bad || return 1
+    fi
   done
 }
 
-sb_stop() { kill "$_pid" 2>/dev/null; rm -f "$WORK/pids/$1"; }
+# sb_kill: stop the shared sing-box and wait until it is gone
+sb_kill() {
+  [ -n "$SB_PID" ] || return 0
+  kill "$SB_PID" 2>/dev/null
+  _bw=0; while kill -0 "$SB_PID" 2>/dev/null && [ "$_bw" -lt 25 ]; do sleep "$NAP"; _bw=$((_bw + 1)); done
+  kill -9 "$SB_PID" 2>/dev/null; rm -f "$WORK/pids/sing-box"; SB_PID=""
+}
+
+# sb_find_bad: sing-box did not say which node it refused: check them one
+# by one; fails when every node passes the check
+sb_find_bad() {
+  _bad=0
+  while IFS="$TAB" read -r _bn _bpp; do
+    printf '{"log":{"disabled":true},"outbounds":[%s]}\n' "$(cat "$WORK/n/$_bn/ob.json")" > "$WORK/chk.json"
+    if ! _bm=$(sing-box check -c "$WORK/chk.json" 2>&1); then
+      printf 'sing-box: %s\n' "$(printf '%s' "$_bm" | tail -n 1)" > "$WORK/n/$_bn/nostart"; _bad=1
+    fi
+  done < "$WORK/ports"
+  rm -f "$WORK/chk.json"
+  [ "$_bad" = 1 ]
+}
+
+# sb_alive: the shared sing-box still runs; if it died (a node crashed it,
+# or memory ran out), start it again
+# ($WORK/sb.restarts: "<last seen running> <found stopped>" in seconds)
+SB_SEEN=0
+sb_alive() {
+  [ -n "$SB_PID" ] || return 1
+  if kill -0 "$SB_PID" 2>/dev/null; then SB_SEEN=$(date +%s); return 0; fi
+  echo "$SB_SEEN $(date +%s)" >> "$WORK/sb.restarts"
+  sb_all_start
+}
+
+# sb_start <idx>: the local port of node idx -> _port; fails if sing-box
+# refused the node
+sb_start() { _port=$(cat "$WORK/n/$1/port" 2>/dev/null); [ -n "$_port" ]; }
+
+sb_stop() { :; }
 
 # speed_fetch <url>: download <url> through the node (again, if it ends
 # early) and watch curl's progress every second. Stops when the running
-# average has settled (changed <3% twice in a row, after 3 s) or after
-# SPEED_T seconds -> Mbit/s on stdout; on failure the reason and exit 1.
+# average has settled (changed <3% twice in a row, after 2 s), when the
+# outcome is clear anyway (after 2 s 85% of the line's own speed and above
+# MIN_SPEED: the node can't show more and passes; after 3 s under a third of
+# MIN_SPEED: it is out), or after SPEED_T seconds -> Mbit/s on stdout; on
+# failure the reason and exit 1.
+LINE_MBIT=0
 SPEED_AWK='
 function b(x, m) { m = 1; if (x ~ /k$/) m = 1024; else if (x ~ /M$/) m = 1048576; else if (x ~ /G$/) m = 1073741824
   sub(/[kMG]$/, "", x); return x * m }
@@ -824,11 +917,13 @@ speed_fetch() {
     while sleep 1; kill -0 "$_cp" 2>/dev/null; do
       set -- $(tr '\r' '\n' < "$_sd/sp.prog" | awk "$SPEED_AWK")
       # -> "stop B T avg stab prev" using this chunk's bytes so far and avg speed
-      set -- $(awk -v B="$_B" -v T="$_T" -v rb="${1:-0}" -v ra="${2:-0}" -v p="$_prev" -v st="$_stab" -v lim="$SPEED_T" 'BEGIN {
+      set -- $(awk -v B="$_B" -v T="$_T" -v rb="${1:-0}" -v ra="${2:-0}" -v p="$_prev" -v st="$_stab" -v lim="$SPEED_T" \
+          -v line="$LINE_MBIT" -v mins="$MIN_SPEED" 'BEGIN {
         if (ra <= 0) { print 0, B, T, 0, 0, p; exit }
-        t = T + rb / ra; avg = (B + rb) / t
-        st = (t >= 3 && p > 0 && (avg > p ? avg - p : p - avg) < 0.03 * avg) ? st + 1 : 0
-        printf "%d %.0f %.3f %.0f %d %.0f\n", (st >= 2 || t >= lim - 0.3), B + rb, t, avg, st, avg }')
+        t = T + rb / ra; avg = (B + rb) / t; mb = avg * 8 / 1000000
+        st = (t >= 2 && p > 0 && (avg > p ? avg - p : p - avg) < 0.03 * avg) ? st + 1 : 0
+        clear = (t >= 2 && line > 0 && mb >= 0.85 * line && mb > mins) || (t >= 3 && mb < mins / 3)
+        printf "%d %.0f %.3f %.0f %d %.0f\n", (st >= 2 || clear || t >= lim - 0.3), B + rb, t, avg, st, avg }')
       _stab=$5; _prev=$6
       if [ "$1" = 1 ]; then
         kill "$_cp" 2>/dev/null; wait "$_cp" 2>/dev/null
@@ -843,10 +938,12 @@ speed_fetch() {
       break
     fi
     # a whole chunk arrived: add it and check the running average again
-    set -- $(awk -v B="$_B" -v T="$_T" -v b="$2" -v t="${3:-0}" -v p="$_prev" -v st="$_stab" -v lim="$SPEED_T" 'BEGIN {
-      B += b; T += t; avg = (T > 0) ? B / T : 0
-      st = (T >= 3 && p > 0 && (avg > p ? avg - p : p - avg) < 0.03 * avg) ? st + 1 : 0
-      printf "%d %.0f %.3f %d %.0f\n", (st >= 2 || T >= lim - 0.3), B, T, st, avg }')
+    set -- $(awk -v B="$_B" -v T="$_T" -v b="$2" -v t="${3:-0}" -v p="$_prev" -v st="$_stab" -v lim="$SPEED_T" \
+        -v line="$LINE_MBIT" -v mins="$MIN_SPEED" 'BEGIN {
+      B += b; T += t; avg = (T > 0) ? B / T : 0; mb = avg * 8 / 1000000
+      st = (T >= 2 && p > 0 && (avg > p ? avg - p : p - avg) < 0.03 * avg) ? st + 1 : 0
+      clear = (T >= 2 && line > 0 && mb >= 0.85 * line && mb > mins) || (T >= 3 && mb < mins / 3)
+      printf "%d %.0f %.3f %d %.0f\n", (st >= 2 || clear || T >= lim - 0.3), B, T, st, avg }')
     _B=$2; _T=$3; _stab=$4; _prev=$5
     [ "$1" = 1 ] && break
   done
@@ -909,6 +1006,7 @@ same_key() {
 
 run_node() {
   _i=$1; _d="$WORK/n/$_i"
+  date +%s > "$_d/t0"
   _st=ok; _ip=""; _cc=""
   if [ -f "$_d/skip" ]; then
     _st=skip
@@ -958,6 +1056,7 @@ run_node() {
     }')
   _sp=$(cat "$_d/speed" 2>/dev/null); [ -n "$_sp" ] || _sp=-
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "${_ip:--}" "${_cc:--}" "$_sp" "$(cat "$_d/name")" > "$_d/result"
+  date +%s > "$_d/t1"
   print_progress "$_i" "$_d/result"
 }
 
@@ -1200,13 +1299,16 @@ nightly_setup() {
 # self_update: replace $BIN with the latest release if it differs
 self_update() {
   [ -f "$BIN" ] || return 1
-  if ! fetch "$RELEASE_URL" > "$BIN.new" 2>/dev/null || ! script_ok "$BIN.new"; then rm -f "$BIN.new"; return 1; fi
-  _nv=$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$BIN.new" 2>/dev/null)
+  # downloaded to /tmp (RAM): $BIN's flash is written only for a newer version
+  _dl="/tmp/podkop-probe.update.$$"
+  if ! fetch "$RELEASE_URL" > "$_dl" 2>/dev/null || ! script_ok "$_dl"; then rm -f "$_dl"; return 1; fi
+  _nv=$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$_dl" 2>/dev/null)
   if [ -n "$_nv" ] && awk -v a="$_nv" -v b="$VERSION" 'BEGIN { n = split(a, x, "."); split(b, y, ".")
-       for (i = 1; i <= n; i++) if (x[i] + 0 != y[i] + 0) exit !(x[i] + 0 > y[i] + 0); exit 1 }'; then
-    chmod +x "$BIN.new" && mv "$BIN.new" "$BIN" && { info "updated $VERSION -> $_nv"; return 0; }
+       for (i = 1; i <= n; i++) if (x[i] + 0 != y[i] + 0) exit !(x[i] + 0 > y[i] + 0); exit 1 }' &&
+     cp "$_dl" "$BIN.new" && chmod +x "$BIN.new" && mv "$BIN.new" "$BIN"; then
+    rm -f "$_dl"; info "updated $VERSION -> $_nv"; return 0
   fi
-  rm -f "$BIN.new"; return 1
+  rm -f "$_dl" "$BIN.new"; return 1
 }
 
 uninstall() {
@@ -1262,11 +1364,19 @@ ensure_section() {
 # A new YouTube section gets podkop's "youtube" list and is moved before
 # $SECTION: podkop routes by the first section that matches, and lists like
 # "Russia inside" contain YouTube too.
+# podkop_state: podkop's settings with what uci has staged, the options in any
+# order (a list put back moves to the end of its section) but the sections in
+# their order (it matters to podkop)
+podkop_state() { uci -q show podkop | sort; echo ---; uci -q show podkop | grep -E '^podkop\.[^.]+='; }
+
 apply_podkop() {
   _cfg=/etc/config/podkop
-  _bak="$_cfg.probe-backup.$(date +%Y%m%d-%H%M%S)"
-  cp "$_cfg" "$_bak" || die "cannot back up $_cfg"
-  ls -1t "$_cfg".probe-backup.* 2>/dev/null | tail -n +4 | while IFS= read -r _f; do rm -f "$_f"; done
+  # not at the same time as an apply or a recovery by podkop-agent
+  if [ -d /tmp/podkop-agent ] && command -v flock >/dev/null 2>&1; then
+    exec 8> /tmp/podkop-agent/apply.lock
+    flock -w 600 8 || die "podkop-agent is busy with podkop's settings; try again later"
+  fi
+  podkop_state > "$WORK/podkop.before"
   _msg=""; _secs=""
   if [ "$DO_MAIN" = 1 ]; then
     uci -q get "podkop.$SECTION" >/dev/null || _new_main=1
@@ -1287,8 +1397,17 @@ apply_podkop() {
     _msg="${_msg:+$_msg, }$YT_SECTION: $(wc -l < "$WORK/ytbest" | tr -d ' ') server(s) + $(wc -l < "$WORK/ytbest.fb" | tr -d ' ') fallback"
     _secs="${_secs:-} $YT_SECTION"
   fi
+  # the same servers as now: nothing written to flash, podkop not restarted
+  if podkop_state | cmp -s - "$WORK/podkop.before"; then
+    uci -q revert podkop
+    info "podkop already has these servers, nothing to change"
+    return 0
+  fi
+  _bak="$_cfg.probe-backup.$(date +%Y%m%d-%H%M%S)"
+  cp "$_cfg" "$_bak" || { uci -q revert podkop; die "cannot back up $_cfg"; }
+  ls -1t "$_cfg".probe-backup.* 2>/dev/null | tail -n +4 | while IFS= read -r _f; do rm -f "$_f"; done
   uci commit podkop || die "uci commit failed, your old settings are in $_bak"
-  /etc/init.d/podkop restart >/dev/null 2>&1
+  /etc/init.d/podkop restart >/dev/null 2>&1 8>&-
   # shellcheck disable=SC2086
   if podkop_up $_secs; then
     # a server once chosen by hand in the dashboard stays chosen after a
@@ -1297,7 +1416,7 @@ apply_podkop() {
     info "podkop updated ($_msg), restarted"
     [ "$CRON" = 1 ] && logger -t podkop-probe "podkop updated ($_msg), restarted" 2>/dev/null
   else
-    cp "$_bak" "$_cfg" && /etc/init.d/podkop restart >/dev/null 2>&1
+    cp "$_bak" "$_cfg" && /etc/init.d/podkop restart >/dev/null 2>&1 8>&-
     warn "podkop did not start with the new lists, the old settings are back (podkop's log: logread -e podkop)"
     [ "$CRON" = 1 ] && logger -t podkop-probe "podkop did not start with the new lists, old settings restored" 2>/dev/null
   fi
@@ -1484,18 +1603,6 @@ if [ "$COUNT" -eq 0 ]; then
   exit 1
 fi
 
-# latency tests of up to 6 nodes run side by side: they are small requests
-# that don't disturb each other (~40 MB of RAM per node). Speed tests always
-# run one at a time afterwards, with nothing else going on.
-_mem=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null)
-_max=$(( ${_mem:-160} / 40 )); [ "$_max" -lt 1 ] && _max=1
-if [ -z "$J" ]; then
-  J=6; [ "$J" -gt "$_max" ] && J=$_max
-elif [ "$J" -gt "$_max" ]; then
-  warn "-j $J needs more free RAM, using $_max"; J=$_max
-fi
-[ "$J" -gt "$COUNT" ] && J=$COUNT
-
 # request list, shared by all nodes; "Connection: close" makes every request
 # open a fresh tunnel through the node, which is what we want to measure
 # req_cfg <count> [url]: curl config with <count> requests
@@ -1514,6 +1621,27 @@ req_cfg 10 "$YT_PING_URL" > "$WORK/ytreq.cfg"
 
 if sleep 0.1 2>/dev/null; then NAP=0.2; WAIT_TICKS=75; else NAP=1; WAIT_TICKS=15; fi
 
+START=$(date +%s)
+# (no node left for it when podkop or sing-box can't use any: they show as such)
+sb_all_start || { [ -s "$WORK/ports" ] &&
+  die "sing-box did not start: $(grep -v '^[[:space:]]*$' "$WORK/sb.log" 2>/dev/null | tail -n 1 | cut -c 1-300)"; }
+
+# latency tests of one node per CPU core run side by side: every request
+# opens a new encrypted tunnel, and more at once than the CPU can handshake
+# makes every ping look slower (a dual-core router: +10% with 2 nodes at a
+# time, +50% with 4, x3 with 10). With sing-box shared a node tested costs
+# only its curl processes (~6 MB); capped by the memory left once it runs.
+# Speed tests run afterwards, a few at a time.
+_mem=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null)
+_max=$(( (${_mem:-160} - 24) / 6 )); [ "$_max" -lt 1 ] && _max=1
+_cpus=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null); [ "${_cpus:-0}" -ge 1 ] || _cpus=1
+if [ -z "$J" ]; then
+  J=$_cpus; [ "$J" -gt "$_max" ] && J=$_max
+elif [ "$J" -gt "$_max" ]; then
+  warn "-j $J needs more free RAM, using $_max"; J=$_max
+fi
+[ "$J" -gt "$COUNT" ] && J=$COUNT
+
 set -- $(exit_ip)
 DIRECT_IP=${1:-none}; DIRECT_CC=${2:--}
 : > "$WORK/lat.done"
@@ -1530,7 +1658,6 @@ if [ "$VERBOSE" = 1 ]; then
   info "router IP: $DIRECT_IP ($DIRECT_CC)   sing-box $SB_VER"
 fi
 
-START=$(date +%s)
 mkfifo "$WORK/sem" || die "mkfifo failed"
 exec 3<>"$WORK/sem"
 _k=0; while [ "$_k" -lt "$J" ]; do echo >&3; _k=$((_k + 1)); done
@@ -1539,9 +1666,26 @@ _i=0
 while [ "$_i" -lt "$COUNT" ]; do
   _i=$((_i + 1))
   read -r _ <&3
+  sb_alive || :
   ( run_node "$_i"; echo >&3 ) &
 done
 wait
+# sing-box stopped on the way: the nodes whose test overlapped the time it
+# was down are tested again
+sb_alive || :
+if [ -s "$WORK/sb.restarts" ] && [ -n "$SB_PID" ]; then
+  _i=0
+  while [ "$_i" -lt "$COUNT" ]; do
+    _i=$((_i + 1))
+    [ -f "$WORK/n/$_i/skip" ] && continue
+    _a=$(cat "$WORK/n/$_i/t0" 2>/dev/null); _b=$(cat "$WORK/n/$_i/t1" 2>/dev/null)
+    awk -v a="${_a:-0}" -v b="${_b:-0}" '$2 >= a && $1 <= b { f = 1 } END { exit !f }' "$WORK/sb.restarts" || continue
+    read -r _ <&3
+    ( run_node "$_i"; echo >&3 ) &
+  done
+  wait
+  [ "$VERBOSE" = 1 ] && warn "sing-box stopped $(wc -l < "$WORK/sb.restarts") time(s) during the test and was started again"
+fi
 exec 3>&-
 
 # --- speed test --------------------------------------------------------------
@@ -1566,26 +1710,27 @@ if [ "$SPEED" = 1 ]; then
   if [ "$_ns" -gt 0 ]; then
     [ "$VERBOSE" = 1 ] && echo
     if [ -z "$SPEED_J" ]; then
-      # how many tests fit on the line at once: measure it directly, then
-      # allow one test per ~200 Mbit/s (a node rarely gives more than ~150)
       SPEED_J=1
-      if [ "$_ns" -gt 1 ]; then
-        _line=$(curl -s -o /dev/null --max-time 5 -w '%{size_download} %{time_total}' "$LINE_URL" 2>/dev/null |
-          awk '$2 > 0 && $1 > 1000000 { printf "%.0f", $1 * 8 / $2 / 1000000 }')
-        if [ -n "$_line" ]; then
-          SPEED_J=$(( _line / 200 )); [ "$SPEED_J" -lt 1 ] && SPEED_J=1; [ "$SPEED_J" -gt 3 ] && SPEED_J=3
-          [ "$VERBOSE" = 1 ] && info "your line (direct): ~$_line Mbit/s"
-        fi
-      fi
+    fi
+    # the line's own speed, measured directly: a node can't show more (see
+    # speed_fetch), and one test per ~200 Mbit/s fits on it at once (a node
+    # rarely gives more than ~150)
+    _line=$(curl -s -o /dev/null --max-time 5 -w '%{size_download} %{time_total}' "$LINE_URL" 2>/dev/null |
+      awk '$2 > 0 && $1 > 1000000 { printf "%.0f", $1 * 8 / $2 / 1000000 }')
+    if [ -n "$_line" ]; then
+      LINE_MBIT=$_line
+      [ -z "$SPEED_J_USER" ] && [ "$_ns" -gt 1 ] && { SPEED_J=$(( _line / 200 )); [ "$SPEED_J" -lt 1 ] && SPEED_J=1; [ "$SPEED_J" -gt 3 ] && SPEED_J=3; }
+      [ "$VERBOSE" = 1 ] && info "your line (direct): ~$_line Mbit/s"
     fi
     [ "$SPEED_J" -gt "$_ns" ] && SPEED_J=$_ns
-    [ "$SPEED_J" -gt "$_max" ] && SPEED_J=$_max   # ~40 MB of RAM per test
+    [ "$SPEED_J" -gt "$_max" ] && SPEED_J=$_max   # a few MB of RAM per test
     [ "$VERBOSE" = 1 ] && info "speed test: $_ns server(s), $SPEED_J at a time, until the result is stable (max ${SPEED_T}s)"
     mkfifo "$WORK/ssem" && exec 5<>"$WORK/ssem"
     _k=0; while [ "$_k" -lt "$SPEED_J" ]; do echo >&5; _k=$((_k + 1)); done
     : > "$WORK/speed.done"
     while IFS= read -r _n; do
       read -r _ <&5
+      sb_alive || :
       (
         speed_node "$_n"
         echo "$_n" >> "$WORK/speed.done"
@@ -1635,6 +1780,7 @@ if [ "$_ny" -gt 0 ]; then
   : > "$WORK/yt.done"
   while IFS= read -r _n; do
     read -r _ <&6
+    sb_alive || :
     (
       yt_node "$_n"
       echo "$_n" >> "$WORK/yt.done"
@@ -1656,6 +1802,9 @@ if [ "$_ny" -gt 0 ]; then
     for _f in yt yt.ms; do [ -f "$WORK/n/$_src/$_f" ] && cp "$WORK/n/$_src/$_f" "$WORK/n/$_n/$_f"; done
   done
 fi
+
+# the tests are over: free sing-box's memory before podkop restarts
+sb_kill
 
 # --- ranking -----------------------------------------------------------------
 
@@ -1847,7 +1996,7 @@ if [ "$VERBOSE" = 1 ]; then
     _why=""
     case "$_s" in
       skip)   _why=$(head -n 1 "$WORK/n/$_n/skip") ;;
-      start)  _why="sing-box did not start: $(grep -v '^[[:space:]]*$' "$WORK/n/$_n/sb.log" 2>/dev/null | tail -n 1 | cut -c 1-200)" ;;
+      start)  _why=$(head -n 1 "$WORK/n/$_n/nostart" 2>/dev/null || echo "sing-box did not start") ;;
       direct) _why="exit IP equals the router's own IP: traffic did not go through the node" ;;
       region) _why="exit country $_xc is outside $(countries_label)" ;;
       noexit) _why="could not learn the exit IP through the node" ;;

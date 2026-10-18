@@ -68,6 +68,11 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
     async def _agent_error(_: Request, e: AgentError):
         return JSONResponse({"error": e.as_dict()}, status_code=502 if e.code in ("unreachable", "timeout") else 400)
 
+    def field(body: dict, name: str) -> str:
+        if not isinstance(body.get(name), str) or not body[name]:
+            raise HTTPException(400, f"{name} is required")
+        return body[name]
+
     def user(request: Request) -> None:
         if not request.session.get("auth"):
             raise HTTPException(401, "log in first")
@@ -136,7 +141,12 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
         host = str(body.get("host", "")).strip()
         if not host:
             raise HTTPException(400, "host is required")
-        port = int(body.get("port") or 22)
+        try:
+            port = int(body.get("port") or 22)
+        except (TypeError, ValueError):
+            port = 0
+        if not 0 < port < 65536:
+            raise HTTPException(400, "port must be a number from 1 to 65535")
         allow = [x.strip() for x in str(body.get("allow_clash", "")).replace(",", " ").split() if x.strip()]
         host_key = await install(host, port, str(body.get("password") or router_password), keys["public"], hub.src, allow,
                                  body.get("close_clash", True) is not False)
@@ -152,10 +162,9 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
     async def reinstall(rid: int, body: dict):
         rt = router_or_404(rid)
         allow = [x.strip() for x in str(body.get("allow_clash", "")).replace(",", " ").split() if x.strip()]
-        host_key = await install(rt.row["host"], rt.row["port"], str(body.get("password") or router_password), keys["public"],
-                                 hub.src, allow, body.get("close_clash", True) is not False)
-        if host_key != rt.row["host_key"]:
-            raise HTTPException(400, "the router's host key changed; remove and add the router again")
+        # the router must still have its host key before the password goes out
+        await install(rt.row["host"], rt.row["port"], str(body.get("password") or router_password), keys["public"],
+                      hub.src, allow, body.get("close_clash", True) is not False, host_key=rt.row["host_key"])
         await hub.refresh(rt)
         return {"ok": True}
 
@@ -188,8 +197,14 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
 
     @app.get("/api/routers/{rid}/config", dependencies=[api])
     async def get_config(rid: int):
-        router_or_404(rid)
-        return await hub.config(rid)
+        rt = router_or_404(rid)
+        try:
+            return await hub.config(rid)
+        except AgentError as e:
+            # the router is away: its settings as last read, so the draft can still be seen
+            if e.code not in ("unreachable", "timeout") or not rt.config:
+                raise
+            return dict(rt.config, cached=True)
 
     @app.post("/api/routers/{rid}/diff", dependencies=[api])
     async def diff(rid: int, body: dict):
@@ -214,7 +229,7 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
     @app.get("/api/routers/{rid}/versions", dependencies=[api])
     async def versions(rid: int, limit: int = 30, before: int | None = None):
         router_or_404(rid)
-        return db.versions(rid, min(limit, 200), before)
+        return db.versions(rid, max(1, min(limit, 200)), before)
 
     # --- the draft ------------------------------------------------------------------
     @app.get("/api/routers/{rid}/draft", dependencies=[api])
@@ -261,33 +276,33 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
     @app.post("/api/routers/{rid}/pin", dependencies=[api])
     async def pin(rid: int, body: dict):
         rt = router_or_404(rid)
-        r = await rt.agent.call("pin", str(body["section"]), str(body["server"]))
+        r = await rt.agent.call("pin", field(body, "section"), field(body, "server"))
         rt.wake.set()
         return r
 
     @app.post("/api/routers/{rid}/delays", dependencies=[api])
     async def delays(rid: int, body: dict):
         rt = router_or_404(rid)
-        return await rt.agent.call("delays", str(body["section"]), timeout=40)
+        return await rt.agent.call("delays", field(body, "section"), timeout=40)
 
     @app.post("/api/routers/{rid}/service", dependencies=[api])
     async def service(rid: int, body: dict):
         rt = router_or_404(rid)
-        r = await rt.agent.call("service", str(body["action"]), timeout=90)
+        r = await rt.agent.call("service", field(body, "action"), timeout=90)
         rt.wake.set()
         return r
 
     @app.get("/api/routers/{rid}/events", dependencies=[api])
     async def events(rid: int, limit: int = 100):
         router_or_404(rid)
-        return db.events(rid, limit)
+        return db.events(rid, max(1, min(limit, 1000)))
 
     @app.get("/api/routers/{rid}/logs", dependencies=[api])
     async def logs(rid: int, q: str = "", limit: int = 500, source: str = "", level: str = ""):
         """Stored lines, oldest first; source and level take comma separated values."""
         router_or_404(rid)
         split = lambda v: [x for x in v.split(",") if x]  # noqa: E731
-        rows = db.logs(rid, q, min(limit, 5000), split(source), split(level))
+        rows = db.logs(rid, q, max(1, min(limit, 5000)), split(source), split(level))
         for r in rows:
             p = podkop.parse_log(r["line"])
             r["time"], r["msg"] = p["time"], p["msg"]
@@ -328,7 +343,10 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
         router_or_404(rid)
         fields = {}
         if "keys" in body:
-            fields["keys"] = [k.strip() for k in body["keys"] if str(k).strip().startswith(("http://", "https://"))]
+            if not isinstance(body["keys"], list):
+                raise HTTPException(400, "keys must be a list of addresses")
+            fields["keys"] = [str(k).strip() for k in body["keys"]
+                              if re.fullmatch(r"https?://\S+", str(k).strip())]
         if "options" in body:
             fields["options"] = [str(o) for o in body["options"]]
         if "schedule" in body:

@@ -50,6 +50,8 @@ that already runs there are taken into **Keys and usage** and the rules.
   protocol, exit IP, name, ping, speed, YouTube and how many to keep. Its
   servers are refreshed after every probe run; **Run probe** is in the rule.
 - Nightly probe: **Global settings** → Nightly probe.
+- **Overview → Now routing**: each rule's server now and where its traffic
+  leaves to the internet (country and exit IP).
 - **Configs**: save a router's config (podkop plus each rule's probe
   parameters), download it, import a file (one from here or podkop's
   `/etc/config/podkop`) and load any saved config into a router's draft.
@@ -82,7 +84,8 @@ sh <(wget -O - https://github.com/dkagramanyan/podkop-manager/releases/latest/do
    `30 4 * * * podkop-probe --cron`.
 
 Each night it updates itself, tests the keys and updates podkop; if podkop
-doesn't start with the new lists, the old settings stay. Log:
+doesn't start with the new lists, the old settings stay. Same servers as
+before: nothing is written to the router's flash and podkop isn't restarted. Log:
 `/tmp/podkop-probe.log`. Remove: `podkop-probe --uninstall`.
 
 - Never picked: ping 700 ms or more, or 40 Mbit/s or less

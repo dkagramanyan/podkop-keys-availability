@@ -135,9 +135,14 @@ def test_move_rules_touches_only_rules_with_the_keys_servers(tmp_path: Path):
         applied.append((config, note, trigger))
         return {"version": 1}
 
-    hub.config, hub.apply = config, apply
+    states = iter(["applied", "applied", "rejected"])
+
+    async def wait_version(vid):
+        return {"state": next(states), "message": "podkop's settings changed since you loaded them"}
+
+    hub.config, hub.apply, hub.wait_version = config, apply, wait_version
     rt = type("RT", (), {"id": rid})()
-    asyncio.run(hub._move_rules(rt, ["provider-a"]))
+    assert asyncio.run(hub._move_rules(rt, ["provider-a"]))
     new, note, trigger = applied[0]
     by = {s["name"]: s["options"]["urltest_proxy_links"] for s in new["sections"]}
     assert by == {"youtube": ["vless://old@h:9#O"], "main": ["vless://c@h:3#C", "vless://y@h:4#Y"]}   # youtube had none
@@ -148,6 +153,10 @@ def test_move_rules_touches_only_rules_with_the_keys_servers(tmp_path: Path):
     asyncio.run(hub._move_rules(rt, []))
     by = {s["name"]: s["options"]["urltest_proxy_links"] for s in applied[1][0]["sections"]}
     assert by == {"youtube": ["vless://old@h:9#O"], "main": ["vless://a@h:1#A", "vless://c@h:3#C"]}
+    # a move the router did not take is not done: it is tried again
+    db.update_key(kid, acted_until=time.time() + 3600)
+    cur["config"] = applied[1][0]
+    assert not asyncio.run(hub._move_rules(rt, ["provider-a"]))
 
 
 def test_old_probe_lists_become_rules_once(tmp_path: Path):
@@ -316,3 +325,110 @@ def test_adding_a_running_router_imports_and_changes_nothing(tmp_path: Path):
     asyncio.run(hub.take_over_probe(r))
     ps = db.probe_settings(rid)
     assert calls[-1] == ("probe-cron", "off") and (ps["schedule"], ps["auto_apply"]) == ("04:30", 1)
+
+
+def test_exit_ip_is_looked_up_when_the_server_changes(tmp_path: Path):
+    import asyncio
+    from podkop_manager.agent import AgentError
+    from podkop_manager.hub import RouterRuntime
+    db = DB(tmp_path / "m.db")
+    rid = db.add_router("home", "192.168.1.1", 22, "ssh-ed25519 AAAA")
+    hub = Hub(db, tmp_path / "key", tmp_path)
+    calls = []
+
+    class Agent:
+        async def call(self, cmd, section, timeout=0):
+            calls.append(section)
+            if section == "work":
+                raise AgentError("exit_unknown", "no answer from ipinfo.io through wg0")
+            return {"section": section, "server": now["main"], "ip": "203.0.113.5", "country": "DE", "city": "", "org": ""}
+
+    rt = RouterRuntime(db.router(rid), tmp_path / "key")
+    rt.agent = Agent()
+    rt.config = {"config": {"sections": [
+        {"name": "settings", "type": "settings", "options": {}},
+        {"name": "main", "type": "section", "options": {"connection_type": "proxy", "proxy_config_type": "urltest"}},
+        {"name": "work", "type": "section", "options": {"connection_type": "vpn", "interface": "wg0"}},
+        {"name": "ru", "type": "section", "options": {"connection_type": "exclusion"}}]}}
+    now = {"main": "main-2-out"}
+
+    def poll():
+        rt.proxies = {"groups": [{"name": "main-out", "now": "main-urltest-out"},
+                                 {"name": "main-urltest-out", "now": now["main"]}]}
+        hub._check_exits(rt)
+
+    async def run(steps):
+        for step in steps:
+            step()
+            if rt.exit_task:
+                await rt.exit_task
+
+    asyncio.run(run([poll]))
+    assert calls == ["main", "work"]
+    assert rt.exits["main"]["ip"] == "203.0.113.5" and rt.exits["work"]["error"].startswith("no answer")
+    asyncio.run(run([poll]))                       # nothing changed: no lookup
+    assert calls == ["main", "work"]
+    now["main"] = "main-1-out"                     # urltest moved: only that section again
+    asyncio.run(run([poll]))
+    assert calls == ["main", "work", "main"]
+
+
+def test_router_time_on_the_manager_clock(monkeypatch):
+    from podkop_manager import hub as hub_mod
+
+    class LT:
+        tm_gmtoff = 3 * 3600                      # the manager runs on Moscow time
+    monkeypatch.setattr(hub_mod.time, "localtime", lambda *a: LT())
+    assert hub_mod.manager_minutes(4 * 60 + 30, "+0000") == 7 * 60 + 30     # a router on UTC
+    assert hub_mod.manager_minutes(4 * 60 + 30, "+0300") == 4 * 60 + 30
+    assert hub_mod.manager_minutes(23 * 60, "-0500") == 7 * 60             # the next day
+    assert hub_mod.manager_minutes(4 * 60 + 30, "") == 4 * 60 + 30          # unknown: as is
+
+
+def test_take_over_refuses_a_cron_line_without_one_time(tmp_path: Path):
+    import asyncio
+    from podkop_manager.agent import AgentError
+    from podkop_manager.hub import RouterRuntime
+    db = DB(tmp_path / "m.db")
+    rid = db.add_router("home", "192.168.1.1", 22, "ssh-ed25519 AAAA")
+    hub = Hub(db, tmp_path / "key", tmp_path)
+    calls = []
+
+    class Agent:
+        async def call(self, cmd, *args, payload=None, timeout=0):
+            calls.append(cmd)
+            return {"keys": ["https://a.example/s/1"]}
+
+    r = RouterRuntime(db.router(rid), tmp_path / "key")
+    r.agent = Agent()
+    r.status = {"probe": {"cron": "*/30 4 * * * podkop-probe --cron"}}
+    with pytest.raises(AgentError, match="no single daily time"):
+        asyncio.run(hub.take_over_probe(r))
+    assert calls == []                                   # the router's run is left on
+    r.status = {"probe": {"cron": "30 4 * * * podkop-probe --cron"}}   # no keys in the manager yet
+    asyncio.run(hub.take_over_probe(r))
+    assert calls == ["probe-config", "probe-cron"] and db.probe_settings(rid)["keys"] == ["https://a.example/s/1"]
+
+
+@pytest.mark.parametrize("noads, youtube", [("RU", "RU"), ("ru by", "RU"), ("", "plays")])
+def test_youtube_region_from_the_routers_probe(tmp_path: Path, noads, youtube):
+    db = DB(tmp_path / "m.db")
+    rid = db.add_router("home", "192.168.1.1", 22, "ssh-ed25519 AAAA")
+    hub = Hub(db, tmp_path / "key", tmp_path)
+    cfg = {"sections": [{"name": "youtube", "type": "section", "options": {}}]}
+    made = hub._probe_rules_from(rid, cfg, {"youtube_section": "youtube", "youtube": True, "apply_to": "both",
+                                            "youtube_noads": noads})
+    assert made == ["youtube"] and db.auto_rule(rid, "youtube")["youtube"] == youtube
+
+
+def test_rules_never_get_servers_of_keys_moved_away_from(tmp_path: Path):
+    db = DB(tmp_path / "m.db")
+    rid = db.add_router("home", "192.168.1.1", 22, "ssh-ed25519 AAAA")
+    db.set_probe_settings(rid, keys=["https://sub.example.com/abc"])
+    db.sync_sub_keys(rid, ["https://sub.example.com/abc"])
+    kid = db.keys(rid)[0]["id"]
+    db.update_key(kid, links=["vless://a@h:1#A"], action="avoid", acted_until=time.time() + 3600)
+    db.set_auto_rule(rid, "main", podkop.check_auto_rule({"top": 2, "fallback": 0}))
+    hub = Hub(db, tmp_path / "key", tmp_path)
+    st = {"rows": [ROW("vless://a@h:1#A", "0.2"), ROW("vless://c@h:3#C", "0.3")]}
+    assert hub.auto_picks(rid, st)["main"]["links"] == ["vless://c@h:3#C"]     # what the rule's preview shows too
