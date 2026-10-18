@@ -1,6 +1,6 @@
 """SQLite storage: routers, their events and logs, every applied config
-version, unapplied drafts, probe settings and runs, and the manager's own
-settings."""
+version, unapplied drafts, probe settings and runs, keys with their usage and
+traffic, and the manager's own settings."""
 
 from __future__ import annotations
 
@@ -51,8 +51,26 @@ CREATE TABLE IF NOT EXISTS auto_rules (
   protocols TEXT NOT NULL DEFAULT '[]', exit_ips TEXT NOT NULL DEFAULT '[]', name_contains TEXT NOT NULL DEFAULT '',
   top INTEGER NOT NULL DEFAULT 5, fallback INTEGER NOT NULL DEFAULT 2, PRIMARY KEY (router_id, section)
 );
+CREATE TABLE IF NOT EXISTS keys (
+  id INTEGER PRIMARY KEY, router_id INTEGER NOT NULL, kind TEXT NOT NULL, url TEXT NOT NULL,
+  label TEXT NOT NULL DEFAULT '', limit_source TEXT NOT NULL DEFAULT 'provider', limit_gb REAL NOT NULL DEFAULT 0,
+  period TEXT NOT NULL DEFAULT '', reset_time TEXT NOT NULL DEFAULT '00:00', action TEXT NOT NULL DEFAULT 'warn',
+  threshold INTEGER NOT NULL DEFAULT 90, acted_until REAL, links TEXT NOT NULL DEFAULT '[]',
+  title TEXT NOT NULL DEFAULT '', why TEXT NOT NULL DEFAULT '', UNIQUE (router_id, url)
+);
+CREATE TABLE IF NOT EXISTS key_usage (
+  key_id INTEGER NOT NULL, t REAL NOT NULL, used INTEGER NOT NULL, total INTEGER NOT NULL, expire INTEGER
+);
+CREATE INDEX IF NOT EXISTS key_usage_key ON key_usage (key_id, t);
+CREATE TABLE IF NOT EXISTS traffic (
+  router_id INTEGER NOT NULL, hour INTEGER NOT NULL, key_id INTEGER NOT NULL, rule TEXT NOT NULL,
+  server TEXT NOT NULL, bytes INTEGER NOT NULL, PRIMARY KEY (router_id, hour, key_id, rule, server)
+);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
+
+KEY_FIELDS = {"label", "limit_source", "limit_gb", "period", "reset_time", "action", "threshold",
+              "acted_until", "links", "title", "why"}
 
 # columns added after the first release: (table, column, declaration)
 COLUMNS = [
@@ -122,7 +140,8 @@ class DB:
             self.x(f"UPDATE routers SET {k} = ? WHERE id = ?", v, rid)
 
     def delete_router(self, rid: int) -> None:
-        for table in ("events", "logs", "versions", "probe_runs", "drafts", "auto_rules"):
+        self.x("DELETE FROM key_usage WHERE key_id IN (SELECT id FROM keys WHERE router_id = ?)", rid)
+        for table in ("events", "logs", "versions", "probe_runs", "drafts", "auto_rules", "keys", "traffic"):
             self.x(f"DELETE FROM {table} WHERE router_id = ?", rid)
         self.x("DELETE FROM probe_settings WHERE router_id = ?", rid)
         self.x("DELETE FROM routers WHERE id = ?", rid)
@@ -159,6 +178,8 @@ class DB:
         now = time.time()
         self.x("DELETE FROM logs WHERE t < ?", now - log_days * 86400)
         self.x("DELETE FROM events WHERE t < ?", now - event_days * 86400)
+        self.x("DELETE FROM key_usage WHERE t < ?", now - 60 * 86400)
+        self.x("DELETE FROM traffic WHERE hour < ?", now - 60 * 86400)
 
     # --- config versions ------------------------------------------------------------
     def add_version(self, rid: int, config: dict, diff: list, note: str, base: str, trigger: str = "web") -> int:
@@ -230,6 +251,63 @@ class DB:
     def probe_result(self, run_id: int) -> dict | None:
         r = self.one("SELECT result FROM probe_runs WHERE id = ?", run_id)
         return json.loads(r["result"]) if r and r["result"] else None
+
+    def last_probe_result(self, rid: int) -> dict | None:
+        """probe-status of the newest finished run."""
+        r = self.one("SELECT result FROM probe_runs WHERE router_id = ? AND state = 'done' AND result IS NOT NULL "
+                     "ORDER BY id DESC LIMIT 1", rid)
+        return json.loads(r["result"]) if r else None
+
+    # --- keys: subscriptions (the probe's keys) and single links, with usage ---------------
+    def keys(self, rid: int) -> list[dict]:
+        rows = self.q("SELECT * FROM keys WHERE router_id = ? ORDER BY kind DESC, id", rid)
+        for r in rows:
+            r["links"] = json.loads(r["links"])
+        return rows
+
+    def key(self, kid: int) -> dict | None:
+        r = self.one("SELECT * FROM keys WHERE id = ?", kid)
+        if r:
+            r["links"] = json.loads(r["links"])
+        return r
+
+    def sync_sub_keys(self, rid: int, urls: list) -> None:
+        """One key row per subscription of the probe; removed ones go."""
+        for u in urls:
+            self.x("INSERT OR IGNORE INTO keys (router_id, kind, url) VALUES (?, 'sub', ?)", rid, u)
+        for r in self.q("SELECT id, url FROM keys WHERE router_id = ? AND kind = 'sub'", rid):
+            if r["url"] not in urls:
+                self.delete_key(r["id"])
+
+    def add_link_key(self, rid: int, url: str, label: str, limit_gb: float) -> int:
+        return self.x("INSERT INTO keys (router_id, kind, url, label, limit_source, limit_gb) "
+                      "VALUES (?, 'link', ?, ?, 'manual', ?)", rid, url, label, limit_gb)
+
+    def update_key(self, kid: int, **fields) -> None:
+        for k, v in fields.items():
+            assert k in KEY_FIELDS
+            self.x(f"UPDATE keys SET {k} = ? WHERE id = ?", json.dumps(v) if k == "links" else v, kid)
+
+    def delete_key(self, kid: int) -> None:
+        self.x("DELETE FROM key_usage WHERE key_id = ?", kid)
+        self.x("DELETE FROM keys WHERE id = ?", kid)
+
+    def add_key_usage(self, kid: int, t: float, used: int, total: int, expire: int | None) -> None:
+        self.x("INSERT INTO key_usage (key_id, t, used, total, expire) VALUES (?, ?, ?, ?, ?)",
+               kid, t, used, total, expire)
+
+    def key_usage(self, kid: int, since: float) -> list[dict]:
+        return self.q("SELECT t, used, total, expire FROM key_usage WHERE key_id = ? AND t >= ? ORDER BY t",
+                      kid, since)
+
+    def add_traffic(self, rid: int, hour: int, key_id: int, rule: str, server: str, nbytes: int) -> None:
+        self.x("INSERT INTO traffic (router_id, hour, key_id, rule, server, bytes) VALUES (?, ?, ?, ?, ?, ?) "
+               "ON CONFLICT (router_id, hour, key_id, rule, server) DO UPDATE SET bytes = bytes + excluded.bytes",
+               rid, hour, key_id, rule, server, nbytes)
+
+    def traffic(self, rid: int, since: float) -> list[dict]:
+        return self.q("SELECT hour, key_id, rule, server, bytes FROM traffic WHERE router_id = ? AND hour >= ?",
+                      rid, since)
 
     # --- drafts: unapplied changes, one per router ----------------------------------------
     def draft(self, rid: int) -> dict | None:

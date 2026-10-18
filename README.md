@@ -47,6 +47,9 @@ all of it.
 - A rule can take servers **from your subscriptions** by exit country,
   protocol, exit IP or name; they are refreshed after every probe run.
 - Nightly probe: **Servers probe** → time and "Apply the nightly result by itself".
+- **Keys and usage**: each key's traffic against its limit (from the provider
+  or your own). At 90% it warns, or moves the probe's rules to other keys
+  until the reset.
 - To stop podkop, use **Stop**: otherwise the watchdog starts it again within
   about 30 s (**Disable** in LuCI turns that off).
 

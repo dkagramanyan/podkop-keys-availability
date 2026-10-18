@@ -12,7 +12,7 @@
 #
 # https://github.com/dkagramanyan/podkop-manager
 
-VERSION="1.15.0"
+VERSION="1.16.0"
 REPO_URL="https://github.com/dkagramanyan/podkop-manager"
 RELEASE_URL="$REPO_URL/releases/latest/download/probe.sh"
 BIN=/usr/bin/podkop-probe            # installed copy, used by the nightly run
@@ -59,6 +59,7 @@ YT_PING_URL="https://www.youtube.com/generate_204"
 YT_VIDEO=jNQXAC9IVRw                 # "Me at the zoo": public everywhere, never removed
 YT_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 APPLY_SAVED=0
+SUB_INFO=0
 CRON=0; CRON_TIME=""; INSTALL=0; UNINSTALL=0; UPDATE=0; NO_UPDATE=0
 COUNTRIES=""                         # "" = all; europe; or DE,NL,...
 # Subscription panels (Remnawave, Marzban, 3x-ui...) only hand the real server
@@ -127,6 +128,7 @@ YouTube (a separate podkop section for YouTube traffic):
   --apply-to WHAT   both (default), main or youtube: which list goes into
                     podkop with --apply and in the nightly run
   --apply-saved     put the lists of the last run into podkop, no new test
+  --sub-info        for podkop-manager: each -s key's usage header and links
                     (they are kept in /tmp until the router restarts)
 
 Podkop (for link sources: -s, -f, links):
@@ -229,6 +231,7 @@ while [ $# -gt 0 ]; do
     --uninstall|--nightly-off) UNINSTALL=1; shift ;;
     --update) UPDATE=1; shift ;;
     --apply-saved) APPLY_SAVED=1; shift ;;
+    --sub-info) SUB_INFO=1; shift ;;
     --no-update) NO_UPDATE=1; shift ;;
     --cron) CRON=1; shift ;;
     --no-color) COLOR=0; shift ;;
@@ -604,6 +607,32 @@ from_sub() {
   _si=$(sub_info "$_raw.h" 2>/dev/null)
   printf '  %s  %-24s %3s servers%s\n' "$2" "$_host" "$(wc -l < "$_raw.real" | tr -d ' ')" "${_si:+  · $_si}"
   [ "$VERBOSE" = 1 ] && info "    fetched as $_app"
+  return 0
+}
+
+# sub_usage <url>: fetched like from_sub, prints "K<TAB>url<TAB>usage header
+# <TAB>title header<TAB>why nothing came", then "L<TAB>link" for each server
+sub_usage() {
+  _raw="$WORK/use"; _why=""
+  rm -f "$_raw.real" "$_raw.h" "$_raw.json" "$_raw.json.h"
+  for _ua in $(printf '%s\n' "$SUB_UAS" | tr ' ' '~'); do
+    _ua=$(printf '%s' "$_ua" | tr '~' ' ')
+    sub_fetch "$1" "$_ua" "$_raw.try"
+    sub_parse "$_raw.try" | awk "$REAL_AWK" > "$_raw.try.real"
+    [ -n "$_why" ] || _why=$(sub_why "$_raw.try")
+    [ -s "$_raw.try.real" ] || continue
+    case "$(tr -d ' \r\n\t' < "$_raw.try" | cut -c 1)" in
+      "{"|"[") [ -s "$_raw.json" ] || { mv "$_raw.try.real" "$_raw.json"; cp "$_raw.try.h" "$_raw.json.h"; }; continue ;;
+    esac
+    mv "$_raw.try.real" "$_raw.real"; cp "$_raw.try.h" "$_raw.h"; break
+  done
+  [ -s "$_raw.real" ] || { mv "$_raw.json" "$_raw.real" 2>/dev/null; mv "$_raw.json.h" "$_raw.h" 2>/dev/null; }
+  [ -s "$_raw.real" ] && _why=""
+  [ -f "$_raw.h" ] || cp "$_raw.try.h" "$_raw.h" 2>/dev/null
+  printf 'K\t%s\t%s\t%s\t%s\n' "$1" \
+    "$(sed -n 's/^[Ss]ubscription-[Uu]serinfo: *//p' "$_raw.h" 2>/dev/null | tr -d '\r\t' | tail -n 1)" \
+    "$(sed -n 's/^[Pp]rofile-[Tt]itle: *//p' "$_raw.h" 2>/dev/null | tr -d '\r\t' | tail -n 1)" "$_why"
+  [ -s "$_raw.real" ] && sed 's/^/L\t/' "$_raw.real"
   return 0
 }
 
@@ -1299,6 +1328,12 @@ mkdir -p "$WORK/n" "$WORK/pids" || die "cannot create $WORK"
 
 trap cleanup EXIT
 trap 'echo; warn "interrupted"; exit 130' INT TERM
+
+if [ "$SUB_INFO" = 1 ]; then
+  set -f
+  for _u in $SUBS; do sub_usage "$_u"; done
+  exit 0
+fi
 
 # --apply-saved: the lists of the last run into podkop, no test
 if [ "$APPLY_SAVED" = 1 ]; then

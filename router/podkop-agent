@@ -12,7 +12,7 @@
 # $SSH_ORIGINAL_COMMAND, requests come as JSON on stdin, answers go as JSON to
 # stdout: {"v":1,"ok":true,"data":...} or {"v":1,"ok":false,"error":{...}}.
 
-AGENT_VERSION="0.1.1"
+AGENT_VERSION="0.2.0"
 PROTO=1
 ETC=/etc/podkop-agent
 RUN=/tmp/podkop-agent
@@ -454,12 +454,42 @@ recover() {
   exec 9>&-
 }
 
+# --- traffic per server ------------------------------------------------------------
+
+# traffic_poll: add each connection's new bytes to its server (the first
+# outbound of its chain, e.g. main-2-out). Bytes of connections that ended
+# between two polls are shared out like the seen ones. Kept since the agent
+# started in $RUN/traffic/state.json.
+traffic_poll() {
+  _cfg=$(uci -q get podkop.settings.config_path); [ -n "$_cfg" ] || _cfg=/etc/sing-box/config.json
+  _addr=$(jq -r '.experimental.clash_api.external_controller // empty' "$_cfg" 2>/dev/null)
+  _sec=$(jq -r '.experimental.clash_api.secret // empty' "$_cfg" 2>/dev/null)
+  [ -n "$_addr" ] || return 0
+  if [ -n "$_sec" ]; then _c=$(curl -s --max-time 5 -H "Authorization: Bearer $_sec" "http://$_addr/connections")
+  else _c=$(curl -s --max-time 5 "http://$_addr/connections"); fi
+  [ -n "$_c" ] || return 0
+  _d="$RUN/traffic"; mkdir -p "$_d"
+  [ -s "$_d/state.json" ] || jq -nc --arg t "$(now)" '{since: $t, total: 0, conns: {}, servers: {}}' > "$_d/state.json"
+  printf '%s' "$_c" | jq -c --slurpfile st "$_d/state.json" '
+    $st[0] as $s
+    | [.connections[]? | {id, b: ((.upload // 0) + (.download // 0)), tag: ((.chains // [])[0] // "")}] as $cs
+    | ((.uploadTotal // 0) + (.downloadTotal // 0)) as $total
+    | [$cs[] | {tag, d: ([.b - ($s.conns[.id] // 0), 0] | max)}] as $ds
+    | ([$ds[].d] | add // 0) as $seen
+    | ([(if $total >= $s.total then $total - $s.total else $total end) - $seen, 0] | max) as $gone
+    | {since: $s.since, total: $total, conns: ($cs | map({key: .id, value: .b}) | from_entries),
+       servers: (reduce $ds[] as $x ($s.servers; .[$x.tag] += ($x.d + (if $seen > 0 then $gone * $x.d / $seen else 0 end) | floor))
+                 | if $seen == 0 and $gone > 0 then .[""] += $gone else . end)}' > "$_d/state.new" 2>/dev/null &&
+    mv "$_d/state.new" "$_d/state.json"
+}
+
 daemon() {
   mkdir -p "$RUN/jobs" "$ETC"
   event agent_started "$(jq -nc --arg v "$AGENT_VERSION" '{version: $v}')"
   _last=""; _down=0
   while :; do
     sleep 15
+    [ -n "$(singbox_pid)" ] && traffic_poll
     if [ -f "$ETC/paused" ] || ! podkop_enabled; then _down=0; continue; fi
     # a change or a recovery holds the lock; podkop's own start takes a while
     flock -n "$RUN/apply.lock" true || continue
@@ -696,6 +726,28 @@ run_probe() {
   event probe_done "$(jq -nc --argjson rc "$_rc" '{exit: $rc}')"
 }
 
+# sub-info: each key's usage header and links, fetched by podkop-probe the
+# way the probe does it, so the provider sees the same device
+cmd_sub_info() {
+  [ -x "$PROBE" ] || fail no_probe "podkop-probe is not installed"
+  _req=$(cat)
+  printf '%s' "$_req" | jq -e '.keys | type == "array" and length > 0' >/dev/null 2>&1 || fail bad_request 'expected {"keys": [...]}'
+  set -f; set --
+  for _k in $(printf '%s' "$_req" | jq -r '.keys[]'); do set -- "$@" -s "$_k"; done
+  set +f
+  _out=$("$PROBE" --sub-info --no-color "$@" 2>/dev/null)
+  printf '%s\n' "$_out" | grep -q '^K' || fail old_probe "podkop-probe can't read key usage: reinstall the agent"
+  reply "$(printf '%s\n' "$_out" | jq -Rsc '
+    split("\n") | map(select(. != "") | split("\t"))
+    | reduce .[] as $r ([]; if $r[0] == "K" then . + [{url: $r[1], usage: ($r[2] // ""), title: ($r[3] // ""), why: ($r[4] // ""), links: []}]
+                         elif $r[0] == "L" and length > 0 then .[-1].links += [$r[1:] | join("\t")] else . end)')"
+}
+
+# traffic: bytes per server since the agent started (see traffic_poll)
+cmd_traffic() {
+  reply "$(jq -c '{since, servers}' "$RUN/traffic/state.json" 2>/dev/null || echo '{"since":"","servers":{}}')"
+}
+
 lines_json() { if [ -f "$1" ]; then jq -Rsc 'split("\n") | map(select(. != ""))' "$1"; else echo '[]'; fi; }
 
 # the CSV of podkop-probe -o: n,verdict,ok,total,min,median,p90,mbit_s,exit_ip,country,youtube,youtube_ms,"node"
@@ -756,6 +808,8 @@ case "$_cmd" in
   service)       cmd_service "$@" ;;
   probe-start)   cmd_probe_start ;;
   probe-status)  cmd_probe_status ;;
+  sub-info)      cmd_sub_info ;;
+  traffic)       cmd_traffic ;;
   uninstall)
     [ -f /usr/share/podkop-agent/install.sh ] || fail not_found "install.sh is not on the router"
     env -u SSH_ORIGINAL_COMMAND -u SSH_CONNECTION -u SSH_CLIENT \
@@ -770,6 +824,6 @@ case "$_cmd" in
       _run-probe) run_probe ;;
     esac ;;
   help|-h|--help)
-    echo "podkop-agent $AGENT_VERSION: status config-get validate apply job pin proxies delays logs watch service probe-start probe-status uninstall version" ;;
+    echo "podkop-agent $AGENT_VERSION: status config-get validate apply job pin proxies delays logs watch service probe-start probe-status sub-info traffic uninstall version" ;;
   *) fail bad_request "unknown command $_cmd" ;;
 esac

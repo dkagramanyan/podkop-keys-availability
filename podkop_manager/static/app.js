@@ -42,6 +42,7 @@ const ICONS = {
   servers: '<rect x="2.5" y="2.5" width="11" height="4.5" rx="1"/><rect x="2.5" y="9" width="11" height="4.5" rx="1"/><path d="M5 4.75h1M5 11.25h1"/>',
   probe: '<path d="M2.5 11.5a5.5 5.5 0 0 1 11 0"/><path d="M8 11.5l2.6-3.6"/>',
   logs: '<path d="M3 4h10M3 8h10M3 12h6"/>',
+  usage: '<path d="M3 13V8.5M6.5 13V4M10 13V9.5M13.5 13V6"/>',
   history: '<circle cx="8" cy="8" r="5.5"/><path d="M8 5v3.2l2.2 1.4"/>',
   settings: '<circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M3.6 12.4L5 11M11 5l1.4-1.4"/>',
   updown: '<path d="M5 6l3-3 3 3M5 10l3 3 3-3"/>',
@@ -239,6 +240,7 @@ const SECTIONS = {
   global: { title: "Global settings", view: (m, id) => viewGlobal(m, id) },
   servers: { title: "Servers", view: (m, id) => viewServers(m, id) },
   probe: { title: "Servers probe", view: (m, id) => viewProbe(m, id) },
+  usage: { title: "Keys and usage", view: (m, id) => viewUsage(m, id) },
   logs: { title: "Logs", view: (m, id) => viewLogs(m, id) },
   history: { title: "History", view: (m, id) => viewHistory(m, id) },
 };
@@ -325,6 +327,8 @@ function drawSide() {
       h("a", { href: `#/r/${rt.id}/global`, class: "sub", "aria-current": cur("global") }, "Global settings"),
       link("servers", "Servers", "servers"),
       link("probe", "Servers probe", "probe"),
+      link("usage", "Keys and usage", "usage", rt.usage && rt.usage.pct !== null && rt.usage.pct !== undefined
+        ? h("span", { class: `count${rt.usage.alerts.length ? " warn" : ""}`, title: "Highest daily limit used" }, `${Math.round(rt.usage.pct)}%`) : null),
       link("logs", "Logs", "logs"),
       link("history", "History", "history")) : null,
     h("div", { class: "nav nav-bottom" },
@@ -535,11 +539,13 @@ const EVENT_TEXT = {
   probe_apply_failed: (d) => `Probe result not applied: ${d.message}`,
   probe_not_started: (d) => `Nightly probe not started: ${d.message}`,
   auto_rule_empty: (d) => `${d.section}: no server matched after the probe, the rule keeps its last servers`,
+  usage_threshold: (d) => `${d.key} used ${Math.round(d.pct)}% of today's traffic${d.action === "avoid" ? ", rules move to other keys" : ""}`,
+  usage_move_failed: (d) => `Rules not moved for the traffic limit: ${d.message}`,
 };
 const EVENT_DOT = {
   applied: "ok", podkop_up: "ok", reverted: "bad", revert_failed: "bad", podkop_down: "bad", recovery_failed: "bad",
   recovery_gave_up: "bad", probe_apply_failed: "bad", probe_not_started: "bad", recovered: "warn", pin_dropped: "warn",
-  auto_rule_empty: "warn",
+  auto_rule_empty: "warn", usage_threshold: "warn", usage_move_failed: "bad",
   pinned: "accent", pin_cleared: "accent", pin_restored: "accent",
 };
 
@@ -619,6 +625,14 @@ async function viewOverview(main, id) {
         h("div", { class: "col" }, h("span", {}, `Probe from ${shortWhen(agentTime(ps.finished))} has new server lists`),
           h("span", {}, `main ${n("main")} and ${n("main_fallback")} fallback, YouTube ${n("youtube")} and ${n("youtube_fallback")} fallback. ${usable} of ${rows.length} servers usable.`)),
         h("a", { class: "alink", href: `#/r/${id}/probe` }, "See results")));
+    }
+    for (const a of (rt.usage && rt.usage.alerts) || []) {
+      const eta = a.forecast && a.forecast.eta;
+      notes.push(h("div", { class: "note" }, h("span", { class: "dot warn" }),
+        h("div", { class: "col" }, h("span", {}, `${a.label} has used ${Math.round(a.pct)}% of today's traffic`),
+          h("span", {}, `${gb(a.used)} of ${gb(a.limit)}.${eta ? ` At this rate it runs out around ${hhmm(new Date(eta * 1000))}.` : ""}${
+            a.action === "avoid" ? ` Rules move to other keys at ${a.threshold}%.` : ""}`)),
+        h("a", { class: "alink", href: `#/r/${id}/usage` }, "See usage")));
     }
     return notes.length ? h("section", { class: "card clip waiting", "aria-label": "Waiting for you" }, notes) : null;
   };
@@ -1033,6 +1047,7 @@ const VERSION_STATE = {
 
 function versionWho(v) {
   if (v.trigger === "probe") return /nightly/i.test(v.note || "") ? "nightly probe" : "probe result, by you";
+  if (v.trigger === "usage") return "traffic limit";
   return "by you";
 }
 
@@ -1407,6 +1422,268 @@ async function viewProbe(main, id) {
     leave: () => clearInterval(timer),
     onProbe: (m) => { if (m.router_id === id) load().then(drawRight).catch(() => {}); },
   };
+}
+
+// --- keys and usage -----------------------------------------------------------------------------------
+
+const GB = 1024 ** 3;
+const gb = (b) => (b >= GB / 10 || !b ? `${(b / GB).toFixed(b >= 100 * GB ? 0 : 1)} GB` : `${Math.round(b / 1024 ** 2)} MB`);
+const usageUnit = (k) => (k.daily ? "today" : k.period === "month" ? "month" : "period");
+const shade = (i) => `var(--shade-${Math.min(i, 3) + 1})`;
+
+function usagePill(k) {
+  if (k.pct === null) return h("span", { class: "pill" }, "no limit");
+  return h("span", { class: `pill ${k.pct >= k.threshold ? "bad" : k.pct >= 60 ? "warn" : "ok"}` }, `${Math.round(k.pct)}% of ${usageUnit(k)}`);
+}
+
+// the running total of today with a dashed forecast at the last 3 hours' rate
+function usageChart(k) {
+  const x0 = 32, x1 = 472, y0 = 120, y1 = 18.75;
+  const top = Math.max(k.limit, k.used) || GB;
+  const X = (t) => (x0 + ((t - k.start) / 86400) * (x1 - x0)).toFixed(1);
+  const Y = (v) => (y0 - (v / top) * (y0 - y1)).toFixed(1);
+  const [nt, nv] = k.series[k.series.length - 1];
+  const line = k.series.map(([t, v], i) => `${i ? "L" : "M"}${X(t)} ${Y(v)}`).join(" ");
+  const f = k.forecast;
+  let ahead = "";
+  if (f && f.rate > 0 && k.used < k.limit) {
+    const end = Math.min(f.eta || Infinity, k.next_reset);
+    ahead = `<path d="M${X(nt)} ${Y(nv)} L${X(end)} ${Y(Math.min(k.limit, nv + f.rate * (end - nt)))}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-dasharray="4 4"/>`;
+    if (f.eta && f.eta < k.next_reset) {
+      ahead += `<circle cx="${X(f.eta)}" cy="${Y(k.limit)}" r="3.5" fill="var(--surface)" stroke="var(--accent)" stroke-width="2"/>
+        <text x="${X(f.eta)}" y="34" text-anchor="middle" font-size="11" fill="var(--text)">≈${hhmm(new Date(f.eta * 1000))}</text>`;
+    }
+  }
+  const grid = [0, 1, 2, 3].map((q) => {
+    const v = (top * q) / 3, y = Y(v);
+    return `<line x1="${x0}" y1="${y}" x2="${x1}" y2="${y}" stroke="var(${q ? "--line-soft" : "--control"})"/>
+      <text x="26" y="${+y + 3.5}" text-anchor="end" font-size="10.5" fill="var(--muted)">${Math.round(v / GB)}</text>`;
+  }).join("");
+  const h0 = +k.reset.split(":")[0];
+  const hours = [0, 6, 12, 18, 24].map((d, i) => `<text x="${x0 + (i * (x1 - x0)) / 4}" y="136" text-anchor="middle" font-size="10.5"
+    fill="var(--muted)">${String((h0 + d) % 24 || (d ? 24 : 0)).padStart(2, "0")}</text>`).join("");
+  const t = document.createElement("template");
+  t.innerHTML = `<svg viewBox="0 0 480 140" role="img" aria-label="${k.used >= 0 ? `Used today: ${gb(k.used)}` : ""}" style="width: 100%; height: auto">
+    ${grid}${hours}
+    <line x1="${x0}" y1="${Y(k.limit)}" x2="${x1}" y2="${Y(k.limit)}" stroke="var(--text-2)" stroke-width="1.5" stroke-dasharray="2 3"/>
+    <text x="${x1}" y="12" text-anchor="end" font-size="11" fill="var(--text-2)">limit ${gb(k.limit)}</text>
+    <path d="${line} L${X(nt)} ${y0} L${x0} ${y0} Z" fill="var(--accent-soft)"/>
+    <path d="${line}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>
+    ${ahead}
+    <circle cx="${X(nt)}" cy="${Y(nv)}" r="4" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/>
+  </svg>`;
+  return h("figure", { class: "uchart" }, h("figcaption", {}, h("span", {}, "Used today"), f ? h("span", {}, "dashed: at the last 3 hours' rate") : null),
+    t.content.firstChild);
+}
+
+async function viewUsage(main, id) {
+  const page = h("div", { class: "page" });
+  put(main, page);
+  let data, histKey = null;
+  const load = async () => { data = await api("GET", `/api/routers/${id}/usage`); };
+  const save = async (k, body) => {
+    try { await api("PUT", `/api/keys/${k.id}`, body); await load(); draw(); }
+    catch (e) { toast(e.message, true); }
+  };
+
+  const keyLine = (k) => h("span", { class: "mono xs muted ellipsis" }, k.kind === "sub"
+    ? `${keyLabel(k.url)} · subscription${k.servers ? `, ${plural(k.servers, "server")}` : ""}`
+    : `${linkProto(k.url)}://…@${linkHost(k.url)} · single link`);
+  const bar = (k) => (k.limit ? h("div", { class: `ubar${k.pct >= 100 ? " over" : ""}`, role: "progressbar", "aria-label": `${k.label} traffic`,
+    "aria-valuemin": "0", "aria-valuemax": String(k.limit), "aria-valuenow": String(k.used) },
+  h("div", { style: `width: ${Math.min(100, k.pct)}%` }),
+  k.daily ? h("span", { class: "mark", style: `left: ${k.threshold}%`, title: `${k.threshold}%` }) : null) : null);
+  const source = (k) => (k.limit_source === "provider" ? `from the provider${k.read ? `, read ${ago(k.read)}` : ""}` : "set by you, counted on the router");
+  const actionPick = (k) => h("div", { class: "row", style: "gap: 8px" },
+    h("label", { for: `act-${k.id}`, class: "small muted" }, `At ${k.threshold}%`),
+    h("select", { id: `act-${k.id}`, class: "input", style: "width: auto; height: 32px", onchange: (e) => save(k, { action: e.target.value }) },
+      h("option", { value: "avoid", selected: k.action === "avoid" }, "Move rules to other keys"),
+      h("option", { value: "warn", selected: k.action === "warn" }, "Only warn me")));
+  const editBtn = (k) => h("button", { type: "button", class: "btn sm", onclick: () => editKey(k) }, "Edit limit");
+
+  const byRule = (k) => {
+    const tot = k.by_rule.reduce((a, r) => a + r.bytes, 0);
+    if (!tot) return null;
+    return h("div", { class: "col", style: "gap: 6px" }, h("span", { class: "small", style: "font-weight: 500" }, "Today by rule"),
+      h("div", { class: "ustack" }, k.by_rule.map((r, i) => h("div", { title: `${r.rule} ${gb(r.bytes)}`,
+        style: `width: ${(r.bytes / tot) * 100}%; background: ${shade(i)}` }))),
+      h("div", { class: "legend" }, k.by_rule.map((r, i) => h("span", {}, h("i", { style: `background: ${shade(i)}` }), `${r.rule} ${gb(r.bytes)}`))));
+  };
+
+  const bigCard = (k) => {
+    const left = Math.max(0, k.limit - k.used), mins = Math.max(0, Math.round((k.next_reset - data.now) / 60));
+    return h("section", { class: "card", id: `key-${k.id}`, "aria-labelledby": `kh-${k.id}` },
+      h("div", { class: "key-big" },
+        h("div", { class: "stack", style: "flex: 1 1 300px; min-width: 0; gap: 14px" },
+          h("div", { class: "col", style: "gap: 4px" },
+            h("div", { class: "row", style: "gap: 10px" }, h("h2", { id: `kh-${k.id}` }, k.label), usagePill(k)), keyLine(k)),
+          h("div", { class: "col", style: "gap: 8px" },
+            h("div", { class: "row", style: "align-items: baseline; gap: 8px" }, h("span", { class: "big-num" }, gb(k.used)),
+              h("span", { class: "muted" }, `of ${gb(k.limit)} today`)),
+            bar(k),
+            h("div", { class: "row small muted", style: "justify-content: space-between" },
+              h("span", {}, `${gb(left)} left, resets in ${duration(mins * 60)}`), h("span", {}, `mark at ${k.threshold}%`))),
+          byRule(k), k.why ? h("span", { class: "small bad-text" }, k.why) : null),
+        h("div", { style: "flex: 1 1 340px; min-width: 0" }, k.series.length > 1 ? usageChart(k) : h("p", { class: "muted small" }, "The chart fills in as traffic is counted."))),
+      h("div", { class: "card-foot" },
+        h("span", { class: "small" }, h("b", {}, `${gb(k.limit)} per day `), h("span", { class: "muted" }, source(k))),
+        h("div", { class: "row", style: "gap: 12px" }, actionPick(k), editBtn(k))));
+  };
+
+  const smallCard = (k) => {
+    const top = k.by_rule[0];
+    const facts = k.kind === "link"
+      ? [["Used by", k.by_rule.map((r) => r.rule).join(", ") || "–"], ["Resets", k.daily ? k.reset : k.period], [`At ${k.threshold}%`, k.action === "avoid" ? "move rules" : "only warn"]]
+      : [["Today", `${gb(k.today)}${top ? `, ${top.rule}` : ""}`],
+        [k.daily ? "Resets" : "No daily limit", k.daily ? k.reset : k.expire ? `period ends ${new Date(k.expire * 1000).toLocaleDateString([], { month: "short", day: "numeric" })}` : "–"],
+        ["Key expires", k.expire ? `${new Date(k.expire * 1000).toLocaleDateString([], { month: "short", day: "numeric" })}, in ${Math.max(0, Math.round((k.expire - data.now) / 86400))} days` : "–"]];
+    return h("section", { class: "card pad", id: `key-${k.id}`, "aria-labelledby": `kh-${k.id}` },
+      h("div", { class: "col", style: "gap: 4px" },
+        h("div", { class: "row", style: "gap: 10px" }, h("h2", { id: `kh-${k.id}` }, k.label), usagePill(k)), keyLine(k)),
+      h("div", { class: "row", style: "align-items: baseline; gap: 8px" }, h("span", { class: "big-num sm" }, gb(k.used)),
+        h("span", { class: "muted" }, k.limit ? `of ${gb(k.limit)} ${k.daily ? "today" : "this " + usageUnit(k)}` : k.daily ? "today" : "used")),
+      bar(k),
+      h("div", { class: "key-facts" }, facts.map(([a, b]) => h("div", {}, h("span", {}, a), h("span", {}, b)))),
+      k.why ? h("span", { class: "small bad-text" }, k.why) : null,
+      h("div", { class: "row", style: "justify-content: space-between" },
+        h("span", { class: "small muted" }, k.read || k.kind === "link" ? source(k) : "Waiting for the first reading"), editBtn(k)));
+  };
+
+  const warnings = () => data.keys.filter((k) => k.daily && k.limit && (k.used >= k.limit * k.threshold / 100 || (k.forecast && k.forecast.hits_today)))
+    .map((k) => h("section", { class: "banner warn", "aria-label": "Warning" },
+      h("span", { class: "dot warn" }),
+      h("div", { class: "col grow", style: "flex: 1 1 320px" },
+        h("span", { style: "font-weight: 600" }, k.used >= k.limit ? `${k.label} used all of today's traffic`
+          : k.forecast && k.forecast.eta ? `${k.label} will run out of today's traffic around ${hhmm(new Date(k.forecast.eta * 1000))}`
+            : `${k.label} used ${Math.round(k.pct)}% of today's traffic`),
+        h("span", { class: "small muted" }, `${gb(k.used)} of ${gb(k.limit)}. At ${k.threshold}%: ${k.action === "avoid" ? `rules move to other keys until ${k.reset}` : "only a warning"}.`)),
+      h("a", { class: "alink", href: `#key-${k.id}`, onclick: (e) => { e.preventDefault(); document.getElementById(`key-${k.id}`).scrollIntoView({ behavior: "smooth" }); } },
+        "Change what happens")));
+
+  const history = () => {
+    const ks = data.keys.filter((k) => k.limit || k.days.some((d) => d.bytes));
+    if (!ks.length) return null;
+    const k = ks.find((x) => x.id === histKey) || ks[0];
+    const top = Math.max(k.daily ? k.limit : 0, ...k.days.map((d) => d.bytes)) || GB;
+    const hits = k.days.filter((d) => d.hit).length;
+    return h("section", { class: "card pad", "aria-labelledby": "u-hist" },
+      h("div", { class: "row", style: "justify-content: space-between" },
+        h("div", { class: "col" }, h("h2", { id: "u-hist" }, "Last 14 days"),
+          hits ? h("span", { class: "small muted" }, `${k.label} hit its limit on ${plural(hits, "day")}`) : null),
+        ks.length > 1 ? seg(ks.map((x) => [x.id, x.label]), k.id, (v) => { histKey = v; draw(); }, { small: true, label: "Key" }) : null),
+      h("div", { class: "days" },
+        k.daily && k.limit ? h("div", { class: "limit", style: `bottom: ${(k.limit / top) * 100}%` }) : null,
+        k.days.map((d) => h("div", { class: `day${d.hit ? " hit" : ""}${d.today ? " today" : ""}`,
+          title: `${d.today ? "Today so far" : new Date(d.t * 1000).toLocaleDateString([], { month: "short", day: "numeric" })}: ${gb(d.bytes)}${d.hit ? ", limit reached" : ""}` },
+        d.hit ? h("span", {}, "limit") : null, h("b", { style: `height: ${(d.bytes / top) * 100}%` })))),
+      h("div", { class: "day-labels" }, k.days.map((d) => h("span", { class: d.today ? "today" : "" },
+        d.today ? "today" : new Date(d.t * 1000 + 43200e3).getDate()))),
+      h("div", { class: "legend muted" },
+        k.daily && k.limit ? h("span", {}, h("i", { class: "dash" }), `daily limit ${gb(k.limit)}`) : null,
+        hits ? h("span", {}, h("i", { style: "background: var(--bad)" }), "limit reached") : null,
+        h("span", {}, "faded bar: today so far")));
+  };
+
+  const servers = () => {
+    if (!data.servers.length) return null;
+    const tot = data.servers.reduce((a, s) => a + s.bytes, 0);
+    return h("section", { class: "card clip", "aria-labelledby": "u-srv" },
+      h("div", { class: "card-head" }, h("h2", { id: "u-srv" }, "Today by server"),
+        h("span", { class: "small muted" }, `${gb(tot)} through podkop since 00:00`)),
+      h("div", { class: "scroll-x" }, h("table", {},
+        h("tr", {}, h("th", { scope: "col" }, "Server"), h("th", { scope: "col" }, "Key"), h("th", { scope: "col" }, "Rule"),
+          h("th", { scope: "col", style: "width: 32%" }, "Share"), h("th", { scope: "col", class: "r" }, "Traffic")),
+        data.servers.slice(0, 20).map((s) => h("tr", {},
+          h("td", {}, s.name), h("td", { class: "muted" }, s.key || "–"), h("td", { class: "mono-cell" }, s.rule),
+          h("td", {}, h("div", { class: "ubar thin" }, h("div", { style: `width: ${(s.bytes / tot) * 100}%` }))),
+          h("td", { class: "r num" }, gb(s.bytes)))))));
+  };
+
+  const addLink = () => {
+    const f = { link: h("input", { class: "input mono", id: "nk-link", placeholder: "vless://…" }),
+      label: h("input", { class: "input", id: "nk-label", placeholder: "e.g. fra-personal" }),
+      limit: h("input", { class: "input mid", id: "nk-limit", inputmode: "decimal", placeholder: "10" }) };
+    return h("form", { class: "card pad", "aria-labelledby": "u-add", onsubmit: async (e) => {
+      e.preventDefault();
+      try {
+        await api("POST", `/api/routers/${id}/keys`, { link: f.link.value.trim(), label: f.label.value.trim(), limit_gb: f.limit.value || 0 });
+        await load(); draw();
+      } catch (err) { toast(err.message, true); }
+    } },
+    h("h2", { id: "u-add" }, "Add a single link"),
+    h("div", { class: "auto-grid", style: "grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr))" },
+      h("div", { class: "field", style: "grid-column: span 2" }, h("label", { for: "nk-link" }, "Link"), f.link),
+      h("div", { class: "field" }, h("label", { for: "nk-label" }, "Name"), f.label),
+      h("div", { class: "field" }, h("label", { for: "nk-limit" }, "GB per day"), h("div", { class: "unit" }, f.limit, h("span", {}, "GB")))),
+    h("div", {}, h("button", { type: "submit", class: "btn" }, "Add")));
+  };
+
+  const editKey = (k) => {
+    const st = k.settings;
+    const v = { ...st };
+    const out = h("div");
+    const body = () => [
+      h("div", { class: "field" }, h("label", { for: "ek-label" }, "Name"),
+        h("input", { class: "input", id: "ek-label", value: v.label, placeholder: k.label, oninput: (e) => { v.label = e.target.value; } })),
+      k.kind === "sub" ? h("div", { class: "field" }, h("span", { class: "label" }, "Limit"),
+        seg([["provider", "From the provider"], ["manual", "My own"]], v.limit_source, (x) => { v.limit_source = x; redraw(); }, { label: "Limit" })) : null,
+      v.limit_source === "manual" || k.kind === "link" ? h("div", { class: "field" }, h("label", { for: "ek-gb" }, "Limit"),
+        h("div", { class: "unit" }, h("input", { class: "input mid", id: "ek-gb", inputmode: "decimal", value: String(v.limit_gb || ""),
+          oninput: (e) => { v.limit_gb = e.target.value; } }), h("span", {}, "GB"))) : null,
+      h("div", { class: "field" }, h("span", { class: "label" }, "Period"),
+        seg([...(k.kind === "sub" ? [["", "Auto"]] : []), ["day", "Day"], ["month", "Month"], ...(k.kind === "sub" ? [["none", "Whole key"]] : [])],
+          v.period, (x) => { v.period = x; redraw(); }, { label: "Period" })),
+      h("div", { class: "row", style: "gap: 16px" },
+        h("div", { class: "field" }, h("label", { for: "ek-reset" }, "Resets at"),
+          h("input", { class: "input mid num", id: "ek-reset", type: "time", value: v.reset_time, oninput: (e) => { v.reset_time = e.target.value; } })),
+        h("div", { class: "field" }, h("label", { for: "ek-thr" }, "Act at"),
+          h("div", { class: "unit" }, h("input", { class: "input mid", id: "ek-thr", inputmode: "numeric", value: String(v.threshold),
+            oninput: (e) => { v.threshold = e.target.value; } }), h("span", {}, "%")))),
+      out];
+    const box = h("div", { class: "stack" });
+    const redraw = () => put(box, body());
+    redraw();
+    const m = modal({ title: `Limit of ${k.label}`, narrow: true, body: box,
+      foot: [k.kind === "link" ? h("button", { type: "button", class: "btn danger", onclick: async () => {
+        if (!confirm(`Remove ${k.label}?`)) return;
+        try { await api("DELETE", `/api/keys/${k.id}`); m.close(); await load(); draw(); } catch (e) { toast(e.message, true); }
+      } }, "Remove") : h("span"),
+      h("div", { class: "row" }, h("button", { type: "button", class: "btn", onclick: () => m.close() }, "Cancel"),
+        h("button", { type: "button", class: "btn primary", onclick: async () => {
+          try {
+            await api("PUT", `/api/keys/${k.id}`, { label: v.label, limit_source: v.limit_source, limit_gb: v.limit_gb || 0,
+              period: v.period, reset_time: v.reset_time, threshold: v.threshold });
+            m.close(); await load(); draw();
+          } catch (e) { put(out, h("p", { class: "problem-box" }, e.message)); }
+        } }, "Save"))] });
+  };
+
+  const refresh = h("button", { type: "button", class: "btn", onclick: async (e) => {
+    const b = e.currentTarget; b.disabled = true;
+    try { data = await api("POST", `/api/routers/${id}/usage/refresh`); draw(); } catch (err) { toast(err.message, true); }
+    b.disabled = false;
+  } }, icon("refresh", 15), "Ask providers now");
+
+  const draw = () => {
+    const rt = S.routers[id];
+    const old = rt && rt.status && rt.status.agent.version.localeCompare("0.2.0", undefined, { numeric: true }) < 0;
+    const big = data.keys.filter((k) => k.daily && k.limit && k.series.length);
+    const small = data.keys.filter((k) => !big.includes(k));
+    put(page,
+      pageHead("Keys and usage", null, refresh),
+      old ? h("div", { class: "banner" }, h("span", { class: "dot warn" }),
+        h("span", { class: "grow" }, "podkop-agent on this router is too old to count traffic."), h("a", { class: "alink", href: "#/settings" }, "Reinstall agent")) : null,
+      warnings(),
+      data.keys.length ? null : h("div", { class: "card empty" }, "No keys yet: add subscriptions under Servers probe, or a single link below."),
+      big.map(bigCard),
+      small.length ? h("div", { class: "cards-2" }, small.map(smallCard)) : null,
+      history(), servers(), addLink(),
+      h("p", { class: "small muted" }, "Provider numbers are read every 10 minutes; the split by rule and server is counted on the router."));
+  };
+
+  await load();
+  draw();
+  S.view = { onUsage: (m) => { if (m.router_id === id && !document.querySelector(".modal-bg") && !page.querySelector("form :focus")) load().then(draw).catch(() => {}); } };
 }
 
 // --- the routing draft ---------------------------------------------------------------------------------
@@ -2597,6 +2874,7 @@ function connect() {
       }
     } else if (m.type === "log") v.onLog && v.onLog(m);
     else if (m.type === "probe") v.onProbe && v.onProbe(m);
+    else if (m.type === "usage") v.onUsage && v.onUsage(m);
     else if (m.type === "job") {
       const fn = S.jobWatch.get(m.version);
       if (fn) fn(m.job);

@@ -309,7 +309,78 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
             if k in body:
                 fields[k] = str(body[k]).strip()
         db.set_probe_settings(rid, **fields)
+        if "keys" in fields:
+            db.sync_sub_keys(rid, fields["keys"])
         return db.probe_settings(rid)
+
+    # --- keys and usage -------------------------------------------------------------------
+    @app.get("/api/routers/{rid}/usage", dependencies=[api])
+    async def get_usage(rid: int):
+        router_or_404(rid)
+        return hub.usage(rid)
+
+    @app.post("/api/routers/{rid}/usage/refresh", dependencies=[api])
+    async def refresh_usage(rid: int):
+        rt = router_or_404(rid)
+        await hub.read_usage(rt)
+        await hub.check_usage(rt)
+        return hub.usage(rid)
+
+    @app.post("/api/routers/{rid}/keys", dependencies=[api])
+    async def add_key(rid: int, body: dict):
+        """A single link as a key, with a limit of your own."""
+        router_or_404(rid)
+        link = str(body.get("link", "")).strip()
+        if podkop.link_protocol(link) not in podkop.PROTOCOLS:
+            raise HTTPException(400, f"a link starts with {', '.join(p + '://' for p in podkop.PROTOCOLS)}")
+        if any(k["url"] == link for k in db.keys(rid)):
+            raise HTTPException(400, "this link is already a key")
+        kid = db.add_link_key(rid, link, str(body.get("label", "")).strip()[:60], _gb(body.get("limit_gb", 0)))
+        return {"id": kid}
+
+    @app.put("/api/keys/{kid}", dependencies=[api])
+    async def update_key(kid: int, body: dict):
+        k = db.key(kid)
+        if not k:
+            raise HTTPException(404, "no such key")
+        fields = {}
+        if "label" in body:
+            fields["label"] = str(body["label"]).strip()[:60]
+        if "limit_gb" in body:
+            fields["limit_gb"] = _gb(body["limit_gb"])
+        for name, allowed in (("limit_source", ("provider", "manual")), ("period", ("", "day", "month", "none")),
+                              ("action", ("warn", "avoid"))):
+            if name in body:
+                if body[name] not in allowed:
+                    raise HTTPException(400, f"{name} must be one of {', '.join(a or '(auto)' for a in allowed)}")
+                fields[name] = body[name]
+        if "reset_time" in body:
+            if not _hhmm(str(body["reset_time"])):
+                raise HTTPException(400, "time must be HH:MM")
+            fields["reset_time"] = str(body["reset_time"])
+        if "threshold" in body:
+            try:
+                fields["threshold"] = int(body["threshold"])
+            except (TypeError, ValueError):
+                fields["threshold"] = 0
+            if not 50 <= fields["threshold"] <= 100:
+                raise HTTPException(400, "the threshold is 50 to 100%")
+        if k["kind"] == "link":
+            fields.pop("limit_source", None)
+        db.update_key(kid, **fields)
+        if rt := hub.routers.get(k["router_id"]):
+            await hub.check_usage(rt)
+        return db.key(kid)
+
+    @app.delete("/api/keys/{kid}", dependencies=[api])
+    async def delete_key(kid: int):
+        k = db.key(kid)
+        if not k:
+            raise HTTPException(404, "no such key")
+        if k["kind"] != "link":
+            raise HTTPException(400, "remove a subscription under Servers probe")
+        db.delete_key(kid)
+        return {"ok": True}
 
     @app.post("/api/routers/{rid}/probe/start", dependencies=[api])
     async def probe_start(rid: int):
@@ -405,6 +476,16 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
 
     return app
+
+
+def _gb(v) -> float:
+    try:
+        gb = float(v or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "the limit is a number of GB") from None
+    if not 0 <= gb <= 100000:
+        raise HTTPException(400, "the limit is a number of GB")
+    return gb
 
 
 def _hhmm(s: str) -> bool:

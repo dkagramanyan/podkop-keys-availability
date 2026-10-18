@@ -1,6 +1,6 @@
 """The manager's core: one runtime per router (status polling, the agent's
-live event stream, apply jobs, probe runs), the nightly probe schedule, and
-fan-out of live updates to the browsers."""
+live event stream, apply jobs, probe runs, key usage and traffic), the
+nightly probe schedule, and fan-out of live updates to the browsers."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import logging
 import time
 from pathlib import Path
 
-from . import podkop
+from . import podkop, usage
 from .agent import Agent, AgentError
 from .db import DB
 
@@ -22,6 +22,8 @@ OK_JOB_STATES = {"applied", "saved", "unchanged"}
 # events shown next to the router's name until something newer happens
 ALERT_EVENTS = ("reverted", "revert_failed")
 POLL_SECONDS = 30
+TRAFFIC_SECONDS = 60     # the router's traffic per server
+USAGE_SECONDS = 600      # the providers' numbers, read through the router
 
 
 class RouterRuntime:
@@ -36,6 +38,7 @@ class RouterRuntime:
         self.config: dict | None = None    # the last config-get
         self.draft: dict | None = None     # summary of the unapplied draft
         self.alert: dict | None = None     # the last change undone on the router
+        self.usage: dict = {"pct": None, "alerts": []}   # daily limits, for the menu and Overview
         self.online = False
         self.error = ""
         self.down_since: float | None = None
@@ -47,7 +50,7 @@ class RouterRuntime:
         return {"id": self.id, "name": self.row["name"], "host": self.row["host"], "port": self.row["port"],
                 "online": self.online, "error": self.error, "checked": self.checked, "down_since": self.down_since,
                 "status": self.status, "proxies": self.proxies, "names": self.names,
-                "draft": self.draft, "alert": self.alert}
+                "draft": self.draft, "alert": self.alert, "usage": self.usage}
 
 
 class Hub:
@@ -78,7 +81,9 @@ class Hub:
                          f"({', '.join('?' * len(ALERT_EVENTS))}) ORDER BY id DESC LIMIT 1", rt.id, *ALERT_EVENTS)
         rt.alert = ev
         self.update_draft(rt)
-        rt.tasks = [asyncio.create_task(self._poll_loop(rt)), asyncio.create_task(self._watch_loop(rt))]
+        self.db.sync_sub_keys(rt.id, self.db.probe_settings(rt.id)["keys"])
+        rt.tasks = [asyncio.create_task(self._poll_loop(rt)), asyncio.create_task(self._watch_loop(rt)),
+                    asyncio.create_task(self._usage_loop(rt))]
         return rt
 
     async def _stop_router(self, rid: int) -> None:
@@ -311,9 +316,24 @@ class Hub:
         return {r["section"]: podkop.auto_pick(status.get("rows") or [], r, max_ping, min_speed)
                 for r in self.db.auto_rules(rid)}
 
+    def _avoided_links(self, rid: int) -> set:
+        """Links of the keys that passed their traffic threshold and are set to
+        move rules to other keys."""
+        now = time.time()
+        return {usage.norm(link) for k in self.db.keys(rid) if k["action"] == "avoid" and (k["acted_until"] or 0) > now
+                for link in (k["links"] if k["kind"] == "sub" else [k["url"]])}
+
     def probe_config(self, rid: int, cur: dict, status: dict) -> dict:
         """The router's config with the probe's lists and the rules by country
-        filled in; ValueError when nothing would change."""
+        filled in, without the servers of keys moved away from; ValueError
+        when nothing would change."""
+        if avoided := self._avoided_links(rid):
+            keep = [r for r in status.get("rows") or [] if usage.norm(r.get("link") or "") not in avoided]
+            lists = {n: [x for x in v if usage.norm(x) not in avoided] for n, v in (status.get("lists") or {}).items()}
+            for n in ("main", "youtube"):
+                if not lists.get(n) and lists.get(f"{n}_fallback"):
+                    lists[n], lists[f"{n}_fallback"] = lists[f"{n}_fallback"], []
+            status = dict(status, rows=keep, lists=lists)
         ps, lists = self.db.probe_settings(rid), status.get("lists") or {}
         picks = self.auto_picks(rid, status)
         if not lists.get("main") and not lists.get("youtube") and not any(p["links"] for p in picks.values()):
@@ -325,6 +345,116 @@ class Hub:
         cur = await self.config(rid)
         new = self.probe_config(rid, cur, status)
         return (await self.apply(rid, cur["fingerprint"], new, note, "probe"))["version"]
+
+    # --- keys and usage --------------------------------------------------------------------
+    async def _usage_loop(self, rt: RouterRuntime) -> None:
+        last = 0.0
+        while True:
+            await asyncio.sleep(TRAFFIC_SECONDS)
+            if not rt.online:
+                continue
+            try:
+                await self.read_traffic(rt)
+                if time.time() - last >= USAGE_SECONDS:
+                    last = time.time()
+                    await self.read_usage(rt)
+            except AgentError as e:
+                log.info("usage %s: %s", rt.row["host"], e.message)
+            await self.check_usage(rt)
+
+    async def read_usage(self, rt: RouterRuntime) -> None:
+        """Each subscription's usage header and server list, fetched on the router."""
+        keys = {k["url"]: k for k in self.db.keys(rt.id) if k["kind"] == "sub"}
+        if not keys:
+            return
+        now = time.time()
+        for r in await rt.agent.call("sub-info", payload={"keys": list(keys)}, timeout=300) or []:
+            k = keys.get(r.get("url"))
+            if not k:
+                continue
+            fields = {"title": usage.parse_title(r.get("title") or ""), "why": r.get("why") or ""}
+            if r.get("links"):
+                fields["links"] = r["links"]
+            self.db.update_key(k["id"], **fields)
+            if info := usage.parse_userinfo(r.get("usage") or ""):
+                self.db.add_key_usage(k["id"], now, info["used"], info["total"], info["expire"])
+
+    async def read_traffic(self, rt: RouterRuntime) -> None:
+        """The bytes per server since the last read, stored by hour, key and rule."""
+        cur = await rt.agent.call("traffic", timeout=30)
+        last = self.db.get_setting(f"traffic:{rt.id}")
+        self.db.set_setting(f"traffic:{rt.id}", cur)
+        if not last or not rt.config:
+            return
+        base = last.get("servers") or {} if last.get("since") == cur.get("since") else {}
+        tags = podkop.tag_links(rt.config["config"])
+        index = usage.link_index(self.db.keys(rt.id))
+        hour = int(time.time() // 3600 * 3600)
+        for tag, total in (cur.get("servers") or {}).items():
+            n = total - base.get(tag, 0)
+            if n < 0:
+                n = total
+            if n > 0 and tag in tags:
+                rule, link = tags[tag]
+                self.db.add_traffic(rt.id, hour, index.get(usage.norm(link), 0), rule, link, n)
+
+    def usage(self, rid: int) -> dict:
+        now = time.time()
+        since = now - 15 * usage.DAY
+        traffic = self.db.traffic(rid, since)
+        keys = [usage.key_usage(k, self.db.key_usage(k["id"], since), [r for r in traffic if r["key_id"] == k["id"]], now)
+                for k in self.db.keys(rid)]
+        return {"now": now, "keys": keys,
+                "servers": usage.servers_today(traffic, {k["id"]: k["label"] for k in keys}, now)}
+
+    async def check_usage(self, rt: RouterRuntime) -> None:
+        """Act on keys past their threshold once per day, move rules away from
+        or back to keys, and refresh the summary for the menu and Overview."""
+        u = self.usage(rt.id)
+        now = u["now"]
+        for k in u["keys"]:
+            if usage.over_threshold(k) and not (k["acted_until"] or 0) > now:
+                self.db.update_key(k["id"], acted_until=k["next_reset"])
+                self._event(rt, "usage_threshold", {"key": k["label"], "pct": k["pct"], "action": k["action"]})
+        avoid = sorted(k["id"] for k in self.db.keys(rt.id) if k["action"] == "avoid" and (k["acted_until"] or 0) > now)
+        if avoid != (self.db.get_setting(f"avoid:{rt.id}") or []):
+            self.db.set_setting(f"avoid:{rt.id}", avoid)
+            await self._move_rules(rt, [k["label"] for k in u["keys"] if k["id"] in avoid])
+        daily = [k for k in u["keys"] if k["daily"] and k["limit"]]
+        rt.usage = {"pct": max((k["pct"] for k in daily), default=None),
+                    "alerts": [{k_: k[k_] for k_ in ("id", "label", "used", "limit", "pct", "threshold", "action", "forecast")}
+                               for k in daily if usage.over_threshold(k) or (k["forecast"] or {}).get("hits_today")]}
+        self.publish({"type": "usage", "router_id": rt.id})
+        self.publish({"type": "router", "router": rt.snapshot()})
+
+    async def _move_rules(self, rt: RouterRuntime, labels: list) -> None:
+        """Rebuild the probe's rules from its last run without the servers of
+        the keys moved away from (or with them again, after the reset). Only
+        rules that held those servers (or were changed last time) are touched."""
+        status = self.db.last_probe_result(rt.id)
+        if not status:
+            self._event(rt, "usage_move_failed", {"message": "no probe run to take other servers from"})
+            return
+        try:
+            cur = await self.config(rt.id)
+            new = self.probe_config(rt.id, cur, status)
+            avoided = self._avoided_links(rt.id)
+            touched = set(self.db.get_setting(f"moved:{rt.id}") or []) | {
+                sec for sec, link in podkop.tag_links(cur["config"]).values() if usage.norm(link) in avoided}
+            old = podkop.sections_by_name(cur["config"])
+            secs = [sec if sec["name"] in touched else old[sec["name"]]
+                    for sec in new["sections"] if sec["name"] in old or sec["name"] in touched]
+            if all(sec["name"] in old for sec in secs):     # nothing added: keep the rules' order
+                order = [sec["name"] for sec in cur["config"]["sections"]]
+                secs.sort(key=lambda sec: order.index(sec["name"]))
+            new = dict(new, sections=secs)
+            self.db.set_setting(f"moved:{rt.id}", sorted(touched) if avoided else [])
+            if not podkop.diff(cur["config"], new):
+                return
+            note = f"traffic limit of {', '.join(labels)}: rules moved to other keys" if labels else "traffic limit reset"
+            await self.apply(rt.id, cur["fingerprint"], new, note, "usage")
+        except (AgentError, ValueError) as e:
+            self._event(rt, "usage_move_failed", {"message": str(e)})
 
     async def _scheduler(self) -> None:
         while True:
