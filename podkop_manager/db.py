@@ -86,6 +86,7 @@ COLUMNS = [
     ("auto_rules", "min_speed", "REAL NOT NULL DEFAULT 40"),
     ("auto_rules", "youtube", "TEXT NOT NULL DEFAULT ''"),
     ("probe_settings", "fix_fingerprint", "INTEGER NOT NULL DEFAULT 0"),
+    ("probe_settings", "test_from", "TEXT NOT NULL DEFAULT 'router'"),
 ]
 
 
@@ -246,7 +247,7 @@ class DB:
         self.x("INSERT OR IGNORE INTO probe_settings (router_id) VALUES (?)", rid)
         for k, v in fields.items():
             assert k in {"keys", "options", "schedule", "auto_apply", "main_section", "youtube_section",
-                         "last_run_day", "fix_fingerprint"}
+                         "last_run_day", "fix_fingerprint", "test_from"}
             self.x(f"UPDATE probe_settings SET {k} = ? WHERE router_id = ?",
                    json.dumps(v) if k in ("keys", "options") else v, rid)
 

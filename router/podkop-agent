@@ -12,7 +12,7 @@
 # $SSH_ORIGINAL_COMMAND, requests come as JSON on stdin, answers go as JSON to
 # stdout: {"v":1,"ok":true,"data":...} or {"v":1,"ok":false,"error":{...}}.
 
-AGENT_VERSION="0.3.2"
+AGENT_VERSION="0.4.0"
 PROTO=1
 ETC=/etc/podkop-agent
 RUN=/tmp/podkop-agent
@@ -940,6 +940,36 @@ cmd_sub_info() {
                          elif $r[0] == "L" and length > 0 then .[-1].links += [$r[1:] | join("\t")] else . end)')"
 }
 
+# probe-nodes: stdin {"keys": [...], "fix_fingerprint": bool}: every server of
+# the keys as {link, outbound} (or {link, why} when podkop can't use it), made
+# by podkop-probe with podkop's own parser, for the manager to test them on
+# its server through this router
+cmd_probe_nodes() {
+  [ -x "$PROBE" ] || fail no_probe "podkop-probe is not installed"
+  _req=$(cat)
+  printf '%s' "$_req" | jq -e '.keys | type == "array" and length > 0' >/dev/null 2>&1 || fail bad_request 'expected {"keys": [...]}'
+  set -f; set --
+  printf '%s' "$_req" | jq -e '.fix_fingerprint == true' >/dev/null 2>&1 && set -- --fix-fingerprint
+  for _k in $(printf '%s' "$_req" | jq -r '.keys[] | strings'); do
+    key_ok "$_k" || fail bad_request "a key is not an http(s) address"
+    set -- "$@" -s "$_k"
+  done
+  set +f
+  _o="$RUN/nodes.$$"
+  "$PROBE" --build-nodes --no-color "$@" > "$_o" 2> "$_o.err"; _rc=$?
+  if [ "$_rc" != 0 ]; then
+    _why=$(grep -v '^[[:space:]]*$' "$_o.err" | tail -n 2 | tr '\n' ' '); rm -f "$_o" "$_o.err"
+    case "$_why" in *"unknown option: --build-nodes"*) fail old_probe "podkop-probe can't build nodes: reinstall the agent" ;; esac
+    fail probe "${_why:-podkop-probe failed}"
+  fi
+  # (OpenWrt's jq has no regular expressions)
+  _r=$(jq -Rsc 'split("\n") | map(split("\t") | select(length > 1 and (.[0] | contains("://")) and (.[0] | contains(" ") | not))
+    | {link: .[0], ob: (.[1:] | join("\t"))}
+    | if (.ob | startswith("!")) then {link, why: .ob[1:]} else {link, outbound: (.ob | fromjson)} end)' "$_o")
+  rm -f "$_o" "$_o.err"
+  reply "${_r:-[]}"
+}
+
 # traffic: bytes per server since the agent started (see traffic_poll)
 cmd_traffic() {
   reply "$(jq -c '{since, servers, links: (.links // {})}' "$RUN/traffic/state.json" 2>/dev/null || echo '{"since":"","servers":{},"links":{}}')"
@@ -1040,6 +1070,7 @@ case "$_cmd" in
   probe-config)  cmd_probe_config ;;
   probe-cron)    cmd_probe_cron "$@" ;;
   sub-info)      cmd_sub_info ;;
+  probe-nodes)   cmd_probe_nodes ;;
   traffic)       cmd_traffic ;;
   uninstall)
     [ -f /usr/share/podkop-agent/install.sh ] || fail not_found "install.sh is not on the router"
@@ -1055,7 +1086,7 @@ case "$_cmd" in
       _run-probe) run_probe ;;
     esac ;;
   help|-h|--help)
-    echo "podkop-agent $AGENT_VERSION: status config-get validate apply job pin proxies exit-ip delays logs watch service probe-start probe-status probe-config probe-cron sub-info traffic uninstall version" ;;
+    echo "podkop-agent $AGENT_VERSION: status config-get validate apply job pin proxies exit-ip delays logs watch service probe-start probe-status probe-config probe-cron sub-info probe-nodes traffic uninstall version" ;;
   *) fail bad_request "unknown command $_cmd" ;;
 esac
 # end of podkop-agent

@@ -32,6 +32,38 @@ def known_hosts_line(host: str, port: int, host_key: str) -> str:
     return f"{target} {host_key}\n"
 
 
+# the line for the router's /etc/dropbear/authorized_keys that lets the
+# manager's forwarding key open connections through the router and nothing
+# else: no shell, no command (it ends at once), no terminal, no agent or X11
+FORWARD_OPTIONS = 'command="/bin/false",no-agent-forwarding,no-X11-forwarding,no-pty'
+
+
+def forward_line(public_key: str) -> str:
+    return f"{FORWARD_OPTIONS} {public_key}"
+
+
+async def check_forward(host: str, port: int, host_key: str, key: Path) -> str:
+    """Logs in with the forwarding key and opens a connection through the
+    router, as probes run on the manager do. Returns a short "ok" text."""
+    async def go():
+        async with asyncssh.connect(
+                host, port=port, username="root", client_keys=[str(key)], agent_path=None, password=None,
+                known_hosts=asyncssh.import_known_hosts(known_hosts_line(host, port, host_key)),
+                preferred_auth="publickey") as conn:
+            _, w = await conn.open_connection("ipinfo.io", 443)
+            w.close()
+    try:
+        await asyncio.wait_for(go(), 20)
+    except asyncssh.PermissionDenied:
+        raise AgentError("forward_key", "the router does not accept the forwarding key: add its line "
+                         "to /etc/dropbear/authorized_keys") from None
+    except asyncssh.ChannelOpenError as e:
+        raise AgentError("forward_denied", f"the router refuses to forward connections: {e.reason}") from None
+    except (OSError, asyncssh.Error, asyncio.TimeoutError) as e:
+        raise AgentError("unreachable", f"cannot connect to {host}: {e or type(e).__name__}") from None
+    return "the router forwards connections for this server"
+
+
 class Agent:
     def __init__(self, host: str, port: int, host_key: str, client_key: Path):
         self.host, self.port, self.host_key, self.client_key = host, port, host_key, client_key

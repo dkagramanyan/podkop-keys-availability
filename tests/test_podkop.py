@@ -173,3 +173,15 @@ def test_probe_rows_match_picks_with_the_fingerprint_fixed():
     picks = {"main": {"links": [podkop.fix_fingerprint(link)], "fallback": []}}
     [row] = podkop.probe_rows({"rows": rows}, [], picks)
     assert row["goes_to"] == [{"rule": "main", "fallback": False}] and row["reason"] == ""
+
+
+def test_probe_csv_rows_like_the_agent():
+    text = ("n,verdict,ok,total,min,median,p90,mbit_s,exit_ip,country,youtube,youtube_ms,node\n"
+            '2,GOOD,20,20,0.1,0.2,0.3,50.0,1.2.3.4,NL,ok:RU,0.15,"A, ""x"""\n'
+            "1,DEAD,0,4,-,-,-,-,-,-,,,B\n")
+    rows = podkop.probe_csv_rows(text, "2\tvless://a@h:1#A\n")
+    assert rows[0] == {"n": "2", "verdict": "GOOD", "ok": "20", "total": "20", "min": "0.1", "median": "0.2",
+                       "p90": "0.3", "mbit": "50.0", "exit_ip": "1.2.3.4", "country": "NL", "youtube": "ok:RU",
+                       "youtube_ms": "0.15", "node": 'A, "x"', "link": "vless://a@h:1#A"}
+    assert rows[1]["node"] == "B" and rows[1]["link"] is None
+    assert "link" not in podkop.probe_csv_rows(text)[0]

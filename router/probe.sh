@@ -12,7 +12,7 @@
 #
 # https://github.com/dkagramanyan/podkop-manager
 
-VERSION="1.21.0"
+VERSION="1.22.0"
 REPO_URL="https://github.com/dkagramanyan/podkop-manager"
 RELEASE_URL="$REPO_URL/releases/latest/download/probe.sh"
 BIN=/usr/bin/podkop-probe            # installed copy, used by the nightly run
@@ -60,6 +60,11 @@ YT_VIDEO=jNQXAC9IVRw                 # "Me at the zoo": public everywhere, never
 YT_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 APPLY_SAVED=0
 SUB_INFO=0
+# podkop-manager tests on its own server: the router turns the keys into
+# sing-box outbounds with podkop's parser (--build-nodes), the manager tests
+# them (--nodes) with every connection going out through the router over SSH
+# (--via), so the servers see the router's address
+BUILD_NODES=0; NODES_FILE=""; VIA=""; VIA_KEY=""; VIA_HOST_KEY=""
 CRON=0; CRON_TIME=""; INSTALL=0; UNINSTALL=0; UPDATE=0; NO_UPDATE=0
 COUNTRIES=""                         # "" = all; europe; or DE,NL,...
 # Subscription panels (Remnawave, Marzban, 3x-ui...) only hand the real server
@@ -134,6 +139,13 @@ YouTube (a separate podkop section for YouTube traffic):
   --apply-saved     put the lists of the last run into podkop, no new test
   --sub-info        for podkop-manager: each -s key's usage header and links
                     (they are kept in /tmp until the router restarts)
+  --build-nodes     for podkop-manager: print each server as "link<TAB>sing-box
+                    outbound" (or "link<TAB>!why podkop can't use it"), no test
+  --nodes FILE      test the servers of such a file (no podkop needed)
+  --via USER@HOST:PORT  send every test connection through this SSH server
+                    (the router), so the servers see its address; TCP only
+  --via-key FILE    SSH private key for --via
+  --via-host-key KEY  the SSH server's host key ("ssh-ed25519 AAAA...")
 
 Podkop (for link sources: -s, -f, links):
   --top N           how many best nodes to offer for podkop   (default $TOP);
@@ -206,7 +218,7 @@ is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -gt 0 ]; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    -f|-s|-C|--config|-n|-c|-j|-t|-u|-p|-o|--top|--section|--speed-url|--cron-line|--countries|--speed-jobs|--youtube-noads|--max-ping|--min-speed|--yt-section|--apply-to)
+    -f|-s|-C|--config|-n|-c|-j|-t|-u|-p|-o|--top|--section|--speed-url|--cron-line|--countries|--speed-jobs|--youtube-noads|--max-ping|--min-speed|--yt-section|--apply-to|--nodes|--via|--via-key|--via-host-key)
       [ $# -ge 2 ] || { echo "option $1 needs a value" >&2; usage 1; }
       case "$1" in
         -f) FILE="$2" ;; -s) SUBS="$SUBS$2
@@ -219,6 +231,7 @@ while [ $# -gt 0 ]; do
         --countries) COUNTRIES="$2" ;;
         --max-ping) MAX_PING="$2" ;; --min-speed) MIN_SPEED="$2" ;; --yt-section) YT_SECTION="$2" ;;
         --apply-to) APPLY_TO="$2" ;;
+        --nodes) NODES_FILE="$2" ;; --via) VIA="$2" ;; --via-key) VIA_KEY="$2" ;; --via-host-key) VIA_HOST_KEY="$2" ;;
         --youtube-noads) YT_NOADS=$(printf '%s' "$2" | tr 'a-z,' 'A-Z ' | sed 's/\bNONE\b//g; s/^ *//; s/ *$//') ;;
       esac
       shift 2 ;;
@@ -237,6 +250,7 @@ while [ $# -gt 0 ]; do
     --update) UPDATE=1; shift ;;
     --apply-saved) APPLY_SAVED=1; shift ;;
     --sub-info) SUB_INFO=1; shift ;;
+    --build-nodes) BUILD_NODES=1; APPLY=no; shift ;;
     --no-update) NO_UPDATE=1; shift ;;
     --cron) CRON=1; shift ;;
     --no-color) COLOR=0; shift ;;
@@ -265,6 +279,12 @@ done
 [ -z "$J" ] || is_uint "$J" || die "-j must be a positive number"
 [ -z "$SPEED_J" ] || is_uint "$SPEED_J" || die "--speed-jobs must be a positive number"
 [ "$C" -le "$N" ] || C=$N
+if [ -n "$VIA" ]; then
+  printf '%s' "$VIA" | grep -qE '^[a-z_][a-z0-9_-]*@[0-9A-Za-z.:-]+:[0-9]+$' || die "--via must be USER@HOST:PORT"
+  [ -r "$VIA_KEY" ] || die "--via needs --via-key FILE"
+  printf '%s' "$VIA_HOST_KEY" | grep -qE '^(ssh-ed25519|ecdsa-sha2-nistp[0-9]+|ssh-rsa) [A-Za-z0-9+/=]+$' ||
+    die "--via needs --via-host-key \"ssh-ed25519 AAAA...\""
+fi
 
 setup_color
 
@@ -527,7 +547,7 @@ build_nodes() (
   _i=0
   while [ "$_i" -lt "$COUNT" ]; do
     _i=$((_i + 1)); _d="$WORK/n/$_i"
-    [ -f "$_d/link" ] || continue
+    { [ -f "$_d/link" ] && [ ! -f "$_d/ob.json" ] && [ ! -f "$_d/skip" ]; } || continue
     ( sing_box_cf_add_proxy_outbound '{"outbounds":[]}' node "$(cat "$_d/link")" 0 ) > "$_d/sb.json" 2>/dev/null
     if [ ! -f "$_d/skip" ]; then
       jq -ce '.outbounds[0] | .tag = "node"' "$_d/sb.json" > "$_d/ob.json" 2>/dev/null ||
@@ -543,9 +563,14 @@ build_nodes() (
 
 # --- node sources ------------------------------------------------------------
 
-NODES="$WORK/nodes"        # lines: "L<TAB>link" or "O<TAB>name<TAB>outbound-json"
+NODES="$WORK/nodes"        # lines: "L<TAB>link", "O<TAB>name<TAB>outbound-json" or "N<TAB>link<TAB>outbound-json"
 
 add_links() { extract_links | awk -v t="$TAB" '{print "L" t $0}' >> "$NODES"; }
+
+# add_nodes <file>: the lines of --build-nodes ("link<TAB>outbound" or "link<TAB>!why")
+add_nodes() {
+  grep -E "^$LINK_RE$TAB." "$1" | awk -v t="$TAB" '{print "N" t $0}' >> "$NODES"
+}
 
 from_config() {
   [ -f "$1" ] || die "config not found: $1"
@@ -792,16 +817,31 @@ port_busy() {
 # start-up of each node and ~40 MB of RAM per node tested at the same time.
 SB_PID=""
 
-# sb_config: the config for every node with a port in $WORK/ports
+# sb_config: the config for every node with a port in $WORK/ports. With
+# --via every node and the server names' DNS go through the SSH outbound
+# "via", and inbound "in-via" (port $WORK/via.port) is the router's own line.
 sb_config() {
-  printf '{"log":{"level":"error"},"dns":{"servers":[{"type":"local","tag":"local"}]},"inbounds":['
+  if [ -n "$VIA" ]; then
+    _vh=${VIA#*@}
+    printf '{"log":{"level":"error"},"dns":{"servers":[{"type":"tcp","tag":"local","server":"77.88.8.8","detour":"via"},{"type":"local","tag":"here"}]},"inbounds":['
+    printf '{"type":"mixed","tag":"in-via","listen":"127.0.0.1","listen_port":%s},' "$(cat "$WORK/via.port")"
+  else
+    printf '{"log":{"level":"error"},"dns":{"servers":[{"type":"local","tag":"local"}]},"inbounds":['
+  fi
   awk -F "$TAB" '{ printf "%s{\"type\":\"mixed\",\"tag\":\"in-%s\",\"listen\":\"127.0.0.1\",\"listen_port\":%s}", (NR > 1 ? "," : ""), $1, $2 }' "$WORK/ports"
   printf '],"outbounds":['
   _bsep=""
   while IFS="$TAB" read -r _bn _bpp; do
-    printf '%s' "$_bsep"; jq -c --arg t "n-$_bn" '.tag = $t' "$WORK/n/$_bn/ob.json"; _bsep=","
+    printf '%s' "$_bsep"; jq -c --arg t "n-$_bn" --arg v "$VIA" '.tag = $t | if $v != "" then .detour = "via" else . end' "$WORK/n/$_bn/ob.json"; _bsep=","
   done < "$WORK/ports"
+  if [ -n "$VIA" ]; then
+    printf '%s' "$_bsep"; _bsep=","
+    jq -nc --arg u "${VIA%%@*}" --arg h "${_vh%:*}" --arg p "${_vh##*:}" --arg k "$VIA_KEY" --arg hk "$VIA_HOST_KEY" \
+      '{type: "ssh", tag: "via", server: $h, server_port: ($p | tonumber), user: $u, private_key_path: $k, domain_resolver: "here",
+        host_key: [$hk], host_key_algorithms: ($hk | split(" ")[0] | if . == "ssh-rsa" then ["rsa-sha2-256", "rsa-sha2-512", .] else [.] end)}' | tr -d '\n'
+  fi
   printf '%s{"type":"direct","tag":"direct"}],"route":{"rules":[' "$_bsep"
+  [ -n "$VIA" ] && printf '{"inbound":["in-via"],"outbound":"via"},'
   awk -F "$TAB" '{ printf "%s{\"inbound\":[\"in-%s\"],\"outbound\":\"n-%s\"}", (NR > 1 ? "," : ""), $1, $1 }' "$WORK/ports"
   printf '],"final":"n-%s","default_domain_resolver":"local"}}\n' "$(head -n 1 "$WORK/ports" | cut -f 1)"
 }
@@ -814,6 +854,10 @@ sb_all_start() {
   while :; do
     : > "$WORK/ports"
     _bi=0; _bp=$BASEPORT
+    if [ -n "$VIA" ]; then
+      while port_busy "$_bp"; do _bp=$((_bp + 1)); done
+      echo "$_bp" > "$WORK/via.port"; _bp=$((_bp + 1))
+    fi
     while [ "$_bi" -lt "$COUNT" ]; do
       _bi=$((_bi + 1)); _bd="$WORK/n/$_bi"; rm -f "$_bd/port"
       { [ -f "$_bd/ob.json" ] && [ ! -f "$_bd/skip" ] && [ ! -f "$_bd/nostart" ]; } || continue
@@ -1509,9 +1553,12 @@ if [ "$APPLY_SAVED" = 1 ]; then
 fi
 : > "$NODES"
 
-# podkop's link parser builds the test nodes, podkop-engine (its sing-box) runs them
-{ [ -f "$PODKOP_LIB/sing_box_config_facade.sh" ] && command -v podkop >/dev/null 2>&1; } ||
-  die "podkop not found. Install it: $PODKOP_INSTALL"
+# podkop's link parser builds the test nodes (here, or on the router for
+# --nodes), podkop-engine (its sing-box) runs them
+if [ -z "$NODES_FILE" ]; then
+  { [ -f "$PODKOP_LIB/sing_box_config_facade.sh" ] && command -v podkop >/dev/null 2>&1; } ||
+    die "podkop not found. Install it: $PODKOP_INSTALL"
+fi
 _feat=$(sing-box version 2>/dev/null | sed -n 's/^Features:[[:space:]]*//p')
 for _f in tools.decode-link urltest.fallbacks; do
   case ",$_feat," in *",$_f,"*) ;; *) die "podkop-engine not found (sing-box has no $_f). Install it: $ENGINE_URL" ;; esac
@@ -1521,8 +1568,9 @@ SB_VER=$(sing-box version 2>/dev/null | awk 'NR == 1 {print $3}')
 
 _model=$(cat /tmp/sysinfo/model 2>/dev/null)
 _os=$(sed -n "s/^DISTRIB_DESCRIPTION='\(.*\)'/\1/p" /etc/openwrt_release 2>/dev/null)
-_sys="${_model:+ · $_model}${_os:+ · $_os} · podkop $(podkop show_version 2>/dev/null) · sing-box $SB_VER"
-printf '%spodkop-probe %s%s%s\n' "$BD" "$VERSION" "$R0" "$DM$_sys$R0"
+_pv=$(podkop show_version 2>/dev/null)
+_sys="${_model:+ · $_model}${_os:+ · $_os}${_pv:+ · podkop $_pv} · sing-box $SB_VER"
+[ "$BUILD_NODES" = 1 ] || printf '%spodkop-probe %s%s%s\n' "$BD" "$VERSION" "$R0" "$DM$_sys$R0"
 
 # collect nodes
 if [ -n "$ARGLINKS" ]; then printf '%s' "$ARGLINKS" | add_links; SOURCE="command line"; fi
@@ -1534,8 +1582,12 @@ if [ -n "$FILE" ]; then
   esac
   SOURCE="${SOURCE:+$SOURCE + }$FILE"
 fi
+if [ -n "$NODES_FILE" ]; then
+  [ -f "$NODES_FILE" ] || die "file not found: $NODES_FILE"
+  add_nodes "$NODES_FILE"; SOURCE="${SOURCE:+$SOURCE + }$NODES_FILE"
+fi
 MODE=""
-if [ -z "$ARGLINKS$FILE$SUBS$CONFIG" ] && [ -n "$TTY" ] && [ "$ASSUME_YES" = 0 ]; then
+if [ -z "$ARGLINKS$FILE$SUBS$CONFIG$NODES_FILE" ] && [ -n "$TTY" ] && [ "$ASSUME_YES" = 0 ]; then
   menu
   [ "$MODE" = paste ] && ask_links
 fi
@@ -1573,6 +1625,21 @@ while IFS= read -r _line; do
       _r=${_line#O"$TAB"}
       printf '%s\n' "${_r%%"$TAB"*}" > "$_d/name"
       printf '%s\n' "${_r#*"$TAB"}" > "$_d/ob.json" ;;
+    N"$TAB"*)
+      _r=${_line#N"$TAB"}
+      printf '%s\n' "${_r%%"$TAB"*}" > "$_d/link"
+      link_name "${_r%%"$TAB"*}" > "$_d/name"
+      _r=${_r#*"$TAB"}
+      case "$_r" in
+        !*) printf '%s\n' "${_r#!}" > "$_d/skip" ;;
+        *) printf '%s\n' "$_r" > "$_d/ob.json" ;;
+      esac
+      # through SSH only TCP gets to the server
+      if [ -n "$VIA" ] && [ -f "$_d/ob.json" ]; then
+        case "$(jq -r '.type' "$_d/ob.json" 2>/dev/null)" in
+          hysteria|hysteria2|tuic|wireguard) echo "uses UDP: can't be tested through the router's SSH" > "$_d/skip"; rm -f "$_d/ob.json" ;;
+        esac
+      fi ;;
   esac
   _ncc=$(name_cc "$(cat "$_d/name")"); echo "$_ncc" > "$_d/ncc"
   if ! cc_allowed "$_ncc"; then           # e.g. "🇺🇸 USA" when only Europe is wanted
@@ -1580,7 +1647,19 @@ while IFS= read -r _line; do
   fi
 done < "$NODES"
 COUNT=$_i
-build_nodes
+# (--nodes come built, by podkop on the router)
+[ -f "$PODKOP_LIB/sing_box_config_facade.sh" ] && build_nodes
+
+if [ "$BUILD_NODES" = 1 ]; then
+  _i=0
+  while [ "$_i" -lt "$COUNT" ]; do
+    _i=$((_i + 1)); _d="$WORK/n/$_i"
+    [ -f "$_d/link" ] || continue
+    if [ -f "$_d/ob.json" ]; then _o=$(cat "$_d/ob.json"); else _o="!$(head -n 1 "$_d/skip" 2>/dev/null)"; fi
+    printf '%s\t%s\n' "$(cat "$_d/link")" "$_o"
+  done
+  exit 0
+fi
 
 HAS_PARALLEL=0
 curl --help all 2>/dev/null | grep -q -- '--parallel-immediate' && HAS_PARALLEL=1
@@ -1648,8 +1727,11 @@ elif [ "$J" -gt "$_max" ]; then
 fi
 [ "$J" -gt "$COUNT" ] && J=$COUNT
 
-set -- $(exit_ip)
+# the router's own line: with --via the SSH outbound, else this device
+VIA_PX=""; [ -n "$VIA" ] && [ -n "$SB_PID" ] && VIA_PX="socks5h://127.0.0.1:$(cat "$WORK/via.port")"
+set -- $(exit_ip "$VIA_PX")
 DIRECT_IP=${1:-none}; DIRECT_CC=${2:--}
+[ -n "$VIA_PX" ] && [ "$DIRECT_IP" = none ] && die "no connection through $VIA (SSH): $(grep -v '^[[:space:]]*$' "$WORK/sb.log" 2>/dev/null | tail -n 1 | cut -c 1-300)"
 : > "$WORK/lat.done"
 
 PROG=0; [ -t 1 ] && [ "$VERBOSE" != 1 ] && PROG=1
@@ -1661,7 +1743,7 @@ printf 'Testing %s%s server(s)%s%s ...\n' "$BD" "$COUNT" "$R0" \
 if [ "$VERBOSE" = 1 ]; then
   info "source: ${SOURCE:-?}; outside the countries: $OUT_REGION by name, $OUT_ENTRY by server IP"
   info "test: $N requests per node, $C in flight, $J nodes at a time, timeout ${T}s -> $URL"
-  info "router IP: $DIRECT_IP ($DIRECT_CC)   sing-box $SB_VER"
+  info "router IP: $DIRECT_IP ($DIRECT_CC)${VIA:+ through $VIA}   sing-box $SB_VER"
 fi
 
 mkfifo "$WORK/sem" || die "mkfifo failed"
@@ -1721,7 +1803,7 @@ if [ "$SPEED" = 1 ]; then
     # the line's own speed, measured directly: a node can't show more (see
     # speed_fetch), and one test per ~200 Mbit/s fits on it at once (a node
     # rarely gives more than ~150)
-    _line=$(curl -s -o /dev/null --max-time 5 -w '%{size_download} %{time_total}' "$LINE_URL" 2>/dev/null |
+    _line=$(_px=$VIA_PX; pcurl -s -o /dev/null --max-time 5 -w '%{size_download} %{time_total}' "$LINE_URL" 2>/dev/null |
       awk '$2 > 0 && $1 > 1000000 { printf "%.0f", $1 * 8 / $2 / 1000000 }')
     if [ -n "$_line" ]; then
       LINE_MBIT=$_line

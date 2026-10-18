@@ -30,11 +30,12 @@ def data_dir(arg: str | None) -> Path:
     return d
 
 
-def ssh_key(d: Path) -> tuple[Path, str]:
-    """The manager's own SSH key; routers allow it to run only podkop-agent."""
-    path = d / "id_ed25519"
+def ssh_key(d: Path, name: str = "id_ed25519", comment: str = "podkop-manager") -> tuple[Path, str]:
+    """The manager's own SSH key; routers allow it to run only podkop-agent.
+    (id_forward: the key routers may allow to forward connections, nothing else.)"""
+    path = d / name
     if not path.exists():
-        key = asyncssh.generate_private_key("ssh-ed25519", comment="podkop-manager")
+        key = asyncssh.generate_private_key("ssh-ed25519", comment=comment)
         key.write_private_key(str(path))
         os.chmod(path, 0o600)
     key = asyncssh.read_private_key(str(path))
@@ -60,6 +61,7 @@ def main(argv: list[str] | None = None) -> int:
     db = DB(d / "manager.db")
 
     key_path, public_key = ssh_key(d)
+    ssh_key(d, "id_forward", "podkop-manager-forward")
     if a.command == "public-key":
         print(public_key)
         return 0

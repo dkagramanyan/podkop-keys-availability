@@ -63,6 +63,8 @@ def test_backup_round_trip(tmp_path: Path):
     db = DB(tmp_path / "manager.db")
     db.add_router("home", "192.168.1.1", 22, "ssh-ed25519 AAAA")
     db.add_config("c", {"sections": []}, {}, "test")
+    fwd = tmp_path / "id_forward"
+    asyncssh.generate_private_key("ssh-ed25519").write_private_key(str(fwd))
     data = backup.make(db, key)
     old_key = key.read_bytes()
 
@@ -75,6 +77,7 @@ def test_backup_round_trip(tmp_path: Path):
     pub = backup.restore(db2, key2, data)
     assert [r["name"] for r in db2.routers()] == ["home"] and [c["name"] for c in db2.configs()] == ["c"]
     assert key2.read_bytes() == old_key and pub.startswith("ssh-ed25519 ")
+    assert (other / "id_forward").read_bytes() == fwd.read_bytes()
     with pytest.raises(ValueError, match="not a podkop-manager backup"):
         backup.restore(db2, key2, b"junk")
     assert [r["name"] for r in db2.routers()] == ["home"]

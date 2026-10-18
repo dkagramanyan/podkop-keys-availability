@@ -20,6 +20,7 @@ class FakeRouter:
     agent = FakeAgent()
     status = {"fingerprint": "fp1", "podkop": {"version": "0.7.24"}}
     row = {"name": "home"}
+    local_probe = None
 
     def snapshot(self):
         return {"id": self.id, "draft": self.draft}
@@ -33,7 +34,11 @@ class FakeHub:
     keep_rules = Hub.keep_rules
     restore_rules = Hub.restore_rules
     probe_config = Hub.probe_config
+    probe_status = Hub.probe_status
     _avoided_links = Hub._avoided_links
+
+    def local_probe_missing(self):
+        return "sing-box not found"
 
     async def config(self, rid):
         return {"fingerprint": "fp1", "config": {"sections": [
