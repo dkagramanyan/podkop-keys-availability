@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -27,7 +28,9 @@ class FakeRouter:
 
 
 class FakeHub:
-    src = None
+    src = Path(__file__).resolve().parents[1]
+    key = Path("/nonexistent/id_ed25519")
+    forward_key = Path("/nonexistent/id_forward")
     auto_picks = Hub.auto_picks
     usage = Hub.usage
     load_config = Hub.load_config
@@ -49,9 +52,16 @@ class FakeHub:
         self.db = db
         self.routers = {1: FakeRouter()} if db else {}
         self.published = []
+        self.jobs = set()
 
     def publish(self, msg):
         self.published.append(msg)
+
+    def add_router(self, row):
+        pass
+
+    async def import_found(self, rid):
+        pass
 
     def update_draft(self, rt):
         d = self.db.draft(rt.id)
@@ -76,12 +86,12 @@ class FakeHub:
         return self.routers[rid]
 
 
-def client(tmp_path, with_router=False, router_password=""):
+def client(tmp_path, with_router=False):
     db = DB(tmp_path / "m.db")
     if with_router:
         db.add_router("home", "192.168.1.1", 22, "ssh-ed25519 AAAA host")
     c = TestClient(create_app(db, FakeHub(db if with_router else None), "ssh-ed25519 AAAA test",
-                              "secret-pass", router_password))
+                              "secret-pass"))
     c.db = db
     return c
 
@@ -157,20 +167,34 @@ def test_versions_trigger_reason_and_paging(tmp_path):
         assert [v["id"] for v in c.get(f"/api/routers/1/versions?before={v2}").json()] == [v1]
 
 
-def test_router_password_from_env(tmp_path, monkeypatch):
-    used = []
+def test_add_router_with_the_line_the_command_printed(tmp_path, monkeypatch):
+    paired = []
 
-    async def fake_install(host, port, password, *rest):
-        used.append(password)
-        raise AgentError("auth", "wrong root password")
+    async def fake_pair(host, port, host_key, key):
+        paired.append((host, port, host_key))
+        if host == "10.0.0.9":
+            raise AgentError("auth", "the router does not accept this manager's key: run the command on it first")
+        return {"version": "0.4.0", "protocol": 1}
 
-    monkeypatch.setattr(web, "install", fake_install)
-    with client(tmp_path, router_password="env-root-pass") as c:
+    monkeypatch.setattr(web, "pair", fake_pair)
+    with client(tmp_path) as c:
         c.post("/login", data={"user": "admin", "password": "secret-pass"})
-        assert c.get("/api/manager").json()["router_password"] is True
-        c.post("/api/routers", json={"host": "192.168.1.1", "password": ""}, headers=H)
-        c.post("/api/routers", json={"host": "192.168.1.1", "password": "typed-pass"}, headers=H)
-    assert used == ["env-root-pass", "typed-pass"]
+        cmd = c.post("/api/install-command", json={"allow_clash": "192.168.1.10", "close_clash": True}, headers=H).json()["command"]
+        assert "/releases/download/v" in cmd and "--key 'ssh-ed25519 AAAA test'" in cmd
+        assert "--allow-clash 192.168.1.10" in cmd and "--forward-key" not in cmd and "--keep-clash-open" not in cmd
+        assert c.post("/api/install-command", json={"allow_clash": "1.2.3.4; reboot"}, headers=H).status_code == 400
+        assert c.post("/api/routers", json={"pairing": "podkop-router 192.168.1.1"}, headers=H).status_code == 400
+        line = "podkop-router 192.168.1.1 22 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHostKey"
+        r = c.post("/api/routers", json={"pairing": line, "host": "10.0.0.9"}, headers=H)
+        assert r.status_code == 400 and r.json()["error"]["code"] == "auth"
+        assert c.db.routers() == []
+        r = c.post("/api/routers", json={"pairing": line, "name": "home"}, headers=H)
+        assert r.status_code == 200
+        (row,) = c.db.routers()
+        assert (row["name"], row["host"], row["port"], row["host_key"]) == (
+            "home", "192.168.1.1", 22, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHostKey")
+        assert c.post("/api/routers", json={"pairing": line}, headers=H).status_code == 400   # already added
+    assert paired[-1] == ("192.168.1.1", 22, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHostKey")
 
 
 def test_old_database_gets_new_columns(tmp_path):

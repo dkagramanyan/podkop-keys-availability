@@ -185,3 +185,16 @@ def test_probe_csv_rows_like_the_agent():
                        "youtube_ms": "0.15", "node": 'A, "x"', "link": "vless://a@h:1#A"}
     assert rows[1]["node"] == "B" and rows[1]["link"] is None
     assert "link" not in podkop.probe_csv_rows(text)[0]
+
+
+def test_install_command_and_pairing_line():
+    from podkop_manager.agent import install_command, parse_pairing
+    cmd = install_command("v1.23.0", "ssh-ed25519 AAAA mgr", "ssh-ed25519 BBBB fwd", ["10.0.0.0/24"], False)
+    assert cmd.startswith("wget -qO /tmp/podkop-install.sh https://github.com/dkagramanyan/podkop-manager/releases/download/v1.23.0/install.sh && ")
+    assert "--release v1.23.0 --key 'ssh-ed25519 AAAA mgr' --forward-key 'ssh-ed25519 BBBB fwd' --keep-clash-open --allow-clash 10.0.0.0/24" in cmd
+    assert parse_pairing("  podkop-router 192.168.8.1 2222 ssh-ed25519 AAAAC3Nz+/x=\n") == {
+        "host": "192.168.8.1", "port": 2222, "host_key": "ssh-ed25519 AAAAC3Nz+/x="}
+    for bad in ("", "podkop-router 1.2.3.4 22 ssh-ed25519", "podkop-router 1.2.3.4 x ssh-ed25519 AAAA",
+                "podkop-router 1.2.3.4 22 ssh-dss AAAA", "router 1.2.3.4 22 ssh-ed25519 AAAA"):
+        with pytest.raises(ValueError):
+            parse_pairing(bad)

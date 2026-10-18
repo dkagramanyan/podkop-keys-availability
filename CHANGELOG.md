@@ -22,6 +22,16 @@ podkop-agent and podkop-manager.
     through SSH and are skipped.
   - The Docker image adds busybox, curl, jq and podkop-engine-full's static
     sing-box (checked by SHA-256). The backup keeps the second key.
+- **Add router without the root password:** Add router shows a command to
+  run on the router. It downloads install.sh of the manager's own release
+  (`--release`) and installs podkop-agent, podkop-probe and the manager's key,
+  with the Clash API options and, if ticked, the forwarding-only key
+  (`--forward-key`; a run without it removes that key). At the end it prints
+  `podkop-router <address> <port> <host key>`; pasted into Add router, the
+  manager checks that this host key answers and that its key runs
+  podkop-agent there before it adds the router. **Reinstall agent** shows the
+  same command. The password fields and PODKOP_MANAGER_ROUTER_PASSWORD are
+  gone; the manager never logs in with a password.
 
 ## 1.21.0 — 2026-10-18
 
