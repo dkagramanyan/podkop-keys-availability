@@ -2174,6 +2174,8 @@ async function viewGlobal(main, id) {
   const headBtn = h("span", { style: "display: contents" });
   // the nightly probe is the manager's setting: saved right away, not in the draft
   let probe = (await api("GET", `/api/routers/${id}/probe`).catch(() => null) || {}).settings;
+  const info = S.manager || (S.manager = await api("GET", "/api/manager").catch(() => null)) || {};
+  const lp = info.local_probe || { ready: false, missing: "this manager is too old" };
   const saveProbe = async (patch) => {
     try { probe = await api("PUT", `/api/routers/${id}/probe`, patch); toast("Saved"); } catch (e) { toast(e.message, true); }
     w.redraw();
@@ -2270,7 +2272,27 @@ async function viewGlobal(main, id) {
             h("span", {}, "Apply the result by itself")),
           h("label", { class: "check" }, h("input", { type: "checkbox", checked: !!probe.fix_fingerprint, onchange: (e) => saveProbe({ fix_fingerprint: e.target.checked }) }),
             h("span", { class: "col" }, h("span", {}, "Use the chrome TLS fingerprint"),
-              h("span", {}, "For REALITY links with fp=qq, 360, ios, android or edge, which new servers reject")))) : null),
+              h("span", {}, "For REALITY links with fp=qq, 360, ios, android or edge, which new servers reject"))),
+          h("div", { class: "form-grid" },
+            h("label", { class: "lbl", for: "testfrom" }, "Test servers"),
+            h("div", { class: "ctl" },
+              h("select", { id: "testfrom", class: "input mid", style: "width: auto", onchange: (e) => saveProbe({ test_from: e.target.value }) },
+                h("option", { value: "router", selected: probe.test_from !== "manager" }, "On the router"),
+                h("option", { value: "manager", selected: probe.test_from === "manager", disabled: !lp.ready && probe.test_from !== "manager" },
+                  "On this server, through the router")),
+              h("span", { class: "help" }, probe.test_from === "manager"
+                ? "The servers still see the router's address. Servers that use UDP (hysteria2, TUIC) are not tested."
+                : lp.ready ? "On this server the test is faster and leaves the router's processor free" : `Not possible here: ${lp.missing}`))),
+          probe.test_from === "manager" ? h("div", { class: "col", style: "gap: 8px" },
+            h("span", { class: "small" }, "Add this line to the router's /etc/dropbear/authorized_keys. It lets this server open connections through the router and nothing else: no shell, no commands."),
+            h("div", { class: "row", style: "align-items: flex-start; flex-wrap: nowrap; padding: 10px 12px; border-radius: 6px; background: var(--chip)" },
+              h("code", { class: "grow", style: "font-size: 12px; line-height: 1.5; color: var(--text-2); word-break: break-all" }, lp.forward_line || lp.missing),
+              lp.forward_line ? h("button", { type: "button", class: "btn xs", onclick: async () => {
+                try { await navigator.clipboard.writeText(lp.forward_line); toast("Line copied"); } catch { toast("Select the line and copy it", true); }
+              } }, "Copy") : null),
+            h("div", { class: "row" }, h("button", { type: "button", class: "btn sm", onclick: busyClick(async () => {
+              try { toast((await api("POST", `/api/routers/${id}/probe/check-forward`)).message); } catch (e) { toast(e.message, true); }
+            }) }, "Check the router"))) : null) : null),
       settingsOther(o, defs));
     w.drawBar && w.drawBar();
   };

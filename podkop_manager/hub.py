@@ -7,12 +7,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
+import json
 import logging
+import os
+import shutil
 import time
 from pathlib import Path
 
 from . import configs, podkop, usage
-from .agent import Agent, AgentError
+from .agent import Agent, AgentError, check_forward
 from .db import DB
 
 log = logging.getLogger("podkop_manager")
@@ -26,6 +29,14 @@ TRAFFIC_SECONDS = 60     # the router's traffic per server
 EXIT_SECONDS = 3600      # a section's exit IP is looked up again after this long
 EXIT_RETRY_SECONDS = 600     # ... or this long after the lookup failed
 USAGE_SECONDS = 600      # the providers' numbers, read through the router
+# the programs podkop-probe needs to test servers on this server: busybox's
+# sh and tools first (as on a router), then podkop-engine-full's sing-box
+PROBE_PATH = os.environ.get("PODKOP_MANAGER_PROBE_PATH") or os.environ.get("PATH", "")
+PROBE_SECONDS = 3 * 3600
+
+
+def _utc() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def manager_minutes(router_minutes: int, utc_offset: str) -> int:
@@ -64,6 +75,7 @@ class RouterRuntime:
         self.exit_task: asyncio.Task | None = None
         self.exit_ip = True                # False for an agent before 0.3.2 (no exit-ip)
         self.moving = False                 # a move of rules for the traffic limit is under way
+        self.local_probe: dict | None = None    # the last probe run on this server: state, times, folder
 
     def snapshot(self) -> dict:
         return {"id": self.id, "name": self.row["name"], "host": self.row["host"], "port": self.row["port"],
@@ -75,6 +87,8 @@ class RouterRuntime:
 class Hub:
     def __init__(self, db: DB, key: Path, src: Path):
         self.db, self.key, self.src = db, key, src
+        # the key the routers let forward connections (and nothing else), for probes run here
+        self.forward_key = key.parent / "id_forward"
         self.routers: dict[int, RouterRuntime] = {}
         self.subscribers: set[asyncio.Queue] = set()
         self.tasks: list[asyncio.Task] = []
@@ -315,7 +329,8 @@ class Hub:
                                        message="the manager restarted while sending this change; check the router")
         for r in self.db.q("SELECT id, router_id, trigger FROM probe_runs WHERE state = 'running'"):
             rt = self.routers.get(r["router_id"])
-            if rt and r["router_id"] not in self.probes:
+            local = self.db.probe_settings(r["router_id"]).get("test_from") == "manager"
+            if rt and r["router_id"] not in self.probes and not local:
                 self.probes[rt.id] = asyncio.create_task(self._track_probe(rt, r["id"], r["trigger"]))
             else:
                 self.db.finish_probe_run(r["id"], "failed", {}, None)
@@ -367,8 +382,17 @@ class Hub:
         if rid in self.probes and not self.probes[rid].done():
             raise AgentError("busy", "a probe is already running")
         options = self.probe_options(rid)
-        agent = (((rt.status or {}).get("agent") or {}).get("version") or "0").split(".")
-        if ps.get("fix_fingerprint") and [int(x) for x in agent if x.isdigit()] >= [0, 3, 1]:
+        agent = [int(x) for x in (((rt.status or {}).get("agent") or {}).get("version") or "0").split(".") if x.isdigit()]
+        if ps.get("test_from") == "manager":
+            if why := self.local_probe_missing():
+                raise AgentError("no_engine", f"this server can't test servers: {why}")
+            if agent < [0, 4, 0]:
+                raise AgentError("old_agent", "the router's podkop-agent is too old to test servers here: reinstall it")
+            run_id = self.db.add_probe_run(rid, trigger, ps["keys"])
+            self.probes[rid] = asyncio.create_task(self._run_local_probe(rt, run_id, trigger, options))
+            self.publish({"type": "probe", "router_id": rid, "state": "running", "run": run_id})
+            return run_id
+        if ps.get("fix_fingerprint") and agent >= [0, 3, 1]:
             options.append("--fix-fingerprint")    # test them as they will be used
         await rt.agent.call("probe-start", payload={"keys": ps["keys"], "options": options}, timeout=30)
         run_id = self.db.add_probe_run(rid, trigger, ps["keys"])
@@ -388,6 +412,9 @@ class Hub:
             self.publish({"type": "probe", "router_id": rt.id, "state": st.get("state"), "run": run_id})
             if st.get("state") != "running":
                 break
+        await self._finish_probe(rt, run_id, trigger, st)
+
+    async def _finish_probe(self, rt: RouterRuntime, run_id: int, trigger: str, st: dict) -> None:
         state = st.get("state", "unknown")
         if state not in ("done", "failed"):
             state = "failed"            # still running after 3 hours, or no answer at all
@@ -404,6 +431,100 @@ class Hub:
                 self._event(rt, "probe_apply_failed", {"message": str(e)})
         self.db.finish_probe_run(run_id, state, st, vid)
         self.publish({"type": "probe", "router_id": rt.id, "state": state, "run": run_id})
+
+    # --- probe on this server, through the router -------------------------------------------
+    def local_probe_missing(self) -> str:
+        """What this server lacks to run podkop-probe itself ("" = nothing)."""
+        miss = [p for p in ("sh", "sing-box", "curl", "jq") if not shutil.which(p, path=PROBE_PATH)]
+        if miss:
+            return f"{', '.join(miss)} not found (the Docker image has them)"
+        if not self.forward_key.exists():
+            return "no forwarding key"
+        return ""
+
+    def forward_public(self) -> str:
+        import asyncssh
+        return asyncssh.read_private_key(str(self.forward_key)).export_public_key().decode().strip()
+
+    async def check_forward(self, rid: int) -> str:
+        """Connects with the forwarding key and opens a connection through the
+        router; returns the router's answer to that or raises AgentError."""
+        rt = self.get(rid)
+        return await check_forward(rt.row["host"], rt.row["port"], rt.row["host_key"], self.forward_key)
+
+    async def _run_local_probe(self, rt: RouterRuntime, run_id: int, trigger: str, options: list) -> None:
+        """The router builds the servers of the keys with podkop's parser
+        (probe-nodes), podkop-probe tests them here with every connection
+        going out through the router over SSH (the forwarding key)."""
+        d = self.key.parent / "probe" / str(rt.id)
+        d.mkdir(parents=True, exist_ok=True)
+        os.chmod(d, 0o700)              # the servers' links and keys are in there
+        for f in d.iterdir():
+            f.unlink()
+        rt.local_probe = lp = {"state": "running", "started": _utc(), "finished": "", "exit": None, "dir": d}
+        rc, proc = 1, None
+        try:
+            with open(d / "log", "w") as out:
+                ps = self.db.probe_settings(rt.id)
+                try:
+                    nodes = await rt.agent.call("probe-nodes", payload={
+                        "keys": ps["keys"], "fix_fingerprint": bool(ps.get("fix_fingerprint"))}, timeout=600)
+                except AgentError as e:
+                    out.write(f"podkop-manager: the router could not read the keys: {e.message}\n")
+                    nodes = None
+                lines = [f"{n['link']}\t" + (json.dumps(n["outbound"], separators=(",", ":")) if n.get("outbound")
+                                             else "!" + (n.get("why") or "podkop can't use it")) + "\n"
+                         for n in nodes or [] if isinstance(n, dict) and n.get("link")]
+                if nodes is not None and not lines:
+                    out.write("podkop-manager: the keys have no servers\n")
+                if lines:
+                    (d / "nodes.txt").write_text("".join(lines))
+                    out.flush()
+                    proc = await asyncio.create_subprocess_exec(
+                        "sh", str(self.src / "router" / "probe.sh"), "--no-apply", "--no-color",
+                        "-o", str(d / "result.csv"), "--nodes", str(d / "nodes.txt"),
+                        "--via", f"root@{rt.row['host']}:{rt.row['port']}", "--via-key", str(self.forward_key),
+                        "--via-host-key", rt.row["host_key"], *options,
+                        stdin=asyncio.subprocess.DEVNULL, stdout=out, stderr=asyncio.subprocess.STDOUT,
+                        cwd=d, env={**os.environ, "PATH": PROBE_PATH}, start_new_session=True)
+                    try:
+                        rc = await asyncio.wait_for(proc.wait(), PROBE_SECONDS)
+                    except asyncio.TimeoutError:
+                        proc.terminate()            # TERM: it stops its sing-box and cleans up
+                        await proc.wait()
+                        out.write("podkop-manager: the probe took longer than 3 hours\n")
+                        rc = 1
+        finally:
+            if proc is not None and proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.terminate()
+            (d / "nodes.txt").unlink(missing_ok=True)
+        lp.update(state="done" if rc == 0 else "failed", finished=_utc(), exit=rc)
+        await self._finish_probe(rt, run_id, trigger, self._local_status(rt))
+
+    def _local_status(self, rt: RouterRuntime) -> dict:
+        """Like the agent's probe-status, for the run on this server."""
+        lp = rt.local_probe or {}
+        d = lp["dir"]
+
+        def read(name: str) -> str:
+            try:
+                return (d / name).read_text(errors="replace")
+            except OSError:
+                return ""
+        return {"state": lp["state"], "started": lp["started"], "finished": lp["finished"], "exit": lp["exit"],
+                "log": [x for x in read("log").splitlines() if x][-400:], "local": True,
+                "rows": podkop.probe_csv_rows(read("result.csv"), read("result.csv.links")),
+                "lists": {"main": [], "main_fallback": [], "youtube": [], "youtube_fallback": []}}
+
+    async def probe_status(self, rt: RouterRuntime) -> dict:
+        """The last probe run: the one on this server, or the router's."""
+        if rt.local_probe:
+            return self._local_status(rt)
+        if self.db.probe_settings(rt.id).get("test_from") == "manager":
+            last = next(iter(self.db.probe_runs(rt.id, 1)), None)
+            return (self.db.probe_result(last["id"]) if last else None) or {"state": "none", "log": [], "rows": []}
+        return await rt.agent.call("probe-status", timeout=30)
 
     def _event(self, rt: RouterRuntime, etype: str, data: dict) -> None:
         """An event of the manager itself, stored and sent like the router's."""

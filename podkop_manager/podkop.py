@@ -9,6 +9,8 @@ A config is what podkop-agent's config-get returns:
 from __future__ import annotations
 
 import copy
+import csv
+import io
 import ipaddress
 import re
 from urllib.parse import unquote
@@ -304,6 +306,25 @@ def probe_reason(row: dict, max_ping: float, min_speed: float) -> str:
 def probe_limits(options: list) -> tuple[float, float]:
     """The probe's ping (ms) and speed (Mbit/s) limits from its options."""
     return _option(options, "--max-ping", 700), _option(options, "--min-speed", 40)
+
+
+PROBE_CSV = ("n", "verdict", "ok", "total", "min", "median", "p90", "mbit", "exit_ip", "country", "youtube",
+             "youtube_ms", "node")
+
+
+def probe_csv_rows(text: str, links: str = "") -> list[dict]:
+    """The rows of podkop-probe -o FILE (and FILE.links: "n<TAB>link"), as the
+    agent's probe-status gives them."""
+    link = dict(x.split("\t", 1) for x in links.splitlines() if "\t" in x)
+    rows = []
+    for f in list(csv.reader(io.StringIO(text)))[1:]:
+        if len(f) < len(PROBE_CSV):
+            continue
+        r = dict(zip(PROBE_CSV, f[:len(PROBE_CSV) - 1] + [",".join(f[len(PROBE_CSV) - 1:])]))
+        if links:
+            r["link"] = link.get(r["n"])
+        rows.append(r)
+    return rows
 
 
 def probe_rows(status: dict, options: list, picks: dict) -> list[dict]:

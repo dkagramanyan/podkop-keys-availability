@@ -3,6 +3,26 @@
 Versions are podkop-probe's (`probe.sh`); a release also carries
 podkop-agent and podkop-manager.
 
+## 1.22.0 — 2026-10-18
+
+- **Test servers on the manager's server, through the router** (manager
+  0.12.0, Global settings → Nightly probe → Test servers). The router only
+  reads the keys (with its own device ID, as before) and turns each server
+  into a sing-box outbound with podkop's own parser (podkop-agent 0.4.0:
+  `probe-nodes`; podkop-probe `--build-nodes`). The manager's container runs
+  podkop-probe on them (`--nodes FILE`) with podkop-engine-full, and every
+  test connection, the DNS for the servers' names included, goes out through
+  the router over SSH (`--via`), so the servers see the router's address and
+  the router's processor and memory stay free.
+  - It uses a second manager key that may only forward connections: the page
+    shows its line for `/etc/dropbear/authorized_keys`
+    (`command="/bin/false",no-agent-forwarding,no-X11-forwarding,no-pty`), and
+    **Check the router** tries it. The manager never changes the router's keys.
+  - Servers that use UDP (hysteria2, TUIC, WireGuard) can't be tested
+    through SSH and are skipped.
+  - The Docker image adds busybox, curl, jq and podkop-engine-full's static
+    sing-box (checked by SHA-256). The backup keeps the second key.
+
 ## 1.21.0 — 2026-10-18
 
 - **Faster probe:** one sing-box runs every server under test, each behind its

@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
 from . import __version__, backup, configs, podkop
-from .agent import AgentError, install
+from .agent import AgentError, forward_line, install
 from .db import DB
 from .hub import Hub
 
@@ -126,7 +126,10 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
 
     @app.get("/api/manager", dependencies=[api])
     async def manager_info():
-        return {"version": __version__, "public_key": keys["public"], "router_password": bool(router_password)}
+        missing = hub.local_probe_missing()
+        return {"version": __version__, "public_key": keys["public"], "router_password": bool(router_password),
+                "local_probe": {"ready": not missing, "missing": missing,
+                                "forward_line": "" if missing else forward_line(hub.forward_public())}}
 
     @app.get("/api/schema", dependencies=[api])
     async def schema():
@@ -323,7 +326,7 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
         ps = db.probe_settings(rid)
         rules = db.auto_rules(rid)
         with contextlib.suppress(AgentError):
-            st = await rt.agent.call("probe-status", timeout=30)
+            st = await hub.probe_status(rt)
         if st:
             picks = hub.auto_picks(rid, st)
             st["rows"] = podkop.probe_rows(st, hub.probe_options(rid), picks)
@@ -358,6 +361,10 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
             fields["auto_apply"] = 1 if body["auto_apply"] else 0
         if "fix_fingerprint" in body:
             fields["fix_fingerprint"] = 1 if body["fix_fingerprint"] else 0
+        if "test_from" in body:
+            if body["test_from"] not in ("router", "manager"):
+                raise HTTPException(400, "test_from must be router or manager")
+            fields["test_from"] = body["test_from"]
         for k in ("main_section", "youtube_section"):
             if k in body:
                 fields[k] = str(body[k]).strip()
@@ -461,10 +468,16 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
         router_or_404(rid)
         return {"run": await hub.start_probe(rid, "manual")}
 
+    @app.post("/api/routers/{rid}/probe/check-forward", dependencies=[api])
+    async def probe_check_forward(rid: int):
+        """The router lets the forwarding key through (probes run here)."""
+        router_or_404(rid)
+        return {"ok": True, "message": await hub.check_forward(rid)}
+
     @app.post("/api/routers/{rid}/probe/preview", dependencies=[api])
     async def probe_preview(rid: int):
         rt = router_or_404(rid)
-        st = await rt.agent.call("probe-status", timeout=30)
+        st = await hub.probe_status(rt)
         cur = await hub.config(rid)
         try:
             new = hub.probe_config(rid, cur, st)
@@ -516,7 +529,7 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
             raise HTTPException(404, "this rule takes its servers from links")
         st = None
         with contextlib.suppress(AgentError):
-            st = await rt.agent.call("probe-status", timeout=30)
+            st = await hub.probe_status(rt)
         run = {k: (st or {}).get(k) for k in ("state", "started", "finished")}
         if run["state"] == "failed":
             run["log"] = (st.get("log") or [])[-30:]

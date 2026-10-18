@@ -50,13 +50,21 @@ that already runs there are taken into **Keys and usage** and the rules.
   protocol, exit IP, name, ping, speed, YouTube and how many to keep. Its
   servers are refreshed after every probe run; **Run probe** is in the rule.
 - Nightly probe: **Global settings** → Nightly probe.
+- **Test servers on this server, through the router** (Global settings →
+  Nightly probe): the router only reads the keys and builds the servers with
+  podkop's own parser; the manager's container tests them, and every test
+  connection goes out through the router over SSH, so the servers still see
+  the router's address and the router's processor stays free. Add the line
+  it shows to the router's `/etc/dropbear/authorized_keys` once: it lets the
+  manager's second key forward connections and nothing else (no shell, no
+  commands). Servers that use UDP (hysteria2, TUIC) can't be tested this way.
 - **Overview → Now routing**: each rule's server now and where its traffic
   leaves to the internet (country and exit IP).
 - **Configs**: save a router's config (podkop plus each rule's probe
   parameters), download it, import a file (one from here or podkop's
   `/etc/config/podkop`) and load any saved config into a router's draft.
 - **Settings → Backup**: the whole manager in one file (routers, keys, rules,
-  configs, history, SSH key), and **Restore…** on a new server. Keep the file
+  configs, history, SSH keys), and **Restore…** on a new server. Keep the file
   private.
 - **Keys and usage**: add subscriptions and single links here, and see each
   key's traffic against its limit (from the provider or your own). At 90% it warns, or moves the probe's rules to other keys

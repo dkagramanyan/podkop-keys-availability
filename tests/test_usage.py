@@ -432,3 +432,49 @@ def test_rules_never_get_servers_of_keys_moved_away_from(tmp_path: Path):
     hub = Hub(db, tmp_path / "key", tmp_path)
     st = {"rows": [ROW("vless://a@h:1#A", "0.2"), ROW("vless://c@h:3#C", "0.3")]}
     assert hub.auto_picks(rid, st)["main"]["links"] == ["vless://c@h:3#C"]     # what the rule's preview shows too
+
+
+FAKE_PROBE = r"""
+while [ $# -gt 0 ]; do
+  case "$1" in -o) out=$2; shift ;; --nodes) nodes=$2; shift ;; --via) via=$2; shift ;; --via-host-key) hk=$2; shift ;; esac
+  shift
+done
+echo "via $via ($hk)"
+{ echo "n,verdict,ok,total,min,median,p90,mbit_s,exit_ip,country,youtube,youtube_ms,node"
+  echo '1,GOOD,20,20,0.1,0.2,0.3,50.0,1.2.3.4,NL,,,"A"'
+  echo '2,SKIPPED,0,0,-,-,-,-,-,-,,,"B"'; } > "$out"
+awk -F '\t' '{ print NR "\t" $1 }' "$nodes" > "$out.links"
+grep -c '!' "$nodes"
+"""
+
+
+def test_local_probe_tests_the_routers_nodes_here(tmp_path: Path):
+    import asyncio
+    from podkop_manager.hub import RouterRuntime
+    (tmp_path / "router").mkdir()
+    (tmp_path / "router" / "probe.sh").write_text(FAKE_PROBE)
+    db = DB(tmp_path / "m.db")
+    rid = db.add_router("home", "192.168.1.1", 22, "ssh-ed25519 AAAA")
+    db.set_probe_settings(rid, keys=["https://sub.example.com/abc"], test_from="manager")
+    hub = Hub(db, tmp_path / "key", tmp_path)
+    rt = RouterRuntime(db.router(rid), hub.key)
+    hub.routers[rid] = rt
+    asked = []
+
+    class Agent:
+        async def call(self, *args, payload=None, timeout=0):
+            asked.append((args, payload))
+            return [{"link": "vless://a@h:1#A", "outbound": {"type": "vless", "server": "h"}},
+                    {"link": "vless://b@h:2#B", "why": "podkop: no"}]
+    rt.agent = Agent()
+    run = db.add_probe_run(rid, "manual", [])
+    asyncio.run(hub._run_local_probe(rt, run, "manual", ["--countries", "NL"]))
+    assert asked == [(("probe-nodes",), {"keys": ["https://sub.example.com/abc"], "fix_fingerprint": False})]
+    st = db.probe_result(run)
+    assert db.probe_runs(rid)[0]["state"] == "done" and st["local"]
+    assert [(r["node"], r["link"]) for r in st["rows"]] == [("A", "vless://a@h:1#A"), ("B", "vless://b@h:2#B")]
+    assert st["log"] == ["via root@192.168.1.1:22 (ssh-ed25519 AAAA)", "1"]
+    assert not (tmp_path / "probe" / str(rid) / "nodes.txt").exists()
+    assert asyncio.run(hub.probe_status(rt))["rows"] == st["rows"]
+    rt.local_probe = None          # after a restart: the stored result
+    assert asyncio.run(hub.probe_status(rt))["rows"] == st["rows"]
