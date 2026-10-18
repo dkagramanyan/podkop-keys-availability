@@ -325,6 +325,9 @@ def _ip_in(ip: str, nets: list) -> bool:
 # what a rule needs from YouTube: nothing, that videos play, that YouTube
 # sees Russia (no ads)
 YOUTUBE_NEEDS = ("", "plays", "ru")
+# podkop-probe's "europe" (EUROPE in router/probe.sh)
+EUROPE = ("EU AD AL AT BA BE BG CH CY CZ DE DK EE ES FI FR GB GR HR HU IE IS IT LI LT LU LV MC MD ME MK MT NL NO PL PT RO RS "
+          "SE SI SK SM UA VA XK").split()
 
 
 def _youtube_why(row: dict, need: str) -> str:

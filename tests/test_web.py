@@ -191,6 +191,7 @@ def test_auto_rules_api_and_preview_from_last_run(tmp_path):
         p = c.get("/api/routers/1/auto-rules/netflix/preview").json()
         assert [m["name"] for m in p["matched"]] == ["PL Fast", "PL Warsaw 5"]
         assert [m["name"] for m in p["fallback"]] == ["PL Krakow 1"] and p["has_links"]
+        assert p["run"]["state"] is None         # the router does not answer: no run state
         assert c.delete("/api/routers/1/auto-rules/netflix", headers=H).json() == {"ok": True}
         assert c.get("/api/routers/1/auto-rules/netflix").status_code == 404
 

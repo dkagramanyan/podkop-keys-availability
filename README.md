@@ -44,10 +44,10 @@ all of it.
 ## Good to know
 
 - Changes collect in a draft until **Review and apply**.
-- Any rule can take servers **from your subscriptions**: filter by exit
-  country, protocol, exit IP or name, with its own ping, speed and YouTube
-  limits; they are refreshed after every probe run.
-- Nightly probe: **Servers probe** → time and "Apply the nightly result by itself".
+- A **Fastest (URLTest)** rule can **Take links from probe**: region,
+  protocol, exit IP, name, ping, speed, YouTube and how many to keep. Its
+  servers are refreshed after every probe run; **Run probe** is in the rule.
+- Nightly probe: **Global settings** → Nightly probe.
 - **Keys and usage**: add subscriptions and single links here, and see each
   key's traffic against its limit (from the provider or your own). At 90% it warns, or moves the probe's rules to other keys
   until the reset.

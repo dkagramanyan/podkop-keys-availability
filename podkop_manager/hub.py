@@ -83,6 +83,7 @@ class Hub:
         self.update_draft(rt)
         self.db.sync_sub_keys(rt.id, self.db.probe_settings(rt.id)["keys"])
         self._lists_to_rules(rt.id)
+        self._countries_to_rules(rt.id)
         rt.tasks = [asyncio.create_task(self._poll_loop(rt)), asyncio.create_task(self._watch_loop(rt)),
                     asyncio.create_task(self._usage_loop(rt))]
         return rt
@@ -332,19 +333,26 @@ class Hub:
         """The servers of the last probe for each rule that takes them from it."""
         return {r["section"]: podkop.auto_pick(status.get("rows") or [], r) for r in self.db.auto_rules(rid)}
 
+    def _countries_to_rules(self, rid: int) -> None:
+        """Once: the countries the probe page tested become the countries of
+        the rules that took any country, so they keep getting the same servers."""
+        if self.db.get_setting(f"countries_to_rules:{rid}"):
+            return
+        self.db.set_setting(f"countries_to_rules:{rid}", True)
+        opts = self.db.probe_settings(rid).get("options") or []
+        c = opts[opts.index("--countries") + 1] if "--countries" in opts[:-1] else "all"
+        codes = list(podkop.EUROPE) if c.lower() in ("europe", "eu") else [] if c in ("all", "") else c.split(",")
+        for r in self.db.auto_rules(rid):
+            if codes and not r["countries"]:
+                self.db.set_auto_rule(rid, r["section"], podkop.check_auto_rule(dict(r, countries=codes)))
+        self.db.set_probe_settings(rid, options=[])
+
     def probe_options(self, rid: int) -> list:
-        """The probe's options for a run: what to test from the probe page, the
-        loosest limits of the rules, and the YouTube check if a rule needs it."""
-        opts, out = self.db.probe_settings(rid).get("options") or [], []
-        skip = {"--max-ping": 1, "--min-speed": 1, "--top": 1, "--youtube-noads": 1, "--no-youtube": 0}
-        i = 0
-        while i < len(opts):
-            if opts[i] in skip:
-                i += 1 + skip[opts[i]]
-                continue
-            out.append(opts[i])
-            i += 1
+        """The probe's options for a run, from the rules: their countries, the
+        loosest limits, and the YouTube check if a rule needs it."""
         rules = self.db.auto_rules(rid)
+        countries = sorted({c for r in rules for c in r["countries"]})
+        out = ["--countries", ",".join(countries) if rules and all(r["countries"] for r in rules) else "all"]
         if rules:
             out += ["--max-ping", str(max(r["max_ping"] for r in rules)),
                     "--min-speed", f"{min(r['min_speed'] for r in rules):g}"]

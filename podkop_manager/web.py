@@ -463,13 +463,16 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
         st = None
         with contextlib.suppress(AgentError):
             st = await rt.agent.call("probe-status", timeout=30)
+        run = {k: (st or {}).get(k) for k in ("state", "started", "finished")}
+        if run["state"] == "failed":
+            run["log"] = (st.get("log") or [])[-30:]
         if not st or not st.get("rows"):
             last = next((r for r in db.probe_runs(rid) if r["state"] == "done"), None)
             st = (db.probe_result(last["id"]) if last else None) or {}
         pick = hub.auto_picks(rid, st).get(section) or {"matched": [], "fallback_rows": [], "left_out": []}
         ps = db.probe_settings(rid)
         return {"rule": rule, "finished": st.get("finished"), "has_links": any(r.get("link") for r in st.get("rows") or []),
-                "probe_options": ps.get("options") or [], "schedule": ps.get("schedule") or "",
+                "run": run, "schedule": ps.get("schedule") or "",
                 "keys": len(ps.get("keys") or []),
                 "countries": sorted({r["country"] for r in st.get("rows") or [] if len(r.get("country") or "") == 2}),
                 "matched": pick["matched"], "fallback": pick["fallback_rows"],

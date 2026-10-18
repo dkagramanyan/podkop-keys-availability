@@ -159,10 +159,17 @@ def test_old_probe_lists_become_rules_once(tmp_path: Path):
     rules = {r["section"]: r for r in db.auto_rules(rid)}
     assert (rules["main"]["top"], rules["main"]["max_ping"], rules["main"]["youtube"]) == (7, 800, "")
     assert rules["youtube"]["youtube"] == "ru"
-    assert hub.probe_options(rid) == ["--countries", "europe", "--max-ping", "800", "--min-speed", "40"]
+    assert hub.probe_options(rid) == ["--countries", "all", "--max-ping", "800", "--min-speed", "40"]
+    hub._countries_to_rules(rid)                  # the probe page's "europe" moves into the rules
+    assert db.auto_rule(rid, "main")["countries"] == sorted(podkop.EUROPE)
+    assert db.probe_settings(rid)["options"] == []
+    assert hub.probe_options(rid)[:2] == ["--countries", ",".join(sorted(podkop.EUROPE))]
     db.delete_auto_rule(rid, "youtube")
+    db.set_auto_rule(rid, "netflix", podkop.check_auto_rule({"countries": []}))
     hub._lists_to_rules(rid)                      # only once
-    assert [r["section"] for r in db.auto_rules(rid)] == ["main"]
+    hub._countries_to_rules(rid)
+    assert [r["section"] for r in db.auto_rules(rid)] == ["main", "netflix"]
+    assert hub.probe_options(rid)[:2] == ["--countries", "all"]      # netflix takes any country
     assert hub.probe_options(rid)[-1] == "--no-youtube"
     fresh = db.add_router("new", "192.168.1.2", 22, "ssh-ed25519 AAAA")
     hub._lists_to_rules(fresh)                    # never used the probe: no rules
