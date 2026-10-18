@@ -57,7 +57,8 @@ Fixes from a review of the whole project:
     at once don't lose one;
   - a probe that could not start, ran past 3 hours or was killed is marked
     failed, and its sing-box and work folder are removed;
-  - the traffic counts in RAM keep only the current links.
+  - the traffic counts in RAM keep only the current links;
+  - a refused probe request no longer replaces the last run's.
 - **Manager:**
   - a command that times out closes its SSH channel;
   - a move of rules for a traffic limit counts only once the router took it

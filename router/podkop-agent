@@ -865,21 +865,24 @@ cmd_probe_start() {
   exec 7> "$RUN/probe.lock"; flock 7
   probe_check
   [ "$(cat "$RUN/probe/state" 2>/dev/null)" = running ] && fail busy "a probe is already running"
-  cat > "$RUN/probe/req.json"
+  # checked before it replaces the last run's request
+  _rq="$RUN/probe/req.$$.json"
+  cat > "$_rq"
   jq -e '(.keys | type == "array" and length > 0 and all(type == "string"))
          and ((.options // []) | type == "array" and all(type == "string"))' \
-    "$RUN/probe/req.json" >/dev/null 2>&1 || fail bad_request "expected {\"keys\": [...], \"options\": [...]}"
+    "$_rq" >/dev/null 2>&1 || { rm -f "$_rq"; fail bad_request "expected {\"keys\": [...], \"options\": [...]}"; }
   _left=0
   set -f
-  for _k in $(jq -r '.keys[]' "$RUN/probe/req.json"); do key_ok "$_k" || fail bad_request "a key is not an http(s) address"; done
-  for _a in $(jq -r '.options // [] | .[]' "$RUN/probe/req.json"); do
+  for _k in $(jq -r '.keys[]' "$_rq"); do key_ok "$_k" || { rm -f "$_rq"; fail bad_request "a key is not an http(s) address"; }; done
+  for _a in $(jq -r '.options // [] | .[]' "$_rq"); do
     if [ "$_left" -gt 0 ]; then _left=$((_left - 1)); continue; fi
     _k=""
     for _po in $PROBE_OPTS; do [ "${_po%:*}" = "$_a" ] && _k=${_po##*:}; done
-    [ -n "$_k" ] || fail bad_request "probe option $_a is not allowed"
+    [ -n "$_k" ] || { rm -f "$_rq"; fail bad_request "probe option $_a is not allowed"; }
     _left=$_k
   done
   set +f
+  mv "$_rq" "$RUN/probe/req.json"
   echo running > "$RUN/probe/state"
   rm -f "$RUN/probe/result.csv" "$RUN/probe/result.csv.links" "$RUN/probe/exit" "$RUN/probe/pid"
   now > "$RUN/probe/started"
