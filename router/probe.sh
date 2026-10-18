@@ -37,7 +37,7 @@ FILE=""; SUBS=""; CONFIG=""; CSV=""
 VERBOSE=0; ASSUME_YES=0; COLOR=auto; SOURCE=""
 TOP=10; APPLY=ask; SECTION=main
 FALLBACK=5                           # servers after the top ones: podkop's fallback links
-SPEED=1; SPEED_URL=""; SPEED_T=5; SPEED_J=""; SPEED_J_USER=""; ENTRY_CHECK=1; FIX_FP=0
+SPEED=1; SPEED_URL=""; SPEED_T=3; SPEED_J=""; SPEED_J_USER=""; ENTRY_CHECK=1; FIX_FP=0
 # direct download used to measure the router's own line (not Cloudflare,
 # which some providers block without a VPN)
 LINE_URL="https://fsn1-speed.hetzner.com/100MB.bin"
@@ -113,7 +113,7 @@ Test:
                     --speed-jobs)
   -t SEC            timeout per request, seconds    (default $T)
   -u URL            target URL                      (default $URL)
-  -q                quick run:    -n 12, 4 s speed test
+  -q                quick run:    -n 12, 2 s speed test
   -F                thorough run: -n 100, 15 s speed test
   -p PORT           first local SOCKS port          (default $BASEPORT)
   --no-speed        skip the download speed test
@@ -222,7 +222,7 @@ while [ $# -gt 0 ]; do
         --youtube-noads) YT_NOADS=$(printf '%s' "$2" | tr 'a-z,' 'A-Z ' | sed 's/\bNONE\b//g; s/^ *//; s/ *$//') ;;
       esac
       shift 2 ;;
-    -q) N=12; SPEED_T=4; shift ;;
+    -q) N=12; SPEED_T=2; shift ;;
     -F) N=100; SPEED_T=15; shift ;;
     -v) VERBOSE=1; shift ;;
     -y) ASSUME_YES=1; shift ;;
@@ -908,7 +908,9 @@ function b(x, m) { m = 1; if (x ~ /k$/) m = 1024; else if (x ~ /M$/) m = 1048576
 NF >= 12 && $1 ~ /^[0-9]+$/ { r = b($4); a = b($7) }
 END { printf "%.0f %.0f\n", r, a }'
 speed_fetch() {
-  _u=$1; _B=0; _T=0; _prev=0; _stab=0; _done=0
+  # _wB/_wT: bytes and time at 1 s: the speed counts from there, after the
+  # tunnel's ramp-up, so a short test gives the steady speed
+  _u=$1; _B=0; _T=0; _prev=0; _stab=0; _done=0; _wB=0; _wT=0
   while [ "$_done" = 0 ]; do
     _rem=$(awk -v a="$SPEED_T" -v t="$_T" 'BEGIN { r = a - t; if (r < 0.5) exit 1; printf "%.1f", r }') || break
     curl -o /dev/null --noproxy '' -x "$_px" --max-time "$_rem" \
@@ -916,15 +918,17 @@ speed_fetch() {
     _cp=$!
     while sleep 1; kill -0 "$_cp" 2>/dev/null; do
       set -- $(tr '\r' '\n' < "$_sd/sp.prog" | awk "$SPEED_AWK")
-      # -> "stop B T avg stab prev" using this chunk's bytes so far and avg speed
+      # -> "stop B T avg stab prev wB wT" using this chunk's bytes so far and avg speed
       set -- $(awk -v B="$_B" -v T="$_T" -v rb="${1:-0}" -v ra="${2:-0}" -v p="$_prev" -v st="$_stab" -v lim="$SPEED_T" \
-          -v line="$LINE_MBIT" -v mins="$MIN_SPEED" 'BEGIN {
-        if (ra <= 0) { print 0, B, T, 0, 0, p; exit }
-        t = T + rb / ra; avg = (B + rb) / t; mb = avg * 8 / 1000000
+          -v line="$LINE_MBIT" -v mins="$MIN_SPEED" -v wb="$_wB" -v wt="$_wT" 'BEGIN {
+        if (ra <= 0) { print 0, B, T, 0, 0, p, wb, wt; exit }
+        t = T + rb / ra
+        if (wt == 0 && t >= 1) { wb = B + rb; wt = t }
+        avg = (wt > 0 && t - wt >= 0.5) ? (B + rb - wb) / (t - wt) : (B + rb) / t; mb = avg * 8 / 1000000
         st = (t >= 2 && p > 0 && (avg > p ? avg - p : p - avg) < 0.03 * avg) ? st + 1 : 0
         clear = (t >= 2 && line > 0 && mb >= 0.85 * line && mb > mins) || (t >= 3 && mb < mins / 3)
-        printf "%d %.0f %.3f %.0f %d %.0f\n", (st >= 2 || clear || t >= lim - 0.3), B + rb, t, avg, st, avg }')
-      _stab=$5; _prev=$6
+        printf "%d %.0f %.3f %.0f %d %.0f %.0f %.3f\n", (st >= 2 || clear || t >= lim - 0.3), B + rb, t, avg, st, avg, wb, wt }')
+      _stab=$5; _prev=$6; _wB=${7:-0}; _wT=${8:-0}
       if [ "$1" = 1 ]; then
         kill "$_cp" 2>/dev/null; wait "$_cp" 2>/dev/null
         _B=$2; _T=$3; _done=1; break
@@ -947,7 +951,9 @@ speed_fetch() {
     _B=$2; _T=$3; _stab=$4; _prev=$5
     [ "$1" = 1 ] && break
   done
-  awk -v b="$_B" -v t="$_T" 'BEGIN { if (t > 0) printf "%.1f\n", b * 8 / t / 1000000; else print "0.0" }'
+  awk -v b="$_B" -v t="$_T" -v wb="$_wB" -v wt="$_wT" 'BEGIN {
+    if (wt > 0 && t - wt >= 1) printf "%.1f\n", (b - wb) * 8 / (t - wt) / 1000000
+    else if (t > 0) printf "%.1f\n", b * 8 / t / 1000000; else print "0.0" }'
 }
 
 # speed_measure <dir>: download speed through the running node -> <dir>/speed

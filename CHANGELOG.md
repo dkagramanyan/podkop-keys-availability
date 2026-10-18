@@ -13,11 +13,12 @@ podkop-agent and podkop-manager.
   refuses is set aside with its message; if sing-box stops during the test, it
   is started again and the servers tested meanwhile are tested again.
 - **Less work per server:** 20 ping requests instead of 40 (losses still show
-  in 5% steps), and a speed test of at most 5 s that may end after 2 s once
-  the speed has settled (was 8 s and 3 s). `-n` and `-F` still test longer.
-  A speed test also ends once its outcome is clear: at 85% of the line's own
-  speed and above the minimum after 2 s (a node can't show more than the
-  line), or under a third of the minimum after 3 s.
+  in 5% steps), and a speed test of 3 s instead of up to 8 s. The speed counts
+  from the first second on, after the tunnel's ramp-up, so the short test
+  gives the steady speed. A test also ends after 2 s when the outcome is clear
+  (at 85% of the line's own speed and above the minimum: a node can't show
+  more than the line). `-n`, `-F` and `-q` (now 2 s) set other sizes.
+  On openwrt-reserv (dual core, 35 servers, a ~45 Mbit/s line): 347 s → ~175 s.
 - The test's local ports start at 20000, below the ones Linux gives outgoing
   connections, and a port held by any connection is skipped (a busy port could
   stop the test from starting).
