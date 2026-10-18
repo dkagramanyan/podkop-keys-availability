@@ -3,6 +3,15 @@
 Versions are podkop-probe's (`probe.sh`); a release also carries
 podkop-agent and podkop-manager.
 
+## 1.24.0 — 2026-10-18
+
+- **Nightly probe in the rules:** its settings (time, apply by itself, TLS
+  fingerprint, where servers are tested, podkop-engine download) moved from
+  Global settings into every rule that takes links from the probe, under the
+  rule's probe parameters. It stays one run for all those rules, so they
+  share the settings. Overview's **Schedule** opens such a rule.
+- Manager 0.14.0.
+
 ## 1.23.0 — 2026-10-18
 
 - **Add router without the root password** (published here: the v1.22.0

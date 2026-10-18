@@ -54,9 +54,11 @@ that already runs there are taken into **Keys and usage** and the rules.
 - A **Fastest (URLTest)** rule can **Take links from probe**: region,
   protocol, exit IP, name, ping, speed, YouTube and how many to keep. Its
   servers are refreshed after every probe run; **Run probe** is in the rule.
-- Nightly probe: **Global settings** → Nightly probe.
-- **Test servers on this server, through the router** (Global settings →
-  Nightly probe): the router only reads the keys and builds the servers with
+- **Nightly probe** (time, apply by itself, TLS fingerprint, where servers
+  are tested): in every rule that takes links from the probe, under its
+  parameters. It is one run for all those rules, so the settings are shared.
+- **Test servers on this server, through the router** (a rule's Nightly
+  probe): the router only reads the keys and builds the servers with
   podkop's own parser; the manager's container tests them, and every test
   connection goes out through the router over SSH, so the servers still see
   the router's address and the router's processor stays free. Add the line

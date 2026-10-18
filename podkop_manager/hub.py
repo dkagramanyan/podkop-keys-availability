@@ -721,7 +721,7 @@ class Hub:
         cron = ((status.get("probe") or {}).get("cron") or "").split()
         if not (len(cron) >= 2 and cron[0].isdigit() and cron[1].isdigit() and int(cron[0]) < 60 and int(cron[1]) < 24):
             raise AgentError("bad_request", "the router's own run has no single daily time; "
-                             "set the time in Global settings → Nightly probe, then turn the router's run off")
+                             "set the time in a rule's Nightly probe (Routing → Rules), then turn the router's run off")
         minutes = manager_minutes(int(cron[1]) * 60 + int(cron[0]), (status.get("router") or {}).get("utc_offset") or "")
         fields = {"auto_apply": 1, "schedule": f"{minutes // 60:02d}:{minutes % 60:02d}"}
         if not self.db.probe_settings(rt.id).get("keys"):
