@@ -133,8 +133,7 @@ class DB:
     def add_router(self, name: str, host: str, port: int, host_key: str) -> int:
         rid = self.x("INSERT INTO routers (name, host, port, host_key, added) VALUES (?, ?, ?, ?, ?)",
                      name, host, port, host_key, time.time())
-        self.x("INSERT OR IGNORE INTO probe_settings (router_id, options) VALUES (?, ?)",
-               rid, json.dumps(["--countries", "europe"]))
+        self.x("INSERT OR IGNORE INTO probe_settings (router_id) VALUES (?)", rid)
         return rid
 
     def update_router(self, rid: int, **fields) -> None:

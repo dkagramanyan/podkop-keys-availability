@@ -39,7 +39,6 @@ function put(el, ...kids) {
 const ICONS = {
   overview: '<rect x="2.5" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="9" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="2.5" y="9" width="4.5" height="4.5" rx="1"/><rect x="9" y="9" width="4.5" height="4.5" rx="1"/>',
   routing: '<path d="M2 4.5h3.5l4 7H14M9.5 4.5H14M12 2.5l2 2-2 2M12 9.5l2 2-2 2"/>',
-  servers: '<rect x="2.5" y="2.5" width="11" height="4.5" rx="1"/><rect x="2.5" y="9" width="11" height="4.5" rx="1"/><path d="M5 4.75h1M5 11.25h1"/>',
   probe: '<path d="M2.5 11.5a5.5 5.5 0 0 1 11 0"/><path d="M8 11.5l2.6-3.6"/>',
   logs: '<path d="M3 4h10M3 8h10M3 12h6"/>',
   usage: '<path d="M3 13V8.5M6.5 13V4M10 13V9.5M13.5 13V6"/>',
@@ -236,11 +235,9 @@ const routerList = () => Object.values(S.routers).sort((a, b) => a.id - b.id);
 
 const SECTIONS = {
   "": { title: "Overview", view: (m, id) => viewOverview(m, id) },
+  usage: { title: "Keys and usage", view: (m, id) => viewUsage(m, id) },
   rules: { title: "Routing rules", view: (m, id, sub) => viewRules(m, id, sub) },
   global: { title: "Global settings", view: (m, id) => viewGlobal(m, id) },
-  servers: { title: "Servers", view: (m, id) => viewServers(m, id) },
-  probe: { title: "Servers probe", view: (m, id) => viewProbe(m, id) },
-  usage: { title: "Keys and usage", view: (m, id) => viewUsage(m, id) },
   logs: { title: "Logs", view: (m, id) => viewLogs(m, id) },
   history: { title: "History", view: (m, id) => viewHistory(m, id) },
 };
@@ -272,6 +269,8 @@ async function render() {
     return;
   }
   if (r.rid && !S.routers[r.rid]) { location.replace("#/"); return; }
+  // the Servers and Servers probe pages are gone: their old links open the rules
+  if (r.rid && ["servers", "probe"].includes(r.section)) { location.replace(`#/r/${r.rid}/rules`); return; }
   if (r.rid) store("router", String(r.rid));
   S.rid = r.rid || lastRouter();
   drawSide();
@@ -321,14 +320,12 @@ function drawSide() {
     rt ? switcher(rt) : null,
     rt ? h("div", { class: "nav" },
       link("", "Overview", "overview"),
+      link("usage", "Keys and usage", "usage", rt.usage && rt.usage.pct !== null && rt.usage.pct !== undefined
+        ? h("span", { class: `count${rt.usage.alerts.length ? " warn" : ""}`, title: "Highest daily limit used" }, `${Math.round(rt.usage.pct)}%`) : null),
       h("a", { href: `#/r/${rt.id}/rules` }, icon("routing"), "Routing",
         n ? h("span", { class: "count", title: `${plural(n, "change")} not applied` }, n) : null),
       h("a", { href: `#/r/${rt.id}/rules`, class: "sub", "aria-current": cur("rules") }, "Rules"),
       h("a", { href: `#/r/${rt.id}/global`, class: "sub", "aria-current": cur("global") }, "Global settings"),
-      link("servers", "Servers", "servers"),
-      link("probe", "Servers probe", "probe"),
-      link("usage", "Keys and usage", "usage", rt.usage && rt.usage.pct !== null && rt.usage.pct !== undefined
-        ? h("span", { class: `count${rt.usage.alerts.length ? " warn" : ""}`, title: "Highest daily limit used" }, `${Math.round(rt.usage.pct)}%`) : null),
       link("logs", "Logs", "logs"),
       link("history", "History", "history")) : null,
     h("div", { class: "nav nav-bottom" },
@@ -606,6 +603,14 @@ async function viewOverview(main, id) {
         eventsCard(rt)));
   };
 
+  const applyProbe = async () => {
+    try {
+      const p = await api("POST", `/api/routers/${id}/probe/preview`);
+      openApply(id, { base: p.fingerprint, config: p.config, note: "Probe result", trigger: "probe",
+        done: async () => { await load(); draw(); } });
+    } catch (e) { toast(e.message, true); }
+  };
+
   // things that wait for the user: an unapplied draft, a probe result not in podkop yet
   const waiting = (rt, cfg, running) => {
     const notes = [];
@@ -624,7 +629,7 @@ async function viewOverview(main, id) {
       notes.push(h("div", { class: "note" }, h("span", { class: "dot accent" }),
         h("div", { class: "col" }, h("span", {}, `Probe from ${shortWhen(agentTime(ps.finished))} has new servers`),
           h("span", {}, `${rules.join(", ")}. ${usable} of ${rows.length} servers usable.`)),
-        h("a", { class: "alink", href: `#/r/${id}/probe` }, "See results")));
+        h("button", { type: "button", class: "btn sm", onclick: applyProbe }, "Review and apply")));
     }
     for (const a of (rt.usage && rt.usage.alerts) || []) {
       const eta = a.forecast && a.forecast.eta;
@@ -652,15 +657,18 @@ async function viewOverview(main, id) {
         h("span", { class: "bad-text" }, st.failsafe.message)) : null);
   };
 
+  const unpin = async (sec) => {
+    try { await api("POST", `/api/routers/${id}/pin`, { section: sec, server: "auto" }); toast(`${sec}: back to automatic`); }
+    catch (e) { toast(e.message, true); }
+  };
+
   const nowRouting = (rt, cfg) => {
     const rules = rulesOf(cfg);
     return h("section", { class: "card clip", "aria-labelledby": "now-routing" },
       h("div", { class: "card-head", style: "align-items: baseline" },
         h("div", { class: "col" }, h("h2", { id: "now-routing" }, "Now routing"),
           h("span", { class: "small muted" }, "First match wins")),
-        h("div", { class: "row", style: "gap: 16px" },
-          h("a", { class: "alink", href: `#/r/${id}/rules` }, "Edit rules"),
-          h("a", { class: "alink", href: `#/r/${id}/servers` }, "Pin servers"))),
+        h("a", { class: "alink", href: `#/r/${id}/rules` }, "Edit rules")),
       !cfg ? h("p", { class: "empty" }, rt.online ? "Could not read podkop's settings." : "Shown when the router answers.")
         : h("div", { class: "scroll-x" }, h("table", { class: "wide" },
           h("tr", {}, h("th", { scope: "col", style: "width: 24px" }, "#"), h("th", { scope: "col" }, "Rule"),
@@ -672,9 +680,10 @@ async function viewOverview(main, id) {
               h("td", { class: "mono", style: "font-size: 13px; font-weight: 500" }, sec.name),
               h("td", { style: "color: var(--text-2)" }, ruleMatches(sec)),
               h("td", {}, data.auto[sec.name] && (sec.options || {}).connection_type === "proxy"
-                ? h("span", { class: "dest" }, `Proxy, from subscriptions${data.auto[sec.name].countries.length ? ", " + data.auto[sec.name].countries.join(", ") : ""}`) : destChip(sec)),
+                ? h("span", { class: "dest" }, `Proxy, from probe${data.auto[sec.name].countries.length ? ", " + countriesText(data.auto[sec.name].countries) : ""}`) : destChip(sec)),
               h("td", {}, h("span", { class: "row", style: "gap: 8px" }, h("span", { class: now.bad ? "bad-text" : "" }, now.text),
-                now.mode ? h("span", { class: "mode" }, now.mode) : null)));
+                now.mode ? h("span", { class: "mode" }, now.mode) : null,
+                now.mode === "pinned" ? h("button", { type: "button", class: "link-btn xs", onclick: () => unpin(sec.name) }, "Unpin") : null)));
           }),
           h("tr", {}, h("td", {}), h("td", { class: "nowrap", style: "color: var(--text-2)" }, "Everything else"),
             h("td", { class: "muted" }, "no rule matched"), h("td", {}, h("span", { class: "dest direct" }, "Direct")),
@@ -707,7 +716,7 @@ async function viewOverview(main, id) {
           ? `Every night at ${ps.schedule}, ${ps.auto_apply ? "applied by itself if podkop starts with it" : "results wait for you to apply them"}.`
           : "Off"),
         lastText || next ? h("span", { class: "small muted" }, [lastText, next].filter(Boolean).join(" ")) : null),
-      h("a", { class: "btn", href: `#/r/${id}/probe` }, "Probe settings"));
+      h("a", { class: "btn", href: `#/r/${id}/global` }, "Schedule"));
   };
 
   const eventsCard = () => h("aside", { class: "card events", "aria-label": "Events", style: "flex: 1 1 300px; min-width: 0" },
@@ -732,149 +741,6 @@ async function viewOverview(main, id) {
 
 // the last probe run picked other servers than some rule has now
 const probeIsNew = (probe) => (probe.auto_rules || []).some((r) => r.differs);
-
-// --- servers ------------------------------------------------------------------------------------
-
-// outbound tag -> link, from the rules' server lists (the way podkop names outbounds)
-function tagLinks(config) {
-  const m = {};
-  for (const s of rulesOf(config)) {
-    const o = s.options || {};
-    const add = (list, mid) => asList(list).forEach((l, i) => (m[`${s.name}-${mid}${i + 1}-out`] = l));
-    if (o.proxy_config_type === "urltest") { add(o.urltest_proxy_links, ""); add(o.urltest_fallback_links, "fallback-"); }
-    if (o.proxy_config_type === "selector") add(o.selector_proxy_links, "");
-    if (o.proxy_config_type === "url" && o.proxy_string) m[`${s.name}-out`] = o.proxy_string;
-  }
-  return m;
-}
-
-async function viewServers(main, id) {
-  const page = h("div", { class: "page" });
-  put(main, page);
-  let config = null, auto = {};
-  const tested = {};        // tag -> delay from "Test delays" (0 = timeout)
-  const open = new Set();   // groups showing all servers
-  const busy = new Set();   // groups being tested
-  const load = async () => {
-    const [c, a] = await Promise.all([api("GET", `/api/routers/${id}/config`).catch(() => null),
-      api("GET", `/api/routers/${id}/auto-rules`).catch(() => [])]);
-    config = c; auto = Object.fromEntries(a.map((r) => [r.section, r]));
-  };
-
-  const testGroup = async (sec) => {
-    busy.add(sec); draw();
-    try {
-      const d = await api("POST", `/api/routers/${id}/delays`, { section: sec });
-      for (const [tag, ms] of Object.entries(d)) tested[tag] = ms;
-      for (const s of config ? groupsOf() : []) if (s.name === sec) for (const t of memberTags(s)) if (!(t in d)) tested[t] = 0;
-    } catch (e) { toast(e.message, true); }
-    busy.delete(sec); draw();
-    api("POST", `/api/routers/${id}/refresh`).catch(() => {});
-  };
-
-  const pin = async (sec, tag) => {
-    try {
-      await api("POST", `/api/routers/${id}/pin`, { section: sec, server: tag });
-      toast(tag === "auto" ? `${sec}: back to automatic` : `${sec}: pinned ${serverName(sec, tag)}`);
-    } catch (e) { toast(e.message, true); }
-  };
-
-  const groupsOf = () => rulesOf(config.config).filter((s) => ["urltest", "selector"].includes((s.options || {}).proxy_config_type)
-    && (s.options || {}).connection_type === "proxy");
-  const memberTags = (s) => {
-    const g = (S.routers[id].proxies.groups || []).find((x) => x.name === `${s.name}-out`);
-    return g ? g.all.filter((t) => t !== `${s.name}-urltest-out`) : [];
-  };
-
-  const draw = () => {
-    const rt = S.routers[id];
-    if (!rt) return;
-    const head = pageHead("Servers", "Pin a server to stop automatic switching",
-      config && rt.proxies && groupsOf().length ? h("button", { type: "button", class: "btn", disabled: busy.size > 0, onclick: async () => {
-        for (const s of groupsOf()) await testGroup(s.name);
-      } }, icon("probe", 15), busy.size ? "Testing…" : "Test all delays") : null);
-    if (!config) { put(page, head, h("div", { class: "card empty" }, rt.online ? "Could not read podkop's settings." : "Shown when the router answers.")); return; }
-    if (!rt.proxies) { put(page, head, h("div", { class: "card empty" }, "Servers show up here while podkop runs.")); return; }
-    const links = tagLinks(config.config);
-    const pins = Object.fromEntries(((rt.status && rt.status.pins) || []).map((p) => [p.section, p.server]));
-    const delayOf = (tag) => {
-      if (tag in tested) return tested[tag];
-      const s = (rt.proxies.servers || []).find((x) => x.name === tag);
-      return s ? s.delay : null;
-    };
-    const groups = groupsOf();
-    const others = rulesOf(config.config).filter((s) => !groups.includes(s)).map((s) => s.name);
-    put(page, head,
-      groups.length ? null : h("div", { class: "card empty" }, "No rule picks from a list of servers (Selector or Fastest)."),
-      groups.map((s) => {
-        const o = s.options || {};
-        const g = (rt.proxies.groups || []).find((x) => x.name === `${s.name}-out`);
-        if (!g) return h("section", { class: "card pad" }, h("h2", { class: "mono" }, s.name), h("p", { class: "muted small" }, "sing-box has no group for this rule yet."));
-        const ut = (rt.proxies.groups || []).find((x) => x.name === `${s.name}-urltest-out`);
-        const current = g.now === `${s.name}-urltest-out` && ut ? ut.now : g.now;
-        const pinned = !!pins[s.name];
-        const all = memberTags(s);
-        // fastest first, then untested, then timeouts
-        const rank = (t) => { const ms = delayOf(t); return ms ? ms : ms === 0 ? 1e9 : 1e8; };
-        const main = all.filter((t) => !t.startsWith(`${s.name}-fallback-`)).sort((a, b) => rank(a) - rank(b));
-        const fb = all.filter((t) => t.startsWith(`${s.name}-fallback-`));
-        const shown = open.has(s.name) ? [...main, ...fb] : main.slice(0, 5);
-        const hidden = main.length - Math.min(main.length, 5);
-        const mode = pinned ? ["pinned", "accent"] : o.proxy_config_type === "urltest" ? ["automatic", "ok"] : ["your choice", ""];
-        const ar = auto[s.name];
-        const exits = ar && ar.countries.length ? ` with an exit IP in ${ar.countries.map(countryName).join(" or ")}` : "";
-        const desc = ar ? `Fastest of ${main.length} ${ar.protocols.length ? ar.protocols.join(", ") + " " : ""}servers${exits}, taken from your subscriptions by the probe.`
-          : o.proxy_config_type === "urltest"
-            ? `Fastest of ${main.length}${fb.length ? `, with ${fb.length} fallback` : ""}. Checked every ${o.urltest_check_interval || "3m"}.`
-            : `Choice of ${main.length}.`;
-        return h("section", { class: "card clip", "aria-label": `Rule ${s.name}` },
-          h("div", { class: "card-head", style: "padding-bottom: 14px" },
-            h("div", { class: "col", style: "flex: 1 1 260px; gap: 3px" },
-              h("div", { class: "row", style: "gap: 10px" }, h("h2", { class: "mono" }, s.name), h("span", { class: `pill ${mode[1]}` }, mode[0])),
-              h("span", { class: "small muted" }, desc + (pinned ? " Pinned: the router keeps this server until you go back to automatic." : ""))),
-            h("div", { class: "row" },
-              pinned && ut ? h("button", { type: "button", class: "btn sm", onclick: () => pin(s.name, "auto") }, "Back to automatic") : null,
-              h("button", { type: "button", class: "btn sm", disabled: busy.has(s.name), onclick: () => testGroup(s.name) },
-                busy.has(s.name) ? "Testing…" : "Test delays"))),
-          h("div", { class: "scroll-x" }, h("table", { class: "wide" },
-            h("tr", {}, h("th", { scope: "col" }, "Server"), h("th", { scope: "col" }, "Protocol"),
-              h("th", { scope: "col", style: "width: 34%" }, "Delay"), h("th", { scope: "col", class: "r" }, h("span", { class: "sr" }, "Action"))),
-            shown.map((tag) => {
-              const ms = delayOf(tag), dead = ms === 0, now = tag === current;
-              const isFb = fb.includes(tag);
-              return h("tr", { class: now ? "current" : "" },
-                h("td", {}, h("span", { class: "row", style: "gap: 8px" }, (rt.names || {})[tag] || tag,
-                  now && pinned ? h("span", { class: "xs muted" }, "pinned") : null,
-                  isFb ? h("span", { class: "xs muted" }, "fallback") : null)),
-                h("td", { class: "mono-cell", style: "color: var(--text-2)" }, links[tag] ? linkProto(links[tag]) : "–"),
-                h("td", {}, h("div", { class: "delay" },
-                  h("div", { class: "bar" }, ms === null || ms === undefined ? null
-                    : h("div", { class: dead ? "dead" : now ? "now" : "", style: `width: ${dead ? 100 : Math.min(100, Math.round(ms / 8))}%` })),
-                  h("span", { class: `ms${dead ? " bad-text" : ""}` }, dead ? "timeout" : ms ? `${ms} ms` : "–"))),
-                h("td", { class: "r", style: "width: 110px" },
-                  now ? h("span", { class: "xs", style: "font-weight: 500" }, "In use")
-                    : dead ? null : h("button", { type: "button", class: "btn xs", onclick: () => pin(s.name, tag) }, "Pin")));
-            }))),
-          hidden || fb.length ? h("div", { style: "padding: 10px 18px; border-top: 1px solid var(--line-soft)" },
-            h("button", { type: "button", class: "link-btn", "aria-expanded": String(open.has(s.name)), onclick: () => {
-              if (open.has(s.name)) open.delete(s.name); else open.add(s.name); draw();
-            } }, open.has(s.name) ? "Show fewer"
-              : `Show ${[hidden ? `${hidden} more` : "", fb.length ? `${fb.length} fallback` : ""].filter(Boolean).join(" and ")}`,
-            icon(open.has(s.name) ? "up" : "down", 14, { width: 1.6 }))) : null);
-      }),
-      others.length ? h("section", { class: "card note" },
-        h("span", { class: "small muted", style: "flex: 1 1 320px" },
-          `${others.join(", ")} ${others.length === 1 ? "has" : "have"} no server list to pick from here. To change which servers a rule has, edit the rule.`),
-        h("a", { class: "alink", href: `#/r/${id}/rules` }, "Open rules")) : null);
-  };
-
-  await load();
-  draw();
-  S.view = { onRouter: (r) => {
-    if (r.id !== id) return;
-    if (config && r.status && r.status.fingerprint !== config.fingerprint) load().then(draw); else draw();
-  } };
-}
 
 // --- logs ------------------------------------------------------------------------------------------
 
@@ -1128,21 +994,7 @@ async function viewHistory(main, id) {
 
 const FINAL_STATES = ["applied", "saved", "unchanged", "rejected", "reverted", "failed"];
 
-// --- servers probe ------------------------------------------------------------------------------------
-
-const VALUE_OPTIONS = ["--countries", "--max-ping", "--min-speed", "--top"];
-const USABLE = ["GOOD", "OK", "FLAKY"];
-
-// podkop-probe's options as a form: {"--countries": "europe", ..., flags: Set, rest: [...]}
-function parseOptions(opts) {
-  const r = { flags: new Set(), rest: [] };
-  for (let i = 0; i < opts.length; i++) {
-    if (VALUE_OPTIONS.includes(opts[i])) { r[opts[i]] = opts[i + 1]; i++; }
-    else if (["--no-youtube", "-q"].includes(opts[i])) r.flags.add(opts[i]);
-    else r.rest.push(opts[i]);
-  }
-  return r;
-}
+// --- keys and usage -----------------------------------------------------------------------------------
 
 // sub.example.com/s/…k9Q: enough to tell keys apart, not enough to use one
 function keyLabel(url) {
@@ -1157,213 +1009,12 @@ const countryName = (cc) => {
   try { return new Intl.DisplayNames(["en"], { type: "region" }).of(cc); } catch { return cc; }
 };
 
-// "exit PL, vless, ping < 700 ms, YouTube RU, 5 and 2 fallback"
-const autoRuleSummary = (r) => [
-  r.countries.length ? `exit ${r.countries.join(", ")}` : "any country",
-  r.protocols.length ? r.protocols.join(", ") : null,
-  `ping < ${r.max_ping} ms, > ${r.min_speed} Mbit/s`,
-  r.youtube === "ru" ? "YouTube RU" : r.youtube === "plays" ? "YouTube plays" : null,
-  `${r.top} and ${r.fallback} fallback`].filter(Boolean).join(", ");
-
-function verdictTag(v) {
-  const cls = { GOOD: "good", OK: "good", FLAKY: "flaky" }[v] || "dead";
-  return h("span", { class: `box-tag ${cls}` }, v);
-}
-
-function goesTags(row) {
-  if (!row.goes_to.length) return h("span", { class: "xs muted" }, "not used");
-  return h("span", { class: "row", style: "gap: 4px" }, row.goes_to.map((g) => h("span", {
-    class: `box-tag ${g.fallback ? "fb" : "k-main"}`,
-    title: g.fallback ? `fallback of ${g.rule}` : null,
-  }, g.fallback ? `${g.rule} fallback` : g.rule)));
-}
-
-async function viewProbe(main, id) {
-  const page = h("div", { class: "page" });
-  put(main, page);
-  let data;
-  let form;            // the left column's values, saved with Save
-  let filter = "picked";
-  let lastState = null;
-
-  const load = async () => { data = await api("GET", `/api/routers/${id}/probe`); };
-  const resetForm = () => {
-    const ps = data.settings, o = parseOptions(ps.options || []);
-    const c = o["--countries"] || "all";
-    form = {
-      countries: ["europe", "all"].includes(c) ? c : "choose", codes: ["europe", "all"].includes(c) ? "" : c,
-      quick: o.flags.has("-q"), rest: o.rest, schedule: ps.schedule || "", auto: !!ps.auto_apply,
-    };
-  };
-
-  const save = async () => {
-    const options = [];
-    const countries = form.countries === "choose" ? form.codes.trim() : form.countries;
-    if (countries) options.push("--countries", countries);
-    if (form.quick) options.push("-q");
-    options.push(...form.rest);
-    data.settings = await api("PUT", `/api/routers/${id}/probe`, { options, schedule: form.schedule, auto_apply: form.auto });
-  };
-
-  const left = () => {
-    const keys = (data.status && data.status.keys) || {};
-    const rules = data.auto_rules || [];
-    return h("div", { class: "stack", style: "flex: 1 1 340px; min-width: 0" },
-      h("section", { class: "card pad", "aria-labelledby": "p-subs" },
-        h("div", { class: "row", style: "justify-content: space-between" }, h("h2", { id: "p-subs" }, "Keys"),
-          h("a", { class: "alink small", href: `#/r/${id}/usage` }, "Manage keys")),
-        (data.settings.keys || []).length ? data.settings.keys.map((k) => {
-          const info = keys[k];
-          return h("div", { class: "subscr" }, h("div", { class: "col" }, h("span", { class: "ellipsis", title: keyLabel(k) }, keyLabel(k)),
-            info ? h("span", { class: info.error ? "bad-text" : "" }, info.error ? info.error : `${info.servers} servers in the last run`) : null));
-        }) : h("p", { class: "small muted" }, "No subscriptions yet: add them under Keys and usage.")),
-      h("section", { class: "card pad", "aria-labelledby": "p-filters" },
-        h("h2", { id: "p-filters" }, "What to test"),
-        h("div", { class: "field" }, h("span", { class: "label" }, "Countries"),
-          seg([["europe", "Europe"], ["all", "All"], ["choose", "Choose"]], form.countries, (v) => { form.countries = v; drawLeft(); }, { label: "Countries" }),
-          form.countries === "choose" ? h("input", { class: "input mid mono", placeholder: "Codes, e.g. DE,NL,FI", value: form.codes,
-            "aria-label": "Country codes", oninput: (e) => { form.codes = e.target.value; } }) : null),
-        h("label", { class: "check" }, h("input", { type: "checkbox", checked: form.quick, onchange: (e) => { form.quick = e.target.checked; } }),
-          h("span", {}, "Quick run"))),
-      h("section", { class: "card pad", "aria-labelledby": "p-into" },
-        h("h2", { id: "p-into" }, "Into podkop"),
-        h("div", { class: "stack", style: "gap: 8px" },
-          rules.map((r) => h("a", { href: `#/r/${id}/rules/${r.section}`, class: "subscr", style: "padding: 9px 10px; color: var(--text)" },
-            h("span", { class: "mono", style: "font-size: 13px; font-weight: 500" }, r.section),
-            h("span", { class: "xs muted grow" }, autoRuleSummary(r)), icon("right", 14, { stroke: "var(--muted)", width: 1.6 }))),
-          h("span", { class: "xs muted" }, rules.length ? "Each rule picks its servers with its own limits, set in the rule."
-            : "No rule takes servers from the probe. In a rule: Sends to → From my subscriptions.")),
-        h("div", { class: "sep stack", style: "gap: 10px" },
-          h("div", { class: "row", style: "justify-content: space-between" },
-            h("label", { for: "sched", style: "font-size: 13.5px; font-weight: 500" }, "Every night at"),
-            h("input", { id: "sched", type: "time", class: "input mid num", style: "width: 110px", value: form.schedule,
-              oninput: (e) => { form.schedule = e.target.value; } })),
-          h("label", { class: "check" }, h("input", { type: "checkbox", checked: form.auto, onchange: (e) => { form.auto = e.target.checked; } }),
-            h("span", {}, "Apply the nightly result by itself")))),
-      h("div", { class: "row", style: "flex-wrap: nowrap" },
-        h("button", { type: "button", class: "btn lg", style: "flex: 1", onclick: async () => {
-          try { await save(); toast("Saved"); drawLeft(); } catch (e) { toast(e.message, true); }
-        } }, "Save"),
-        h("button", { type: "button", class: "btn primary lg", style: "flex: 1", disabled: data.status && data.status.state === "running",
-          onclick: async () => {
-            try {
-              await save();
-              await api("POST", `/api/routers/${id}/probe/start`);
-              toast("Probe started, it takes 2 to 10 minutes");
-              await load(); drawRight();
-            } catch (e) { toast(e.message, true); }
-          } }, "Save and run now")));
-  };
-
-  const leftBox = h("div", { style: "display: contents" });
-  const rightBox = h("div", { class: "stack", style: "flex: 2 1 600px; min-width: 0" });
-  const drawLeft = () => put(leftBox, left());
-
-  const lastRun = () => {
-    const st = data.status;
-    if (!st || st.state === "none") {
-      return h("section", { class: "card pad" }, h("h2", {}, "Last run"),
-        h("p", { class: "muted small" }, "No probe has run on this router since it started. Add your subscriptions and press Save and run now."));
-    }
-    const rows = st.rows || [];
-    const usable = rows.filter((r) => USABLE.includes(r.verdict));
-    const run = (data.runs || [])[0];
-    const by = run && run.trigger === "schedule" ? "by the nightly schedule" : "by you";
-    const started = agentTime(st.started), finished = agentTime(st.finished);
-    const isNew = st.state === "done" && probeIsNew(data);
-    let sub = `Started ${by} at ${started ? shortWhen(started) : "?"}`;
-    if (st.state === "running") sub += ". Running now, this takes 2 to 10 minutes.";
-    else if (finished && started) sub += `, took ${duration(finished - started)}.`;
-    if (st.state === "done") sub += isNew ? " Not applied yet." : " Its servers are in podkop.";
-    const shown = rows.filter((r) => filter === "all" || (filter === "usable" ? USABLE.includes(r.verdict) : r.goes_to.length || r.reason));
-    const pill = { running: ["running", "accent"], done: ["done", "ok"], failed: ["failed", "bad"] }[st.state] || [st.state, ""];
-    return h("section", { class: "card clip", "aria-labelledby": "p-last" },
-      h("div", { class: "card-head", style: "padding: 18px 18px 14px" },
-        h("div", { class: "col", style: "flex: 1 1 280px; gap: 4px" },
-          h("div", { class: "row", style: "gap: 10px" }, h("h2", { id: "p-last" }, "Last run"),
-            h("span", { class: `pill ${pill[1]}` }, st.state === "running" ? spinner() : null, pill[0])),
-          h("span", { class: "small muted" }, sub)),
-        st.state === "done" && isNew ? h("button", { type: "button", class: "btn primary", onclick: applyLists }, "Review and apply lists") : null),
-      rows.length ? h("div", { class: "totals" },
-        h("div", {}, h("span", {}, "Tested"), h("span", {}, rows.length)),
-        h("div", {}, h("span", {}, "Usable"), h("span", {}, usable.length)),
-        (data.auto_rules || []).map((r) => h("div", {}, h("span", {}, r.section),
-          h("span", {}, `${r.picked || 0} + ${r.picked_fallback || 0}`)))) : null,
-      rows.length ? h("div", { class: "row", style: "padding: 12px 18px" },
-        [["all", `All ${rows.length}`], ["usable", `Usable ${usable.length}`], ["picked", "Picked and rejected"]].map(([v, t]) =>
-          h("button", { type: "button", class: "toggle", "aria-pressed": String(filter === v), onclick: () => { filter = v; drawRight(); } }, t)),
-        rows[0] && rows[0].total ? h("span", { class: "xs muted", style: "margin-left: auto" }, `${rows[0].total} requests per server`) : null) : null,
-      rows.length ? h("div", { class: "scroll-x" }, h("table", { style: "min-width: 680px" },
-        h("tr", {}, h("th", { scope: "col" }, "Goes to"), h("th", { scope: "col" }, "Result"),
-          h("th", { scope: "col", class: "r" }, "Median"), h("th", { scope: "col", class: "r" }, "Mbit/s"), h("th", { scope: "col" }, "Exit"),
-          h("th", { scope: "col" }, "YouTube sees"), h("th", { scope: "col" }, "Server")),
-        shown.map((r) => {
-          const [ys, yc] = String(r.youtube || "-").split(":");
-          const median = parseFloat(r.median);
-          return h("tr", {},
-            h("td", {}, goesTags(r)),
-            h("td", { title: r.total ? `${r.ok} of ${r.total} requests answered` : null }, verdictTag(r.verdict)),
-            h("td", { class: "r num nowrap" }, Number.isFinite(median) ? `${median.toFixed(2)} s` : "–"),
-            h("td", { class: `r num${/slow/.test(r.reason) ? " bad-text" : ""}` }, r.mbit && r.mbit !== "-" ? Math.round(+r.mbit) : "–"),
-            h("td", { class: "mono-cell" }, r.country || "–"),
-            h("td", { class: "mono-cell", style: yc === "RU" && ys === "ok" ? "font-weight: 500; color: var(--yt)" : "color: var(--muted)" },
-              ys === "ok" ? yc : ys === "-" || !ys ? "–" : ys === "bot" ? "bot check" : ys === "no" ? "no video" : "failed"),
-            h("td", { style: "min-width: 160px" }, h("span", { class: "col" }, h("span", {}, r.node),
-              r.reason ? h("span", { class: "xs muted" }, r.reason) : null)));
-        }))) : null,
-      h("details", { style: "border-top: 1px solid var(--line)", open: st.state === "failed" },
-        h("summary", { style: "padding: 12px 18px; font-size: 13px; font-weight: 500" }, icon("right", 14, { width: 1.6, class: "chev" }),
-          "Full output of podkop-probe"),
-        h("pre", { class: "out" }, (st.log || []).join("\n"))));
-  };
-
-  const runs = () => h("section", { class: "card events", "aria-labelledby": "p-runs" },
-    h("h2", { id: "p-runs", style: "margin-bottom: 8px" }, "Runs"),
-    (data.runs || []).length ? data.runs.map((u, i) => {
-      const pill = { running: ["running", "accent"], done: ["done", "ok"], failed: ["failed", "bad"] }[u.state] || [u.state, ""];
-      let result = h("span", { class: "muted" }, u.state === "failed" ? "Nothing applied, old settings kept" : u.state === "running" ? "" : "Not applied");
-      if (u.version_id) {
-        result = u.version_state === "unchanged" ? h("span", { class: "muted" }, "Same servers as before, nothing to apply")
-          : h("a", { href: `#/r/${id}/history`, style: "font-weight: 500" },
-            `Applied as #${u.version_id}${["reverted", "rejected", "failed"].includes(u.version_state) ? `, ${VERSION_STATE[u.version_state][0]}` : ""}`);
-      } else if (i === 0 && u.state === "done") result = h("span", { class: "muted" }, "Not applied yet");
-      return h("div", { class: "run" },
-        h("span", { class: "num" }, longWhen(u.started)),
-        h("span", { class: "muted" }, u.trigger === "schedule" ? "nightly" : u.trigger),
-        h("span", { class: `pill ${pill[1]}` }, pill[0]), result);
-    }) : h("p", { class: "muted small" }, "No runs from this manager yet."));
-
-  const drawRight = () => put(rightBox, lastRun(), runs());
-
-  const applyLists = async () => {
-    try {
-      const p = await api("POST", `/api/routers/${id}/probe/preview`);
-      openApply(id, { base: p.fingerprint, config: p.config, note: "Probe result", trigger: "probe",
-        done: async () => { await load(); drawRight(); } });
-    } catch (e) { toast(e.message, true); }
-  };
-
-  await load();
-  resetForm();
-  put(page,
-    pageHead("Servers probe"),
-    h("div", { class: "split" }, leftBox, rightBox));
-  drawLeft(); drawRight();
-  lastState = data.status && data.status.state;
-  const timer = setInterval(async () => {
-    if (!data.status || data.status.state !== "running") return;
-    await load().catch(() => {});
-    drawRight();
-    if (lastState === "running" && data.status && data.status.state !== "running") drawLeft();
-    lastState = data.status && data.status.state;
-  }, 10000);
-  S.view = {
-    leave: () => clearInterval(timer),
-    onProbe: (m) => { if (m.router_id === id) load().then(drawRight).catch(() => {}); },
-  };
-}
-
-// --- keys and usage -----------------------------------------------------------------------------------
+// podkop-probe's "europe" (EUROPE in router/probe.sh)
+const EUROPE = ("EU AD AL AT BA BE BG CH CY CZ DE DK EE ES FI FR GB GR HR HU IE IS IT LI LT LU LV MC MD ME MK MT NL NO PL PT RO RS "
+  + "SE SI SK SM UA VA XK").split(" ");
+const hasEurope = (cs) => EUROPE.every((c) => cs.includes(c));
+// "Europe, TR" or "DE, PL"
+const countriesText = (cs) => (hasEurope(cs) ? ["Europe", ...cs.filter((c) => !EUROPE.includes(c))] : cs).join(", ");
 
 const GB = 1024 ** 3;
 const gb = (b) => (b >= GB / 10 || !b ? `${(b / GB).toFixed(b >= 100 * GB ? 0 : 1)} GB` : `${Math.round(b / 1024 ** 2)} MB`);
@@ -1865,13 +1516,12 @@ function userListField(b, kind) {
 const LINK_RE = /[a-z0-9]+:\/\/[^\s"'<>]+/gi;
 
 // the list of server links of a rule: rows with name, protocol, host; drag, remove, add
-function serversField(w, b, opt, { title, help, collapsible, probeLink }) {
+function serversField(w, b, opt, { title, help, collapsible }) {
   const links = asList(b.get(opt));
   const old = asList(b.old(opt));
   const ui = w.ui[`${b.name}:${opt}`] || (w.ui[`${b.name}:${opt}`] = { open: !collapsible, all: false });
   const head = h("div", { class: "servers-head" },
-    h("span", {}, b.changed(opt) ? h("span", { class: "dot sm accent" }) : null, `${title}, ${links.length}`),
-    probeLink ? h("a", { class: "small", style: "font-weight: 500", href: `#/r/${w.id}/probe` }, "Take from last probe") : null);
+    h("span", {}, b.changed(opt) ? h("span", { class: "dot sm accent" }) : null, `${title}, ${links.length}`));
   if (collapsible && !ui.open) {
     return h("div", { class: "mini" }, h("div", { class: "col" }, h("span", { class: "row", style: "gap: 8px; font-size: 13px; font-weight: 500" },
       b.changed(opt) ? h("span", { class: "dot sm accent" }) : null, `${title}, ${links.length}`), h("span", { class: "xs muted" }, help)),
@@ -1926,7 +1576,7 @@ const CONNECTIONS = [["proxy", "Proxy"], ["vpn", "VPN"], ["block", "Block"], ["e
 const PROXY_TYPES = [["url", "One link"], ["selector", "Selector"], ["urltest", "Fastest (URLTest)"], ["outbound", "sing-box JSON"]];
 const PROXY_HELP = {
   url: "One server.",
-  selector: "You pick the server under Servers.",
+  selector: "Uses the first server until you switch it in the Clash dashboard.",
   urltest: "Uses the fastest server.",
   outbound: "Checked with sing-box before applying.",
 };
@@ -1988,7 +1638,7 @@ async function viewRules(main, id, sub) {
         h("span", { class: "n" }, i + 1),
         h("div", { class: "col grow", style: "gap: 6px" },
           h("div", { class: "row" }, h("span", { class: "name" }, s.name), tag,
-            auto ? h("span", { class: "tag", style: "background: var(--line-soft); color: var(--text-2)" }, "from subscriptions") : null),
+            auto ? h("span", { class: "tag", style: "background: var(--line-soft); color: var(--text-2)" }, "from probe") : null),
           h("div", { class: "what" }, h("span", {}, ruleMatches(s)), icon("arrow", 14, { stroke: "var(--muted)" }),
             auto ? h("span", { class: "dest" }, autoDest(auto, s)) : destChip(s))));
       }),
@@ -2010,6 +1660,7 @@ async function viewRules(main, id, sub) {
   };
 
   drawList(); drawEditor();
+  let probeState;
   S.view = {
     leave: () => { w.drawBar = null; },
     onRouter: (r) => {
@@ -2017,12 +1668,19 @@ async function viewRules(main, id, sub) {
       if (r.status.fingerprint !== w.fp) w.fp = r.status.fingerprint;
       w.drawBar();
     },
+    // a probe started or finished: the rules that take its servers read them again
+    onProbe: (m) => {
+      if (m.router_id !== id || m.state === probeState) return;
+      probeState = m.state;
+      for (const k of Object.keys(w.ui)) if (k.endsWith(":auto")) w.ui[k].preview = null;
+      w.redraw();
+    },
   };
 }
 
 // "Proxy, PL servers, 4"
-const autoDest = (rule, sec) => `Proxy, fastest ${asList((sec.options || {}).urltest_proxy_links).length} from subscriptions${
-  rule.countries.length ? ", " + rule.countries.join(", ") : ""}`;
+const autoDest = (rule, sec) => `Proxy, fastest ${asList((sec.options || {}).urltest_proxy_links).length} from probe${
+  rule.countries.length ? ", " + countriesText(rule.countries) : ""}`;
 
 function ruleEditor(w, s, { onRename }) {
   const defs = S.schema.section;
@@ -2126,18 +1784,24 @@ function ruleEditor(w, s, { onRename }) {
         }, { label: "Connection" })),
       null),
     b.problemEls("connection_type"),
-    ct === "proxy" ? sourceCards(w, s, auto) : null,
-    ct === "proxy" && !auto ? h("div", { class: "field", role: "group", "aria-label": "Servers" }, h("span", { class: "label xs muted", style: "font-size: 12px" }, b.dot("proxy_config_type"), "Servers"),
-      seg(PROXY_TYPES, pt, (v) => b.set("proxy_config_type", v, true), { label: "Servers" })) : null,
+    ct === "proxy" ? h("div", { class: "field", role: "group", "aria-label": "Servers" }, h("span", { class: "label xs muted", style: "font-size: 12px" }, b.dot("proxy_config_type"), "Servers"),
+      seg(PROXY_TYPES, pt, (v) => {
+        if (v !== "urltest" && auto) toggleAuto(w, s, false);
+        b.set("proxy_config_type", v, true);
+      }, { label: "Servers" })) : null,
     b.problemEls("proxy_config_type"),
-    ct === "proxy" && auto ? autoRuleEditor(w, s, auto) : null,
-    ct === "proxy" && !auto ? h("p", { class: "xs muted", style: "margin-top: -6px" }, PROXY_HELP[pt]) : null,
-    ct === "proxy" && !auto && pt === "url" ? oneLinkField(b) : null,
-    ct === "proxy" && !auto && pt === "selector" ? serversField(w, b, "selector_proxy_links", { title: "Servers", probeLink: true }) : null,
-    ct === "proxy" && !auto && pt === "urltest" ? serversField(w, b, "urltest_proxy_links", { title: "Servers", probeLink: true }) : null,
-    ct === "proxy" && !auto && pt === "urltest" ? serversField(w, b, "urltest_fallback_links", { title: "Fallback servers",
+    ct === "proxy" ? h("p", { class: "xs muted", style: "margin-top: -6px" }, PROXY_HELP[pt]) : null,
+    ct === "proxy" && pt === "urltest" ? h("label", { class: "check" },
+      h("input", { type: "checkbox", role: "switch", checked: !!auto, onchange: (e) => toggleAuto(w, s, e.target.checked) }),
+      h("span", { class: "col" }, h("span", { style: "font-weight: 500" }, "Take links from probe"),
+        auto ? null : h("span", {}, "The probe tests your keys and picks servers by region, ping and speed"))) : null,
+    ct === "proxy" && pt === "urltest" && auto ? autoRuleEditor(w, s, auto) : null,
+    ct === "proxy" && pt === "url" ? oneLinkField(b) : null,
+    ct === "proxy" && pt === "selector" ? serversField(w, b, "selector_proxy_links", { title: "Servers" }) : null,
+    ct === "proxy" && pt === "urltest" && !auto ? serversField(w, b, "urltest_proxy_links", { title: "Servers" }) : null,
+    ct === "proxy" && pt === "urltest" && !auto ? serversField(w, b, "urltest_fallback_links", { title: "Fallback servers",
       help: "Used only when every server above fails", collapsible: true }) : null,
-    ct === "proxy" && !auto && pt === "outbound" ? h("div", { class: "field" }, lbl(b, "outbound_json", "sing-box outbound (JSON)"),
+    ct === "proxy" && pt === "outbound" ? h("div", { class: "field" }, lbl(b, "outbound_json", "sing-box outbound (JSON)"),
       h("textarea", { class: "input", rows: 9, "data-k": "outbound_json", spellcheck: "false", oninput: (e) => b.set("outbound_json", e.target.value) }, o.outbound_json || ""),
       b.problemEls("outbound_json")) : null,
     ct === "vpn" ? h("div", { class: "form-grid" },
@@ -2216,18 +1880,6 @@ function proxyAdvanced(w, b, s, ct, pt) {
 
 // --- rules whose servers the probe picks from the subscriptions ----------------------------------------------------------
 
-function sourceCards(w, s, auto) {
-  const card = (on, title, sub, onclick) => h("button", { type: "button", "aria-pressed": String(on), onclick,
-    class: "source", style: `display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding: 12px 14px; border-radius: 8px; text-align: left; cursor: pointer; ${on
-      ? "border: 1px solid var(--accent); background: var(--selected); box-shadow: 0 0 0 3px var(--accent-ring);" : "border: 1px solid var(--control); background: var(--surface);"}` },
-  h("span", { class: "row", style: "gap: 8px; font-size: 13.5px; font-weight: 500" }, on ? icon("check", 14, { stroke: "var(--accent)", width: 2 }) : null, title),
-  h("span", { class: "xs", style: `color: ${on ? "var(--text-2)" : "var(--muted)"}` }, sub));
-  return h("div", { role: "group", "aria-label": "Where servers come from",
-    style: "display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 10px" },
-  card(!auto, "Links I add", "Paste vless:// and other links", () => auto && toggleAuto(w, s, false)),
-  card(!!auto, "From my subscriptions", "Picked by the probe with this rule's limits", () => !auto && toggleAuto(w, s, true)));
-}
-
 async function toggleAuto(w, s, on) {
   try {
     if (on) {
@@ -2267,6 +1919,13 @@ function autoRuleEditor(w, s, rule) {
     catch (e) { toast(e.message, true); }
     ui.loading = false; draw();
   };
+  const runProbe = async () => {
+    try {
+      await api("POST", `/api/routers/${w.id}/probe/start`);
+      toast("Probe started, it takes 2 to 10 minutes");
+      await preview();
+    } catch (e) { toast(e.message, true); }
+  };
   const update = (patch, now) => {
     Object.assign(rule, patch);
     clearTimeout(saveTimer);
@@ -2281,32 +1940,36 @@ function autoRuleEditor(w, s, rule) {
   const draw = () => {
     const p = ui.preview;
     const seen = (p && p.countries) || [];
-    const opts = p ? p.probe_options : [];
-    const probeCountries = opts.includes("--countries") ? opts[opts.indexOf("--countries") + 1] : "all";
     const matched = p ? p.matched : [], fb = p ? p.fallback : [];
+    const run = (p && p.run) || {};
+    const running = run.state === "running";
+    const eu = hasEurope(rule.countries);
+    const chip = (text, label, without) => h("span", { class: "toggle", "aria-pressed": "true", style: "display: inline-flex; align-items: center; gap: 6px; padding: 0 4px 0 10px; height: 30px" },
+      text, h("button", { type: "button", class: "btn icon", style: "width: 22px; height: 22px; color: inherit", "aria-label": `Remove ${label}`,
+        onclick: () => update({ countries: rule.countries.filter((x) => !without.includes(x)) }, true) }, icon("close", 10, { width: 2 })));
     put(box,
       h("div", { class: "stack", style: "gap: 14px; padding: 16px; border: 1px solid var(--line); border-radius: 10px" },
-        h("div", { class: "part-head" }, h("span", { style: "font-size: 13.5px; font-weight: 600" }, "Take servers where"),
-          h("a", { href: `#/r/${w.id}/usage`, class: "xs" }, p ? `${plural(p.keys, "subscription")}, from Keys and usage` : "Keys and usage")),
+        h("div", { class: "part-head" }, h("span", { style: "font-size: 13.5px; font-weight: 600" }, "Probe parameters"),
+          h("a", { href: `#/r/${w.id}/usage`, class: "xs" }, p ? `Tests ${plural(p.keys, "subscription")} from Keys and usage` : "Keys and usage")),
         h("div", { class: "form-grid", style: "grid-template-columns: minmax(110px, 140px) minmax(0, 1fr); align-items: start" },
           h("span", { class: "lbl", style: "font-weight: 500; padding-top: 6px" }, "Exit country"),
           h("div", { class: "ctl", style: "gap: 6px" },
             h("div", { class: "row", style: "gap: 6px" },
-              rule.countries.map((c) => h("span", { class: "toggle", "aria-pressed": "true", style: "display: inline-flex; align-items: center; gap: 6px; padding: 0 4px 0 10px; height: 30px" },
-                `${c}, ${countryName(c)}`, h("button", { type: "button", class: "btn icon", style: "width: 22px; height: 22px; color: inherit", "aria-label": `Remove ${countryName(c)}`,
-                  onclick: () => update({ countries: rule.countries.filter((x) => x !== c) }, true) }, icon("close", 10, { width: 2 })))),
+              eu ? chip("Europe", "Europe", EUROPE) : null,
+              rule.countries.filter((c) => !eu || !EUROPE.includes(c)).map((c) => chip(`${c}, ${countryName(c)}`, countryName(c), [c])),
               h("label", { class: "sr", for: "add-cc" }, "Add a country"),
               h("select", { id: "add-cc", class: "input sm", style: "width: auto; height: 30px; border-style: dashed; border-radius: 15px",
                 onchange: (e) => {
                   let v = e.target.value;
                   if (v === "?") v = (prompt("Two-letter country code, e.g. PL") || "").trim().toUpperCase();
-                  if (/^[A-Z]{2}$/.test(v) && !rule.countries.includes(v)) update({ countries: [...rule.countries, v] }, true); else draw();
+                  if (v === "europe") update({ countries: [...new Set([...rule.countries, ...EUROPE])].sort() }, true);
+                  else if (/^[A-Z]{2}$/.test(v) && !rule.countries.includes(v)) update({ countries: [...rule.countries, v] }, true); else draw();
                 } },
               h("option", { value: "" }, rule.countries.length ? "Add country" : "Any country, add one"),
-              seen.filter((c) => !rule.countries.includes(c)).map((c) => h("option", { value: c }, `${c}, ${countryName(c)}`)),
+              eu ? null : h("option", { value: "europe" }, "Europe, all countries"),
+              seen.filter((c) => !rule.countries.includes(c) && !(eu && EUROPE.includes(c))).map((c) => h("option", { value: c }, `${c}, ${countryName(c)}`)),
               h("option", { value: "?" }, "Other…"))),
-            h("span", { class: "help" }, "The country sites see"),
-            probeCountries !== "all" && rule.countries.length ? h("span", { class: "help" }, `The probe tests only servers in ${probeCountries === "europe" ? "Europe" : probeCountries}; set its countries under Servers probe.`) : null),
+            h("span", { class: "help" }, "The country sites see")),
           h("span", { class: "lbl", style: "font-weight: 500; padding-top: 6px" }, "Protocol"),
           h("div", { class: "row", style: "gap: 6px" }, ["vless", "trojan", "ss", "hysteria2", "socks"].map((x) =>
             h("button", { type: "button", class: "toggle mono", "aria-pressed": String(rule.protocols.includes(x)),
@@ -2344,9 +2007,16 @@ function autoRuleEditor(w, s, rule) {
             { small: true, label: "YouTube" }))),
       h("div", { class: "servers" },
         h("div", { class: "part-head", style: "padding: 12px 14px" },
-          h("span", { style: "font-size: 13.5px; font-weight: 600" }, ui.loading && !p ? "Matches now" : `Matches now: ${plural(matched.length + fb.length, "server")}`),
-          h("span", { class: "xs muted" }, ui.loading ? "Updating…" : p && p.finished
-            ? `From the probe at ${shortWhen(agentTime(p.finished))}.${p.schedule ? ` Next update at ${p.schedule}.` : " Updated after every probe run."}` : "")),
+          h("div", { class: "col", style: "gap: 2px" },
+            h("span", { style: "font-size: 13.5px; font-weight: 600" }, ui.loading && !p ? "Matches now" : `Matches now: ${plural(matched.length + fb.length, "server")}`),
+            h("span", { class: "xs muted" }, running ? "The probe is running, 2 to 10 minutes" : ui.loading ? "Updating…" : p && p.finished
+              ? `Probe at ${shortWhen(agentTime(p.finished))}.${p.schedule ? ` Next at ${p.schedule}.` : ""}` : p ? "No probe run yet" : "")),
+          h("button", { type: "button", class: "btn sm", disabled: running || !p, onclick: runProbe },
+            running ? spinner() : icon("probe", 14), running ? "Running" : "Run probe")),
+        run.state === "failed" ? h("details", { style: "border-top: 1px solid var(--line-soft)" },
+          h("summary", { class: "bad-text", style: "padding: 10px 14px; font-size: 13px; font-weight: 500" }, icon("right", 14, { width: 1.6, class: "chev" }),
+            "The last probe run failed"),
+          h("pre", { class: "out" }, (run.log || []).join("\n"))) : null,
         p && !p.has_links ? h("p", { class: "empty", style: "border-top: 1px solid var(--line-soft)" },
           "The last probe run has no server links (podkop-probe before 1.12 does not save them). Run the probe again to fill this rule.") : null,
         matched.length || fb.length ? h("div", { class: "scroll-x" }, h("table", {},
@@ -2383,6 +2053,12 @@ async function viewGlobal(main, id) {
   put(main, page);
   const defs = S.schema.settings;
   const headBtn = h("span", { style: "display: contents" });
+  // the nightly probe is the manager's setting: saved right away, not in the draft
+  let probe = (await api("GET", `/api/routers/${id}/probe`).catch(() => null) || {}).settings;
+  const saveProbe = async (patch) => {
+    try { probe = await api("PUT", `/api/routers/${id}/probe`, patch); toast("Saved"); } catch (e) { toast(e.message, true); }
+    w.redraw();
+  };
   w.drawBar = () => {
     const n = workChanges(w).length;
     put(headBtn, n ? h("button", { type: "button", class: "btn primary", disabled: w.base !== w.fp, onclick: () => reviewWork(w) }, `Review and apply, ${n}`) : null);
@@ -2465,7 +2141,14 @@ async function viewGlobal(main, id) {
         card("YACD dashboard", null,
           flagField(b, "enable_yacd", "Turn on"),
           flagField(b, "enable_yacd_wan_access", "Reachable from WAN, with a secret", null, { disabled: b.val("enable_yacd") !== "1" }),
-          b.val("enable_yacd_wan_access") === "1" ? h("div", { class: "form-grid" }, row("yacd_secret_key", "Secret", textField(b, "yacd_secret_key", { mono: true }))) : null)),
+          b.val("enable_yacd_wan_access") === "1" ? h("div", { class: "form-grid" }, row("yacd_secret_key", "Secret", textField(b, "yacd_secret_key", { mono: true }))) : null),
+        probe ? card("Nightly probe", "Saved right away",
+          h("div", { class: "form-grid" },
+            h("label", { class: "lbl", for: "sched" }, "Every night at"),
+            h("div", { class: "ctl" }, h("input", { id: "sched", type: "time", class: "input mid num", style: "width: 110px", value: probe.schedule || "",
+              onchange: (e) => saveProbe({ schedule: e.target.value }) }), h("span", { class: "help" }, "Empty: off"))),
+          h("label", { class: "check" }, h("input", { type: "checkbox", checked: !!probe.auto_apply, onchange: (e) => saveProbe({ auto_apply: e.target.checked }) }),
+            h("span", {}, "Apply the result by itself"))) : null),
       settingsOther(o, defs));
     w.drawBar();
   };

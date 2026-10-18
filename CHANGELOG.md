@@ -3,6 +3,19 @@
 Versions are podkop-probe's (`probe.sh`); a release also carries
 podkop-agent and podkop-manager.
 
+## 1.18.0 — 2026-10-18
+
+- Manager 0.8.0: the Servers and Servers probe pages are gone. **Keys and
+  usage** comes right after Overview.
+- A Fastest (URLTest) rule has a **Take links from probe** switch; when on,
+  the probe's parameters (region, protocol, exit IP, name, ping, speed,
+  YouTube, how many) and **Run probe** are shown under it.
+- The probe tests the countries of the rules (all, if a rule takes any);
+  the probe page's countries move into the rules once ("Europe" is one
+  choice in the rule). Schedule and auto-apply are in **Global settings**.
+- Overview: **Review and apply** for a new probe result, **Unpin** for a
+  pinned rule.
+
 ## 1.17.0 — 2026-10-18
 
 - Manager 0.7.0: every rule, main and youtube included, can take its servers
