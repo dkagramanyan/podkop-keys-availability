@@ -284,7 +284,7 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
             picks = hub.auto_picks(rid, st)
             st["rows"] = podkop.probe_rows(st, ps.get("options") or [],
                                            {"main": ps.get("main_section"), "youtube": ps.get("youtube_section")}, picks)
-            st["keys"] = podkop.probe_keys(st.get("log") or [])
+            st["keys"] = podkop.probe_keys(st.get("log") or [], db.last_probe_keys(rid))
             for r in rules:
                 r["picked"] = len(picks[r["section"]]["links"])
                 r["picked_fallback"] = len(picks[r["section"]]["fallback"])

@@ -113,8 +113,9 @@ def test_probe_rows_goes_to_and_reasons():
 def test_probe_keys():
     log = ["==> servers", "  key 1  sub.example.com            42 servers  · 10 GB left",
            "! key 2 (link.example.org): the key's device limit is reached (x): remove an old device"]
-    assert podkop.probe_keys(log) == {1: {"servers": 42},
-                                      2: {"error": "the key's device limit is reached (x): remove an old device"}}
+    assert podkop.probe_keys(log, ["https://a", "https://b"]) == {
+        "https://a": {"servers": 42}, "https://b": {"error": "the key's device limit is reached (x): remove an old device"}}
+    assert podkop.probe_keys(log, ["https://a"]) == {"https://a": {"servers": 42}}   # key 2 was not in that run
 
 
 ROWS = [{"node": "PL Warsaw 5", "link": "vless://a@h:1#W5", "verdict": "GOOD", "median": "0.47", "mbit": "138",

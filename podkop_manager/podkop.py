@@ -421,15 +421,20 @@ _KEY_OK = re.compile(r"^\s*key (\d+)\s+\S+\s+(\d+) servers")
 _KEY_BAD = re.compile(r"key (\d+) \([^)]*\): (.*)$")
 
 
-def probe_keys(log: list) -> dict:
-    """What podkop-probe's output says about each key (subscription), by its
-    position: {1: {"servers": 42}, 2: {"error": "the key's device limit ..."}}."""
-    out: dict[int, dict] = {}
+def probe_keys(log: list, keys: list) -> dict:
+    """What podkop-probe's output says about each key (subscription) of the run
+    that got `keys`: {url: {"servers": 42}, url2: {"error": "the key's device
+    limit ..."}}. The output numbers keys by position in that run."""
+    out: dict[str, dict] = {}
     for line in log or []:
         if m := _KEY_OK.match(line):
-            out[int(m.group(1))] = {"servers": int(m.group(2))}
+            n, info = int(m.group(1)), {"servers": int(m.group(2))}
         elif m := _KEY_BAD.search(line):
-            out[int(m.group(1))] = {"error": m.group(2).strip()}
+            n, info = int(m.group(1)), {"error": m.group(2).strip()}
+        else:
+            continue
+        if 0 < n <= len(keys):
+            out[keys[n - 1]] = info
     return out
 
 
