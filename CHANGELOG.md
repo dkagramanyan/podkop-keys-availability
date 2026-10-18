@@ -3,6 +3,16 @@
 Versions are podkop-probe's (`probe.sh`); a release also carries
 podkop-agent and podkop-manager.
 
+## 1.15.0 — 2026-10-18
+
+- Manager 0.5.0: pages swap in when their data is loaded, with a short fade,
+  instead of going blank first; quick clicks show only the last page.
+- Servers probe: a key's result ("device limit reached", server count) is
+  shown only next to the key that ran, not next to whatever key now sits in
+  the same place in the list.
+- Less text: no page subtitles, shorter hints; the probe table drops the OK
+  column (hover the result instead).
+
 ## 1.14.1 — 2026-10-18
 
 - The web interface's port is `PODKOP_MANAGER_PORT` in `.env` (default 8080).

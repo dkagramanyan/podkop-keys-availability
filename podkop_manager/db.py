@@ -59,6 +59,7 @@ COLUMNS = [
     ("logs", "source", "TEXT NOT NULL DEFAULT ''"),
     ("logs", "level", "TEXT NOT NULL DEFAULT 'info'"),
     ("versions", "trigger", "TEXT NOT NULL DEFAULT 'web'"),
+    ("probe_runs", "keys", "TEXT NOT NULL DEFAULT '[]'"),
 ]
 
 
@@ -207,9 +208,14 @@ class DB:
             self.x(f"UPDATE probe_settings SET {k} = ? WHERE router_id = ?",
                    json.dumps(v) if k in ("keys", "options") else v, rid)
 
-    def add_probe_run(self, rid: int, trigger: str) -> int:
-        return self.x("INSERT INTO probe_runs (router_id, started, state, trigger) VALUES (?, ?, 'running', ?)",
-                      rid, time.time(), trigger)
+    def add_probe_run(self, rid: int, trigger: str, keys: list | None = None) -> int:
+        return self.x("INSERT INTO probe_runs (router_id, started, state, trigger, keys) VALUES (?, ?, 'running', ?, ?)",
+                      rid, time.time(), trigger, json.dumps(keys or []))
+
+    def last_probe_keys(self, rid: int) -> list:
+        """The keys the newest run was started with."""
+        r = self.one("SELECT keys FROM probe_runs WHERE router_id = ? ORDER BY id DESC LIMIT 1", rid)
+        return json.loads(r["keys"]) if r else []
 
     def finish_probe_run(self, run_id: int, state: str, result: dict | None, version_id: int | None = None):
         self.x("UPDATE probe_runs SET finished = ?, state = ?, result = ?, version_id = ? WHERE id = ?",

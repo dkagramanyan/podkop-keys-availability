@@ -255,10 +255,14 @@ const lastRouter = () => {
   return S.routers[id] ? id : (routerList()[0] || {}).id;
 };
 
+// A page is built off screen and swapped in when its data is there, so the
+// old page stays until then (dimmed after a moment) instead of a blank one.
+let renders = 0;
+
 async function render() {
   const main = document.getElementById("main");
   if (S.view && S.view.leave) S.view.leave();
-  S.view = null;
+  S.view = S.shown = null;
   const r = route();
   if (r.home) {
     const id = lastRouter();
@@ -269,17 +273,31 @@ async function render() {
   if (r.rid) store("router", String(r.rid));
   S.rid = r.rid || lastRouter();
   drawSide();
-  put(main, h("div", { class: "page" }, h("p", { class: "loading" }, "Loading…")));
-  window.scrollTo(0, 0);
   const sec = SECTIONS[r.section];
   document.title = `${r.settings ? "Settings" : sec ? sec.title : "Not found"} · podkop-manager`;
+  const token = ++renders;
+  const slot = h("div");
+  const wait = setTimeout(() => {
+    main.classList.add("busy");
+    if (!main.firstChild) put(main, h("div", { class: "page" }, h("p", { class: "loading" }, "Loading…")));
+  }, 250);
   try {
-    if (r.settings) await viewSettings(main);
-    else if (sec) await sec.view(main, r.rid, r.sub);
-    else put(main, h("div", { class: "page" }, h("p", {}, "Not found")));
+    if (r.settings) await viewSettings(slot);
+    else if (sec) await sec.view(slot, r.rid, r.sub);
+    else put(slot, h("div", { class: "page" }, h("p", {}, "Not found")));
   } catch (e) {
-    put(main, h("div", { class: "page" }, h("div", { class: "card pad" }, h("p", { class: "bad-text" }, e.message))));
+    put(slot, h("div", { class: "page" }, h("div", { class: "card pad" }, h("p", { class: "bad-text" }, e.message))));
   }
+  if (token !== renders) {
+    // a newer page was asked for meanwhile: drop this one
+    if (S.view !== S.shown) { if (S.view && S.view.leave) S.view.leave(); S.view = S.shown; }
+    return;
+  }
+  clearTimeout(wait);
+  main.classList.remove("busy");
+  main.replaceChildren(...slot.childNodes);
+  S.shown = S.view;
+  window.scrollTo(0, 0);
 }
 
 // --- sidebar ---------------------------------------------------------------------------
@@ -562,7 +580,7 @@ async function viewOverview(main, id) {
     const cfg = data.config && data.config.config;
     const running = runningVersion(rt, data.versions);
     put(page,
-      pageHead("Overview", `What podkop on ${rt.name} is doing right now`,
+      pageHead("Overview", null,
         h("button", { type: "button", class: "btn", onclick: async (e) => {
           const b = e.currentTarget; b.disabled = true;
           try { await api("POST", `/api/routers/${id}/refresh`); await load(); draw(); } catch (err) { toast(err.message, true); }
@@ -577,7 +595,7 @@ async function viewOverview(main, id) {
       st ? statusStrip(st) : null,
       h("div", { class: "split" },
         h("div", { class: "stack", style: "flex: 2 1 600px; min-width: 0" },
-          nowRouting(rt, cfg, running),
+          nowRouting(rt, cfg),
           nightly(rt)),
         eventsCard(rt)));
   };
@@ -620,12 +638,12 @@ async function viewOverview(main, id) {
         h("span", { class: "bad-text" }, st.failsafe.message)) : null);
   };
 
-  const nowRouting = (rt, cfg, running) => {
+  const nowRouting = (rt, cfg) => {
     const rules = rulesOf(cfg);
     return h("section", { class: "card clip", "aria-labelledby": "now-routing" },
       h("div", { class: "card-head", style: "align-items: baseline" },
         h("div", { class: "col" }, h("h2", { id: "now-routing" }, "Now routing"),
-          h("span", { class: "small muted" }, running ? `Rules from #${running.id}, first match wins` : "First matching rule wins")),
+          h("span", { class: "small muted" }, "First match wins")),
         h("div", { class: "row", style: "gap: 16px" },
           h("a", { class: "alink", href: `#/r/${id}/rules` }, "Edit rules"),
           h("a", { class: "alink", href: `#/r/${id}/servers` }, "Pin servers"))),
@@ -673,7 +691,7 @@ async function viewOverview(main, id) {
         h("h2", { id: "nightly", class: "h2" }, "Nightly probe"),
         h("span", { style: "font-size: 13.5px; color: var(--text-2); font-weight: 400" }, ps.schedule
           ? `Every night at ${ps.schedule}, ${ps.auto_apply ? "applied by itself if podkop starts with it" : "results wait for you to apply them"}.`
-          : "Off. Set a time to test your subscriptions every night."),
+          : "Off"),
         lastText || next ? h("span", { class: "small muted" }, [lastText, next].filter(Boolean).join(" ")) : null),
       h("a", { class: "btn", href: `#/r/${id}/probe` }, "Probe settings"));
   };
@@ -768,7 +786,7 @@ async function viewServers(main, id) {
   const draw = () => {
     const rt = S.routers[id];
     if (!rt) return;
-    const head = pageHead("Servers", "Which server each rule uses now. Pin one to stop automatic switching. The router keeps the pin after restarts.",
+    const head = pageHead("Servers", "Pin a server to stop automatic switching",
       config && rt.proxies && groupsOf().length ? h("button", { type: "button", class: "btn", disabled: busy.size > 0, onclick: async () => {
         for (const s of groupsOf()) await testGroup(s.name);
       } }, icon("probe", 15), busy.size ? "Testing…" : "Test all delays") : null);
@@ -869,7 +887,7 @@ async function viewLogs(main, id) {
   const foot = h("div", { class: "card-foot" });
   const toolbar = h("div", { class: "row", role: "toolbar", "aria-label": "Log filters", style: "gap: 10px 12px" });
   const page = h("div", { class: "page" },
-    pageHead("Logs", `podkop, sing-box, podkop-engine and podkop-agent on ${rt.name}`),
+    pageHead("Logs"),
     toolbar,
     h("section", { class: "card clip", "aria-label": "Log lines" }, box, foot));
   put(main, page);
@@ -894,7 +912,7 @@ async function viewLogs(main, id) {
 
   const drawFoot = () => put(foot,
     f.buffer ? h("span", {}, `The router's own log buffer, read at ${hhmm(new Date(f.buffer * 1000))}. Filters apply to stored lines.`)
-      : h("span", {}, "Stored on this manager. Newest at the bottom, new lines arrive live."),
+      : h("span", {}, "Newest at the bottom"),
     f.buffer ? h("button", { type: "button", class: "link-btn", onclick: () => { f.buffer = null; drawAll(); load(); } }, "Back to stored lines")
       : h("span", { class: `live${f.follow && S.live ? " on" : ""}` }, h("span", { class: "dot sm" }),
         f.follow ? (S.live ? "following" : "reconnecting") : "paused"));
@@ -1058,7 +1076,7 @@ async function viewHistory(main, id) {
     const shown = list.filter((v) => filter === "all" || (filter === "ok" ? ["applied", "saved"].includes(v.state)
       : ["reverted", "rejected", "failed"].includes(v.state)));
     put(page,
-      pageHead("History", "Every change made from this manager: by you, the nightly probe or a restore"),
+      pageHead("History"),
       h("div", { class: "row" }, seg([["all", "All"], ["ok", "Applied"], ["bad", "Undone or rejected"]], filter,
         (v) => { filter = v; draw(); }, { label: "Show" })),
       shown.length ? h("ol", { class: "versions" }, shown.map((v) => {
@@ -1216,10 +1234,9 @@ async function viewProbe(main, id) {
     };
     return h("div", { class: "stack", style: "flex: 1 1 340px; min-width: 0" },
       h("section", { class: "card pad", "aria-labelledby": "p-subs" },
-        h("div", { class: "col" }, h("h2", { id: "p-subs" }, "Subscriptions"),
-          h("span", { class: "small muted" }, "Kept on this manager, sent to the router only for a run")),
+        h("h2", { id: "p-subs" }, "Subscriptions"),
         form.keys.map((k, i) => {
-          const info = keys[i + 1];
+          const info = keys[k];
           return h("div", { class: "subscr" },
             h("div", { class: "col" }, h("span", { class: "ellipsis", title: keyLabel(k) }, keyLabel(k)),
               info ? h("span", { class: info.error ? "bad-text" : "" }, info.error ? info.error : `${info.servers} servers in the last run`) : null),
@@ -1238,14 +1255,13 @@ async function viewProbe(main, id) {
         h("div", { class: "field" }, h("span", { class: "label" }, "Countries"),
           seg([["europe", "Europe"], ["all", "All"], ["choose", "Choose"]], form.countries, (v) => { form.countries = v; drawLeft(); }, { label: "Countries" }),
           form.countries === "choose" ? h("input", { class: "input mid mono", placeholder: "Codes, e.g. DE,NL,FI", value: form.codes,
-            "aria-label": "Country codes", oninput: (e) => { form.codes = e.target.value; } }) : null,
-          h("span", { class: "help" }, "Checks the name, server IP and exit IP, so relays through RU are skipped")),
+            "aria-label": "Country codes", oninput: (e) => { form.codes = e.target.value; } }) : null),
         h("div", { style: "display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px" },
           num("Max ping", "maxPing", "ms", "700"), num("Min speed", "minSpeed", "Mbit/s", "40"), num("Per list", "top", "servers", "10")),
         h("label", { class: "check" }, h("input", { type: "checkbox", checked: form.youtube, onchange: (e) => { form.youtube = e.target.checked; drawLeft(); } }),
-          h("span", { class: "col" }, h("span", {}, "Build a YouTube list"), h("span", {}, "Fastest servers where YouTube sees Russia, so no ads"))),
+          h("span", { class: "col" }, h("span", {}, "Build a YouTube list"), h("span", {}, "Where YouTube sees Russia, no ads"))),
         h("label", { class: "check" }, h("input", { type: "checkbox", checked: form.quick, onchange: (e) => { form.quick = e.target.checked; } }),
-          h("span", { class: "col" }, h("span", {}, "Quick run"), h("span", {}, "Fewer requests and a short speed test")))),
+          h("span", {}, "Quick run"))),
       h("section", { class: "card pad", "aria-labelledby": "p-into" },
         h("h2", { id: "p-into" }, "Into podkop"),
         h("div", { style: "display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px 12px; align-items: center" },
@@ -1258,16 +1274,14 @@ async function viewProbe(main, id) {
           (data.auto_rules || []).map((r) => h("a", { href: `#/r/${id}/rules/${r.section}`, class: "subscr", style: "padding: 9px 10px; color: var(--text)" },
             h("span", { class: "mono", style: "font-size: 13px; font-weight: 500" }, r.section),
             h("span", { class: "xs muted grow" }, autoRuleSummary(r)), icon("right", 14, { stroke: "var(--muted)", width: 1.6 }))),
-          h("span", { class: "xs muted" }, (data.auto_rules || []).length ? "Set up in the rule, under Sends to, From my subscriptions."
-            : "None yet. In a rule, under Sends to, choose From my subscriptions to have the probe pick its servers by country.")),
+          (data.auto_rules || []).length ? null : h("span", { class: "xs muted" }, "None. In a rule: Sends to → From my subscriptions.")),
         h("div", { class: "sep stack", style: "gap: 10px" },
           h("div", { class: "row", style: "justify-content: space-between" },
             h("label", { for: "sched", style: "font-size: 13.5px; font-weight: 500" }, "Every night at"),
             h("input", { id: "sched", type: "time", class: "input mid num", style: "width: 110px", value: form.schedule,
               oninput: (e) => { form.schedule = e.target.value; } })),
           h("label", { class: "check" }, h("input", { type: "checkbox", checked: form.auto, onchange: (e) => { form.auto = e.target.checked; } }),
-            h("span", { class: "col" }, h("span", {}, "Apply the nightly result by itself"), h("span", {}, "Checked first and undone if podkop does not start"))),
-          !form.schedule ? h("span", { class: "xs muted" }, "Empty time: no nightly run.") : null)),
+            h("span", {}, "Apply the nightly result by itself")))),
       h("div", { class: "row", style: "flex-wrap: nowrap" },
         h("button", { type: "button", class: "btn lg", style: "flex: 1", onclick: async () => {
           try { await save(); toast("Saved"); drawLeft(); } catch (e) { toast(e.message, true); }
@@ -1325,8 +1339,8 @@ async function viewProbe(main, id) {
         [["all", `All ${rows.length}`], ["usable", `Usable ${usable.length}`], ["picked", "Picked and rejected"]].map(([v, t]) =>
           h("button", { type: "button", class: "toggle", "aria-pressed": String(filter === v), onclick: () => { filter = v; drawRight(); } }, t)),
         rows[0] && rows[0].total ? h("span", { class: "xs muted", style: "margin-left: auto" }, `${rows[0].total} requests per server`) : null) : null,
-      rows.length ? h("div", { class: "scroll-x" }, h("table", { style: "min-width: 760px" },
-        h("tr", {}, h("th", { scope: "col" }, "Goes to"), h("th", { scope: "col" }, "Result"), h("th", { scope: "col", class: "r" }, "OK"),
+      rows.length ? h("div", { class: "scroll-x" }, h("table", { style: "min-width: 680px" },
+        h("tr", {}, h("th", { scope: "col" }, "Goes to"), h("th", { scope: "col" }, "Result"),
           h("th", { scope: "col", class: "r" }, "Median"), h("th", { scope: "col", class: "r" }, "Mbit/s"), h("th", { scope: "col" }, "Exit"),
           h("th", { scope: "col" }, "YouTube sees"), h("th", { scope: "col" }, "Server")),
         shown.map((r) => {
@@ -1334,14 +1348,13 @@ async function viewProbe(main, id) {
           const median = parseFloat(r.median);
           return h("tr", {},
             h("td", {}, goesTags(r)),
-            h("td", {}, verdictTag(r.verdict)),
-            h("td", { class: "r num" }, r.total ? `${r.ok}/${r.total}` : "–"),
+            h("td", { title: r.total ? `${r.ok} of ${r.total} requests answered` : null }, verdictTag(r.verdict)),
             h("td", { class: "r num nowrap" }, Number.isFinite(median) ? `${median.toFixed(2)} s` : "–"),
             h("td", { class: `r num${/slow/.test(r.reason) ? " bad-text" : ""}` }, r.mbit && r.mbit !== "-" ? Math.round(+r.mbit) : "–"),
             h("td", { class: "mono-cell" }, r.country || "–"),
             h("td", { class: "mono-cell", style: yc === "RU" && ys === "ok" ? "font-weight: 500; color: var(--yt)" : "color: var(--muted)" },
               ys === "ok" ? yc : ys === "-" || !ys ? "–" : ys === "bot" ? "bot check" : ys === "no" ? "no video" : "failed"),
-            h("td", { style: "min-width: 180px" }, h("span", { class: "col" }, h("span", {}, r.node),
+            h("td", { style: "min-width: 160px" }, h("span", { class: "col" }, h("span", {}, r.node),
               r.reason ? h("span", { class: "xs muted" }, r.reason) : null)));
         }))) : null,
       h("details", { style: "border-top: 1px solid var(--line)", open: st.state === "failed" },
@@ -1379,7 +1392,7 @@ async function viewProbe(main, id) {
   await load();
   resetForm();
   put(page,
-    pageHead("Servers probe", "Tests every server from your subscriptions on the router and puts the fastest into podkop"),
+    pageHead("Servers probe"),
     h("div", { class: "split" }, leftBox, rightBox));
   drawLeft(); drawRight();
   lastState = data.status && data.status.state;
@@ -1470,19 +1483,17 @@ function draftBar(w) {
     // while the router applies, its fingerprint moves; that is not someone else's change
     const busy = !!(rt && rt.status && rt.status.podkop.busy);
     const stale = w.base !== w.fp && !busy;
-    const running = runningVersion(rt, w.versions);
     if (!n && !stale) { put(box); return; }
     const probs = w.problems || [];
     put(box, h("div", { class: `banner${stale ? " bad" : ""}`, role: "region", "aria-label": "Unapplied changes" },
       h("span", { class: `dot ${stale ? "bad" : "accent"}` }),
       h("div", { class: "row grow", style: "flex: 1 1 300px; align-items: baseline; gap: 4px 12px" },
         h("span", { style: "font-size: 14px; font-weight: 600" }, n ? `${plural(n, "change")} not applied` : "Draft"),
-        stale ? h("span", { class: "small bad-text" }, "podkop's settings changed on the router after this draft was started. Applying it would undo that, so the router refuses it: discard the draft and make your changes again.")
+        stale ? h("span", { class: "small bad-text" }, "Settings changed on the router since. Discard and edit again.")
           : busy ? h("span", { class: "small muted" }, "The router is applying settings now…")
             : w.checking ? h("span", { class: "small muted" }, "Checking on the router…")
             : w.problems ? h("span", { class: `small ${probs.length ? "bad-text" : "ok-text"}` },
-              probs.length ? `${plural(probs.length, "problem")} found by Check${w.problems.stale ? ", changed since" : ""}` : `Check found no problems${w.problems.stale ? ", changed since" : ""}`) : null,
-        !stale ? h("span", { class: "small muted" }, `Draft kept on this manager. The router still runs ${running ? `the settings from #${running.id}` : "its current settings"}.`) : null),
+              probs.length ? `${plural(probs.length, "problem")} found by Check${w.problems.stale ? ", changed since" : ""}` : `Check found no problems${w.problems.stale ? ", changed since" : ""}`) : null),
       h("div", { class: "row" },
         h("button", { type: "button", class: "btn ghost", onclick: async () => {
           if (confirm(`Discard ${plural(n, "change")}? The router keeps its settings.`)) await discardWork(w);
@@ -1623,7 +1634,7 @@ function userListField(b, kind) {
       seg([["disabled", "Off"], ["dynamic", "List"], ["text", "Text"]], mode, (v) => b.set(type, v, true), { small: true, label: name })),
     mode === "dynamic" ? tokenField(b, list, { placeholder: kind === "domain" ? "Add domain, Enter" : "Add subnet, Enter" }) : null,
     mode === "text" ? h("textarea", { class: "input", rows: 5, "data-k": text, oninput: (e) => b.set(text, e.target.value) }, b.get(text) || "") : null,
-    mode === "dynamic" ? h("span", { class: "help" }, "Green items are new in this draft. Paste several at once, separated by spaces or new lines.") : null,
+    mode === "dynamic" ? h("span", { class: "help" }, "Green: new in this draft") : null,
     b.problemEls(list), b.problemEls(text));
 }
 
@@ -1692,10 +1703,10 @@ function serversField(w, b, opt, { title, help, collapsible, probeLink }) {
 const CONNECTIONS = [["proxy", "Proxy"], ["vpn", "VPN"], ["block", "Block"], ["exclusion", "Direct"]];
 const PROXY_TYPES = [["url", "One link"], ["selector", "Selector"], ["urltest", "Fastest (URLTest)"], ["outbound", "sing-box JSON"]];
 const PROXY_HELP = {
-  url: "One server for everything this rule matches.",
-  selector: "A list of servers; you pick which one is used under Servers.",
-  urltest: "Tests every server and uses the fastest. Fallback servers are used only when all of them fail.",
-  outbound: "A sing-box outbound written by hand, checked with sing-box before it is applied.",
+  url: "One server.",
+  selector: "You pick the server under Servers.",
+  urltest: "Uses the fastest server.",
+  outbound: "Checked with sing-box before applying.",
 };
 
 async function viewRules(main, id, sub) {
@@ -1706,7 +1717,7 @@ async function viewRules(main, id, sub) {
   const bar = draftBar(w);
   const listBox = h("section", { "aria-label": "Rules", class: "stack", style: "flex: 1 1 400px; min-width: 0; gap: 10px" });
   const editBox = h("div", { style: "flex: 1.3 1 520px; min-width: 0" });
-  put(page, pageHead("Routing rules", "podkop sections as rules: what each one matches and where that traffic goes"),
+  put(page, pageHead("Routing rules"),
     bar, h("div", { class: "split" }, listBox, editBox));
 
   const selected = () => {
@@ -1732,7 +1743,7 @@ async function viewRules(main, id, sub) {
     let drag = null;
     put(listBox,
       h("div", { class: "col", style: "padding: 0 2px 4px" }, h("h2", { class: "h2" }, "Rules"),
-        h("p", { class: "small muted" }, "A site goes to the first rule that matches it. Drag to change the order, or use Alt and the arrow keys.")),
+        h("p", { class: "small muted" }, "First match wins. Drag to reorder.")),
       rules.map((s, i) => {
         const n = diff.filter((d) => d.section === s.name && d.change === "changed").length;
         const auto = w.auto[s.name];
@@ -1855,7 +1866,7 @@ function ruleEditor(w, s, { onRename }) {
 
   const matches = h("div", { class: "part" },
     h("div", { class: "part-head" }, h("h3", {}, "Matches"),
-      h("span", {}, index > 0 ? `Any of these sends traffic here, unless rule${index > 1 ? "s" : ""} 1${index > 1 ? "–" + index : ""} above catch${index > 1 ? "" : "es"} it first` : "Any of these sends traffic to this rule")),
+      index > 0 ? h("span", {}, `Unless rule${index > 1 ? "s" : ""} 1${index > 1 ? "–" + index : ""} above catch${index > 1 ? "" : "es"} it first`) : null),
     h("div", { class: "field" },
       h("span", { class: "label" }, b.changed("community_lists") ? h("span", { class: "dot sm accent" }) : null, "Community lists"),
       h("div", { class: "row", style: "gap: 6px" },
@@ -1880,11 +1891,10 @@ function ruleEditor(w, s, { onRename }) {
         .map(([opt, text, ph]) => h("div", { class: "field" }, lbl(b, opt, text), tokenField(b, opt, { placeholder: ph, splitter: /[\s,]+/ }), b.problemEls(opt)))) : null);
 
   const advanced = proxyAdvanced(w, b, s, ct, pt);
-  const sendsHelp = ct === "proxy" ? (auto ? "Proxy, fastest of the servers below" : "Where matching traffic goes")
-    : ct === "vpn" ? "Through a VPN interface of the router" : ct === "block" ? "Matching traffic is dropped" : "Matching traffic goes out directly, not through podkop";
+  const sendsHelp = ct === "exclusion" ? "Not through podkop" : null;
 
   const sends = h("div", { class: "part" },
-    h("div", { class: "part-head" }, h("h3", {}, "Sends to"), h("span", {}, sendsHelp)),
+    h("div", { class: "part-head" }, h("h3", {}, "Sends to"), sendsHelp ? h("span", {}, sendsHelp) : null),
     h("div", { class: "row", style: "gap: 14px 24px; align-items: flex-start" },
       h("div", { class: "field", role: "group", "aria-label": "Connection" }, h("span", { class: "label xs muted", style: "font-size: 12px" }, b.dot("connection_type"), "Connection"),
         seg(CONNECTIONS, ct, (v) => {
@@ -1991,8 +2001,8 @@ function sourceCards(w, s, auto) {
   h("span", { class: "xs", style: `color: ${on ? "var(--text-2)" : "var(--muted)"}` }, sub));
   return h("div", { role: "group", "aria-label": "Where servers come from",
     style: "display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 10px" },
-  card(!auto, "Links I add", "You paste vless:// and other links, they stay as they are", () => auto && toggleAuto(w, s, false)),
-  card(!!auto, "From my subscriptions", "The probe picks servers that pass the filter and refreshes them on every run", () => !auto && toggleAuto(w, s, true)));
+  card(!auto, "Links I add", "Paste vless:// and other links", () => auto && toggleAuto(w, s, false)),
+  card(!!auto, "From my subscriptions", "Picked by the probe, by country", () => !auto && toggleAuto(w, s, true)));
 }
 
 async function toggleAuto(w, s, on) {
@@ -2071,7 +2081,7 @@ function autoRuleEditor(w, s, rule) {
               h("option", { value: "" }, rule.countries.length ? "Add country" : "Any country, add one"),
               seen.filter((c) => !rule.countries.includes(c)).map((c) => h("option", { value: c }, `${c}, ${countryName(c)}`)),
               h("option", { value: "?" }, "Other…"))),
-            h("span", { class: "help" }, "The country of the IP that sites see, checked through each server. Relays whose exit is elsewhere are left out."),
+            h("span", { class: "help" }, "The country sites see"),
             probeCountries !== "all" && rule.countries.length ? h("span", { class: "help" }, `The probe tests only servers in ${probeCountries === "europe" ? "Europe" : probeCountries}; set its countries under Servers probe.`) : null),
           h("span", { class: "lbl", style: "font-weight: 500; padding-top: 6px" }, "Protocol"),
           h("div", { class: "row", style: "gap: 6px" }, ["vless", "trojan", "ss", "hysteria2", "socks"].map((x) =>
@@ -2081,7 +2091,7 @@ function autoRuleEditor(w, s, rule) {
           h("div", { class: "ctl" }, h("input", { id: "ipf", class: "input mid mono", style: "max-width: 360px; font-size: 12.5px", "data-k": "auto-ip",
             placeholder: "Any. Or an IP or subnet, e.g. 203.0.113.0/24", value: rule.exit_ips.join(" "),
             oninput: (e) => update({ exit_ips: e.target.value.split(/[\s,]+/).filter(Boolean) }) }),
-          h("span", { class: "help" }, "Use it to keep one IP the service already trusts. Several, separated by spaces.")),
+          h("span", { class: "help" }, "Several, separated by spaces")),
           h("label", { for: "namef", class: "lbl", style: "font-weight: 500; padding-top: 8px" }, "Name contains"),
           h("div", { class: "ctl" }, h("input", { id: "namef", class: "input mid", style: "max-width: 360px", "data-k": "auto-name", placeholder: "Any, e.g. Warsaw",
             value: rule.name_contains, oninput: (e) => update({ name_contains: e.target.value }) })),
@@ -2156,12 +2166,12 @@ async function viewGlobal(main, id) {
       h("div", { class: "ctl" }, control, b.was(opt), b.problemEls(opt))];
     const devices = asList(b.val("source_network_interfaces"));
     put(page,
-      pageHead("Global settings", "Options for every rule. Changes join the same draft as the rules. Dots mark values that differ from podkop's defaults.", headBtn),
+      pageHead("Global settings", "Dots mark values that differ from podkop's defaults", headBtn),
       w.base !== w.fp ? h("div", { class: "banner bad" }, h("span", { class: "dot bad" }),
         h("span", { class: "small bad-text grow" }, "podkop's settings changed on the router after this draft was started. Applying it would undo that, so the router refuses it."),
         h("button", { type: "button", class: "btn ghost", onclick: () => discardWork(w) }, "Discard draft")) : null,
       h("div", { class: "cards-2" },
-        card("DNS", "How podkop resolves names for routed traffic",
+        card("DNS", null,
           h("div", { class: "form-grid" },
             row("dns_type", "Protocol", segField(b, "dns_type", ["doh", "dot", "udp"], ["DoH", "DoT", "UDP"])),
             row("dns_server", "DNS server", comboField(b, "dns_server", optionDef("settings", "dns_server").values)),
@@ -2169,7 +2179,7 @@ async function viewGlobal(main, id) {
             row("dns_rewrite_ttl", "Rewrite TTL", h("div", { class: "unit" }, h("input", { class: "input mid", style: "width: 90px", inputmode: "numeric",
               "data-k": "dns_rewrite_ttl", value: o.dns_rewrite_ttl ?? "", placeholder: "60", oninput: (e) => b.set("dns_rewrite_ttl", e.target.value.trim()) }),
             h("span", {}, "seconds"))))),
-        card("Which devices", "Traffic from these networks goes through the rules",
+        card("Which devices", null,
           h("div", { class: "row" }, b.changed("source_network_interfaces") ? h("span", { class: "dot sm accent" }) : null,
             [...new Set([...w.ctx.devices.filter((d) => /^br-|^wg|^tun|^lan|^eth/.test(d)), ...devices])].map((d) => h("label", { class: "box-check" },
               h("input", { type: "checkbox", checked: devices.includes(d), onchange: (e) => b.set("source_network_interfaces",
@@ -2191,7 +2201,7 @@ async function viewGlobal(main, id) {
               row("badwan_reload_delay", "Delay", h("div", { class: "unit" }, h("input", { class: "input mid", style: "width: 100px", inputmode: "numeric",
                 "data-k": "badwan_reload_delay", value: o.badwan_reload_delay ?? "", placeholder: "2000",
                 oninput: (e) => b.set("badwan_reload_delay", e.target.value.trim()) }), h("span", {}, "ms")))) : null)),
-        card("Lists", "Community and remote lists used by the rules",
+        card("Lists", null,
           h("div", { class: "form-grid" },
             row("update_interval", "Update every", segField(b, "update_interval", ["1h", "3h", "12h", "1d", "3d"])),
             h("span", { class: "lbl" }, b.dot("download_lists_via_proxy"), "Download"),
@@ -2204,22 +2214,21 @@ async function viewGlobal(main, id) {
               h("option", { value: "" }, "—"), [...new Set([...proxyRules, ...(o.download_lists_via_proxy_section ? [o.download_lists_via_proxy_section] : [])])]
                 .map((n) => h("option", { value: n, selected: n === o.download_lists_via_proxy_section }, n))),
               b.problemEls("download_lists_via_proxy_section")))),
-        card("Traffic", "Fixes for sites and devices that misbehave",
+        card("Traffic", null,
           h("div", { style: "display: grid; grid-template-columns: repeat(auto-fit, minmax(min(190px, 100%), 1fr)); gap: 12px 20px" },
             flagField(b, "disable_quic", "Disable QUIC"), flagField(b, "enable_utls_fallback", "uTLS fallback"),
             flagField(b, "exclude_ntp", "Exclude NTP"), flagField(b, "dont_touch_dhcp", "Don't touch DHCP")),
           h("div", { class: "field sep" }, lbl(b, "routing_excluded_ips", "IPs never routed"),
             tokenField(b, "routing_excluded_ips", { placeholder: "IP or subnet, Enter" }), b.problemEls("routing_excluded_ips"))),
-        card("sing-box", "Files and log level",
+        card("sing-box", null,
           h("div", { class: "form-grid" },
             row("config_path", "Config file", selectField(b, "config_path", optionDef("settings", "config_path").values, { mono: true })),
             row("cache_path", "Cache file", textField(b, "cache_path", { mono: true })),
             row("log_level", "Log level", selectField(b, "log_level", optionDef("settings", "log_level").values)))),
-        card("YACD dashboard", "sing-box's own web dashboard on the router",
+        card("YACD dashboard", null,
           flagField(b, "enable_yacd", "Turn on"),
           flagField(b, "enable_yacd_wan_access", "Reachable from WAN, with a secret", null, { disabled: b.val("enable_yacd") !== "1" }),
-          b.val("enable_yacd_wan_access") === "1" ? h("div", { class: "form-grid" }, row("yacd_secret_key", "Secret", textField(b, "yacd_secret_key", { mono: true }))) : null,
-          h("p", { class: "xs muted" }, "The Clash API it uses is closed to the LAN by podkop-agent, except for the computers listed when the router was added."))),
+          b.val("enable_yacd_wan_access") === "1" ? h("div", { class: "form-grid" }, row("yacd_secret_key", "Secret", textField(b, "yacd_secret_key", { mono: true }))) : null)),
       settingsOther(o, defs));
     w.drawBar();
   };
@@ -2231,7 +2240,7 @@ async function viewGlobal(main, id) {
 function settingsOther(o, defs) {
   const known = new Set([...defs.map((d) => d.name), ...S.schema.internal]);
   const other = Object.keys(o).filter((k) => !known.has(k));
-  return h("p", { class: "small muted" }, "Options this manager does not know are kept on the router as they are",
+  return h("p", { class: "small muted" }, "Other options are kept as they are",
     other.length ? `: ${other.join(", ")}.` : ".");
 }
 
@@ -2504,23 +2513,23 @@ async function viewSettings(main) {
     } catch (err) { put(addOut, h("p", { class: "problem-box" }, err.message)); addBtn.disabled = false; }
   } },
   h("div", { class: "col" }, h("h2", { id: "s-add" }, "Add router"),
-    h("span", { class: "small muted" }, "Needs podkop and podkop-engine on the router. Installs podkop-agent, podkop-probe, a key that may run only podkop-agent, and two firewall rules.")),
+    h("span", { class: "small muted" }, "Needs podkop and podkop-engine on the router")),
   h("div", { class: "auto-grid", style: "grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr))" },
     h("div", { class: "field" }, h("label", { for: "a-name" }, "Name"), f.name),
     h("div", { class: "field" }, h("label", { for: "a-host" }, "Address"), f.host),
     h("div", { class: "field" }, h("label", { for: "a-port" }, "SSH port"), f.port),
     h("div", { class: "field" }, h("label", { for: "a-pass" }, "Root password"), f.pass, h("span", { class: "help" }, pwHelp("Used once to install, not stored")))),
   h("div", { class: "field", style: "max-width: 560px" }, h("label", { for: "a-clash" }, "Computers that may still reach the Clash API"), f.allow,
-    h("span", { class: "help" }, "Port 9090 gets closed to the LAN. Add a computer here if you use the YACD dashboard from it.")),
+    h("span", { class: "help" }, "Port 9090 is closed to the rest of the LAN")),
   addOut, h("div", {}, addBtn));
 
   const draw = () => {
     const list = routerList();
     put(page,
-      pageHead("Settings", "Routers this manager controls, its SSH key and your login"),
+      pageHead("Settings"),
       h("section", { class: "card clip", "aria-labelledby": "s-routers" },
         h("div", { class: "card-head" }, h("div", { class: "col" }, h("h2", { id: "s-routers" }, "Routers"),
-          h("span", { class: "small muted" }, list.length ? "Switch between them at the top of the menu" : "None yet: add your first router below"))),
+          list.length ? null : h("span", { class: "small muted" }, "None yet: add your first router below"))),
         list.length ? h("div", { class: "scroll-x" }, h("table", { class: "wide" },
           h("tr", {}, h("th", { scope: "col" }, "Name"), h("th", { scope: "col" }, "Address"), h("th", { scope: "col" }, "State"),
             h("th", { scope: "col" }, "podkop-agent"), h("th", { scope: "col", class: "r" }, h("span", { class: "sr" }, "Actions"))),
@@ -2546,11 +2555,10 @@ async function viewSettings(main) {
             h("code", { class: "grow", style: "font-size: 12px; line-height: 1.5; color: var(--text-2); word-break: break-all" }, info.public_key),
             h("button", { type: "button", class: "btn xs", onclick: async () => {
               try { await navigator.clipboard.writeText(info.public_key); toast("Key copied"); } catch { toast("Select the key and copy it", true); }
-            } }, "Copy")),
-          h("span", { class: "xs muted" }, "Restricted on each router to running podkop-agent: no shell, no port forwarding.")),
+            } }, "Copy"))),
         h("section", { class: "card pad", "aria-labelledby": "s-acc", style: "gap: 12px" },
           h("h2", { id: "s-acc" }, "Login"),
-          h("span", { class: "small muted" }, "The password is PODKOP_MANAGER_PASSWORD in .env. Change it there and restart: everyone is logged out."),
+          h("span", { class: "small muted" }, "Set in .env (PODKOP_MANAGER_PASSWORD)"),
           h("div", { class: "row" },
             h("form", { method: "post", action: "/logout", style: "display: contents" }, h("button", { type: "submit", class: "btn" }, "Log out"))))));
   };

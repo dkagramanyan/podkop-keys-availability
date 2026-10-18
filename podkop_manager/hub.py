@@ -268,7 +268,7 @@ class Hub:
         if rid in self.probes and not self.probes[rid].done():
             raise AgentError("busy", "a probe is already running")
         await rt.agent.call("probe-start", payload={"keys": ps["keys"], "options": ps["options"]}, timeout=30)
-        run_id = self.db.add_probe_run(rid, trigger)
+        run_id = self.db.add_probe_run(rid, trigger, ps["keys"])
         self.probes[rid] = asyncio.create_task(self._track_probe(rt, run_id, trigger))
         self.publish({"type": "probe", "router_id": rid, "state": "running", "run": run_id})
         return run_id
