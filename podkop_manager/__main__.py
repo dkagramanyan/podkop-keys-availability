@@ -82,7 +82,9 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("asyncssh").setLevel(logging.WARNING)
     host, _, port = a.listen.rpartition(":")
-    app = create_app(db, Hub(db, key_path, src), public_key, password,
+    hub = Hub(db, key_path, src)
+    hub.auto_engine = True       # podkop-engine for testing servers here, fetched in the background
+    app = create_app(db, hub, public_key, password,
                      os.environ.get("PODKOP_MANAGER_USER", "").strip() or "admin")
     uvicorn.run(app, host=host or "0.0.0.0", port=int(port), log_level="warning", proxy_headers=False)
     return 0

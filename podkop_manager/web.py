@@ -125,7 +125,7 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, username: str =
     async def manager_info():
         missing = hub.local_probe_missing()
         return {"version": __version__, "public_key": keys["public"],
-                "local_probe": {"ready": not missing, "missing": missing,
+                "local_probe": {"ready": not missing, "missing": missing, "engine": hub.engine,
                                 "forward_line": "" if missing else forward_line(hub.forward_public())}}
 
     @app.get("/api/schema", dependencies=[api])
@@ -135,6 +135,12 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, username: str =
     @app.get("/api/routers", dependencies=[api])
     async def routers():
         return [rt.snapshot() for rt in hub.routers.values()]
+
+    @app.post("/api/engine/download", dependencies=[api])
+    async def engine_download():
+        """podkop-engine for probes run here: downloaded once into the data folder."""
+        hub.download_engine()
+        return hub.engine
 
     @app.post("/api/install-command", dependencies=[api])
     async def router_command(body: dict):

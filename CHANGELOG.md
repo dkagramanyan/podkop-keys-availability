@@ -3,6 +3,28 @@
 Versions are podkop-probe's (`probe.sh`); a release also carries
 podkop-agent and podkop-manager.
 
+## 1.23.0 — 2026-10-18
+
+- **Add router without the root password** (published here: the v1.22.0
+  release was made before it, so its install.sh lacked `--release`). Add
+  router shows a command to run on the router. It downloads install.sh of the manager's own release
+  (`--release`) and installs podkop-agent, podkop-probe and the manager's key,
+  with the Clash API options and, if ticked, the forwarding-only key
+  (`--forward-key`; a run without it removes that key). At the end it prints
+  `podkop-router <address> <port> <host key>`; pasted into Add router, the
+  manager checks that this host key answers and that its key runs
+  podkop-agent there before it adds the router. **Reinstall agent** shows the
+  same command. The password fields and PODKOP_MANAGER_ROUTER_PASSWORD are
+  gone; the manager never logs in with a password.
+- **Faster build:** podkop-engine is no longer in the Docker image. GitHub
+  serves it slowly (~100 KB/s), and a build stopped during the download lost
+  the cached apt step too. The manager now downloads it once in the
+  background when it starts (~13 MB, checked by SHA-256) into the data
+  volume, where rebuilds keep it. Global settings shows the download and
+  has a button to try again if it failed. Testing servers on the manager's
+  server works as before once it is there.
+- Manager 0.13.0.
+
 ## 1.22.0 — 2026-10-18
 
 - **Test servers on the manager's server, through the router** (manager
@@ -22,16 +44,6 @@ podkop-agent and podkop-manager.
     through SSH and are skipped.
   - The Docker image adds busybox, curl, jq and podkop-engine-full's static
     sing-box (checked by SHA-256). The backup keeps the second key.
-- **Add router without the root password:** Add router shows a command to
-  run on the router. It downloads install.sh of the manager's own release
-  (`--release`) and installs podkop-agent, podkop-probe and the manager's key,
-  with the Clash API options and, if ticked, the forwarding-only key
-  (`--forward-key`; a run without it removes that key). At the end it prints
-  `podkop-router <address> <port> <host key>`; pasted into Add router, the
-  manager checks that this host key answers and that its key runs
-  podkop-agent there before it adds the router. **Reinstall agent** shows the
-  same command. The password fields and PODKOP_MANAGER_ROUTER_PASSWORD are
-  gone; the manager never logs in with a password.
 
 ## 1.21.0 — 2026-10-18
 

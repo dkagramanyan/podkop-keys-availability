@@ -63,6 +63,8 @@ that already runs there are taken into **Keys and usage** and the rules.
   it shows to the router's `/etc/dropbear/authorized_keys` once: it lets the
   manager's second key forward connections and nothing else (no shell, no
   commands). Servers that use UDP (hysteria2, TUIC) can't be tested this way.
+  The manager downloads podkop-engine for this by itself once, after it
+  starts (~13 MB, kept in the data volume).
 - **Overview → Now routing**: each rule's server now and where its traffic
   leaves to the internet (country and exit IP).
 - **Configs**: save a router's config (podkop plus each rule's probe

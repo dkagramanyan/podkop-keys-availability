@@ -478,3 +478,36 @@ def test_local_probe_tests_the_routers_nodes_here(tmp_path: Path):
     assert asyncio.run(hub.probe_status(rt))["rows"] == st["rows"]
     rt.local_probe = None          # after a restart: the stored result
     assert asyncio.run(hub.probe_status(rt))["rows"] == st["rows"]
+
+
+def test_engine_download_is_checked_and_unpacked(tmp_path: Path, monkeypatch):
+    import hashlib
+    import io
+    import tarfile
+    from podkop_manager import hub as hubmod
+
+    def tgz(name, data):
+        out = io.BytesIO()
+        with tarfile.open(fileobj=out, mode="w:gz") as t:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            t.addfile(info, io.BytesIO(data))
+        return out.getvalue()
+    ipk = tgz("./data.tar.gz", tgz("./usr/bin/sing-box", b"#!/bin/sh\necho engine\n"))
+
+    class Answer(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+    monkeypatch.setattr(hubmod.urllib.request, "urlopen", lambda url, timeout=0: Answer(ipk))
+    monkeypatch.setitem(hubmod.ENGINE_FILES, "x86_64", ("x86_64", hashlib.sha256(ipk).hexdigest()))
+    dest = tmp_path / "bin" / "sing-box"
+    hubmod.fetch_engine(dest, "x86_64")
+    assert dest.read_bytes() == b"#!/bin/sh\necho engine\n" and dest.stat().st_mode & 0o111
+    monkeypatch.setitem(hubmod.ENGINE_FILES, "x86_64", ("x86_64", "0" * 64))
+    with pytest.raises(ValueError, match="not the expected file"):
+        hubmod.fetch_engine(tmp_path / "other", "x86_64")
+    with pytest.raises(ValueError, match="no build"):
+        hubmod.fetch_engine(dest, "mips")

@@ -9,9 +9,14 @@ import contextlib
 import datetime as dt
 import json
 import logging
+import hashlib
+import io
 import os
+import platform
 import shutil
+import tarfile
 import time
+import urllib.request
 from pathlib import Path
 
 from . import configs, podkop, usage
@@ -33,6 +38,36 @@ USAGE_SECONDS = 600      # the providers' numbers, read through the router
 # sh and tools first (as on a router), then podkop-engine-full's sing-box
 PROBE_PATH = os.environ.get("PODKOP_MANAGER_PROBE_PATH") or os.environ.get("PATH", "")
 PROBE_SECONDS = 3 * 3600
+# podkop-engine-full's sing-box (static, with the SSH outbound) for probes run
+# here: downloaded once, when asked for, into the data folder (bin/)
+ENGINE_VERSION = "1.13.21-r14"
+ENGINE_FILES = {   # machine -> (package arch, SHA-256 of the .ipk)
+    "x86_64": ("x86_64", "7e23ea61e0ce0a58f101706a9bbd3badeea804af165ba12d714cc8c97b753d9d"),
+    "aarch64": ("aarch64_generic", "275e42156a1e36b71310729b6b5557bb2e91aa3c61a68a4f50eb4c61c9ecb7d9"),
+}
+ENGINE_FILES["amd64"], ENGINE_FILES["arm64"] = ENGINE_FILES["x86_64"], ENGINE_FILES["aarch64"]
+
+
+def fetch_engine(dest: Path, machine: str = "") -> None:
+    """Downloads podkop-engine-full, checks it and puts its sing-box at dest."""
+    arch, sha = ENGINE_FILES.get(machine or platform.machine(), (None, None))
+    if not arch:
+        raise ValueError(f"podkop-engine has no build for {machine or platform.machine()}")
+    url = (f"https://github.com/FiyeroT/podkop-engine/releases/download/v{ENGINE_VERSION}/"
+           f"podkop-engine-full_{ENGINE_VERSION}_openwrt_{arch}.ipk")
+    with urllib.request.urlopen(url, timeout=60) as r:
+        data = r.read()
+    if hashlib.sha256(data).hexdigest() != sha:
+        raise ValueError("the downloaded podkop-engine is not the expected file")
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as ipk:
+        inner = ipk.extractfile("./data.tar.gz").read()
+    with tarfile.open(fileobj=io.BytesIO(inner), mode="r:gz") as pkg:
+        binary = pkg.extractfile("./usr/bin/sing-box").read()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(".new")
+    tmp.write_bytes(binary)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, dest)
 
 
 def _utc() -> str:
@@ -89,6 +124,8 @@ class Hub:
         self.db, self.key, self.src = db, key, src
         # the key the routers let forward connections (and nothing else), for probes run here
         self.forward_key = key.parent / "id_forward"
+        self.engine = {"state": "", "error": ""}    # its download: "", "downloading", "failed"
+        self.auto_engine = False     # serve: download podkop-engine at start when it isn't there
         self.routers: dict[int, RouterRuntime] = {}
         self.subscribers: set[asyncio.Queue] = set()
         self.tasks: list[asyncio.Task] = []
@@ -104,6 +141,8 @@ class Hub:
         self.tasks.append(asyncio.create_task(self._scheduler()))
         self.tasks.append(asyncio.create_task(self._pruner()))
         self._resume()
+        if self.auto_engine and not shutil.which("sing-box", path=self.probe_path):
+            self.download_engine()
 
     async def stop(self) -> None:
         for rt in list(self.routers.values()):
@@ -433,9 +472,34 @@ class Hub:
         self.publish({"type": "probe", "router_id": rt.id, "state": state, "run": run_id})
 
     # --- probe on this server, through the router -------------------------------------------
+    @property
+    def probe_path(self) -> str:
+        """PATH for podkop-probe here: the downloaded sing-box first."""
+        return f"{self.key.parent / 'bin'}:{PROBE_PATH}"
+
+    def download_engine(self) -> None:
+        """Starts the download of podkop-engine's sing-box (once, kept in the data folder)."""
+        if self.engine["state"] == "downloading":
+            return
+
+        async def go():
+            try:
+                await asyncio.to_thread(fetch_engine, self.key.parent / "bin" / "sing-box")
+                self.engine = {"state": "", "error": ""}
+            except (OSError, ValueError, KeyError, tarfile.TarError) as e:
+                self.engine = {"state": "failed", "error": str(e) or type(e).__name__}
+            self.publish({"type": "engine", **self.engine})
+        self.engine = {"state": "downloading", "error": ""}
+        task = asyncio.create_task(go())
+        self.jobs.add(task)
+        task.add_done_callback(self.jobs.discard)
+
     def local_probe_missing(self) -> str:
         """What this server lacks to run podkop-probe itself ("" = nothing)."""
-        miss = [p for p in ("sh", "sing-box", "curl", "jq") if not shutil.which(p, path=PROBE_PATH)]
+        if not shutil.which("sing-box", path=self.probe_path):
+            return {"downloading": "podkop-engine is downloading…"}.get(
+                self.engine["state"], "podkop-engine is not downloaded yet")
+        miss = [p for p in ("sh", "curl", "jq") if not shutil.which(p, path=self.probe_path)]
         if miss:
             return f"{', '.join(miss)} not found (the Docker image has them)"
         if not self.forward_key.exists():
@@ -486,7 +550,7 @@ class Hub:
                         "--via", f"root@{rt.row['host']}:{rt.row['port']}", "--via-key", str(self.forward_key),
                         "--via-host-key", rt.row["host_key"], *options,
                         stdin=asyncio.subprocess.DEVNULL, stdout=out, stderr=asyncio.subprocess.STDOUT,
-                        cwd=d, env={**os.environ, "PATH": PROBE_PATH}, start_new_session=True)
+                        cwd=d, env={**os.environ, "PATH": self.probe_path}, start_new_session=True)
                     try:
                         rc = await asyncio.wait_for(proc.wait(), PROBE_SECONDS)
                     except asyncio.TimeoutError:
