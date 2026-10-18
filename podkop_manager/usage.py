@@ -116,7 +116,8 @@ def key_usage(key: dict, samples: list, traffic: list, now: float) -> dict:
     limit = (latest["total"] if provider else int(key["limit_gb"] * GB)) or 0
 
     # bytes as they came in: from the provider when it reports, else the router
-    router_inc = sorted((r["hour"] + 3600, r["bytes"]) for r in traffic)
+    # (the current hour's bytes count as of now)
+    router_inc = sorted((min(r["hour"] + 3600, now), r["bytes"]) for r in traffic)
     inc = increments(samples) if samples else router_inc
     start = last_reset(now, reset)
     if period == "month":
@@ -129,7 +130,8 @@ def key_usage(key: dict, samples: list, traffic: list, now: float) -> dict:
         return sum(v for t, v in inc if a < t <= b)
 
     if provider:
-        used = latest["used"]
+        # a reading from before the reset is yesterday's: nothing used yet until the next one
+        used = latest["used"] if not daily or latest["t"] > start else 0
         series = [(start, 0.0)] + [(s["t"], float(s["used"])) for s in samples if s["t"] > start] if daily else []
     else:
         used = summed(start, now) if period != "none" else sum(v for _, v in inc)

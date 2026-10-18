@@ -3,6 +3,79 @@
 Versions are podkop-probe's (`probe.sh`); a release also carries
 podkop-agent and podkop-manager.
 
+## 1.19.0 — 2026-10-18
+
+- Manager 0.9.0: **Routing → Configs**. Save a router's running config or
+  its draft, with each rule's probe parameters; download it as a JSON file;
+  import such a file or podkop's own `/etc/config/podkop`; load any saved
+  config into a router's draft (its probe rules get the last probe's
+  servers right away).
+- **Settings → Backup**: download the whole manager (database and SSH key)
+  as one `.tar.gz`, and restore it, e.g. on a new server.
+- **YouTube region** in a rule's probe parameters: not checked, any (video
+  plays), or the country YouTube must detect (RU: no ads), instead of the
+  fixed "sees Russia".
+- The manager's probe runs judge servers by their exit only
+  (`--no-entry-check`): relays that enter in another country, like
+  whitelist bypasses entering in Russia, are no longer dropped before the
+  test. A rule whose countries no tested server exits in says so.
+- Stability fixes in the manager:
+  - **Background work:** polling, usage, the nightly scheduler and pruning
+    no longer stop for good after an unexpected error. A garbled answer
+    from the router marks it offline instead.
+  - **Nightly probe:** if the router is unreachable at the set time, it is
+    retried within the hour.
+  - **Traffic limits:**
+    - A key is no longer avoided again right after its provider reset.
+    - A failed move to other keys is retried every 10 minutes.
+    - Keys counted on the router include the current hour.
+  - **Restore:** only one runs at a time. Apply tracking stops before it,
+    and the upload size is checked while it arrives.
+  - **Bad input:** files, rules and requests get a clear error instead of
+    a server error. The login check no longer blocks the server.
+  - **Cleanup:** old versions (beyond 500 per router) and old probe results
+    (beyond 30) are pruned. A removed router or key leaves no settings or
+    traffic behind.
+  - **UI:**
+    - Probe parameters keep focus while you type, and Exit IP keeps the
+      spaces between addresses.
+    - A rule editor you left can no longer overwrite the draft.
+    - Live updates reconnect after an error.
+    - Overview reads the config once the router is back.
+- **Discard** also puts back the rules' probe parameters (and what "Load
+  into draft" changed) as they were before the draft.
+- **Two tabs:** a draft changed in another tab, or by "Load into draft", is
+  no longer overwritten. The page reloads it instead.
+- **After a restart or restore:** the manager follows the changes and probe
+  runs the router was still busy with.
+- **Traffic per server:** with agent 0.3.0, traffic is credited to the
+  server it went through, not to the position in the rule. Moving servers
+  no longer mixes up their bytes.
+- podkop-agent 0.3.0 (**Settings → Reinstall agent** on each router to get it):
+  - **Interrupted apply:** a change cut off by a reboot or a killed process
+    is undone when the agent starts again (event "apply_interrupted").
+  - **Killed probe:** a probe killed for lack of memory shows as failed,
+    instead of "running" forever.
+  - **Failed undo:** when the old settings can't be put back, the change is
+    reported as failed instead of "the old settings are back".
+  - **Smaller fixes:**
+    - The apply lock is no longer held by podkop's own background jobs.
+    - `last-good` is written atomically.
+    - A damaged traffic state is reset.
+- podkop-probe:
+  - **Self-update:** a cut-off download is never installed (end marker and
+    `sh -n`).
+  - **Server names:** names like "Безлимит" or "Для всех устройств" are no
+    longer taken for placeholder entries. Control characters in names
+    don't break the results.
+  - **Cleanup and memory:** a closed SSH session cleans up the test
+    sing-box instances. The YouTube and speed tests respect the router's
+    free RAM.
+  - **Nightly lock:** a stale `--cron` lock no longer blocks every run.
+  - **Relays:** relays that share one entry address but differ in SNI,
+    path or user get their own speed and YouTube tests instead of copying
+    another one's.
+
 ## 1.18.0 — 2026-10-18
 
 - Manager 0.8.0: the Servers and Servers probe pages are gone. **Keys and

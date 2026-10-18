@@ -158,8 +158,8 @@ def test_old_probe_lists_become_rules_once(tmp_path: Path):
     hub._lists_to_rules(rid)
     rules = {r["section"]: r for r in db.auto_rules(rid)}
     assert (rules["main"]["top"], rules["main"]["max_ping"], rules["main"]["youtube"]) == (7, 800, "")
-    assert rules["youtube"]["youtube"] == "ru"
-    assert hub.probe_options(rid) == ["--countries", "all", "--max-ping", "800", "--min-speed", "40"]
+    assert rules["youtube"]["youtube"] == "RU"
+    assert hub.probe_options(rid) == ["--countries", "all", "--no-entry-check", "--max-ping", "800", "--min-speed", "40"]
     hub._countries_to_rules(rid)                  # the probe page's "europe" moves into the rules
     assert db.auto_rule(rid, "main")["countries"] == sorted(podkop.EUROPE)
     assert db.probe_settings(rid)["options"] == []
@@ -174,3 +174,72 @@ def test_old_probe_lists_become_rules_once(tmp_path: Path):
     fresh = db.add_router("new", "192.168.1.2", 22, "ssh-ed25519 AAAA")
     hub._lists_to_rules(fresh)                    # never used the probe: no rules
     assert db.auto_rules(fresh) == []
+
+
+def test_reading_from_before_the_reset_is_not_today():
+    # the provider resets at 00:10; at 00:12 the newest reading is still yesterday's 23:55 one
+    samples = [{"t": ts("2026-10-17T00:05"), "used": 29 * GB, "total": 30 * GB, "expire": None},
+               {"t": ts("2026-10-17T00:15"), "used": 0, "total": 30 * GB, "expire": None},
+               {"t": ts("2026-10-17T23:55"), "used": 29 * GB, "total": 30 * GB, "expire": None}]
+    u = usage.key_usage(key(), samples, [], ts("2026-10-18T00:12"))
+    assert u["daily"] and u["used"] == 0 and not usage.over_threshold(u)
+
+
+def test_router_counts_the_current_hour():
+    hour = int(ts("2026-10-18T12:00"))
+    traffic = [{"hour": hour, "key_id": 2, "rule": "main", "server": "vless://x@h:1#X", "bytes": 3 * GB}]
+    k = key(id=2, kind="link", url="vless://x@h:1#X", links=[], limit_source="manual", limit_gb=10)
+    assert usage.key_usage(k, [], traffic, ts("2026-10-18T12:20"))["used"] == 3 * GB
+
+
+
+def test_restart_follows_unfinished_changes_and_probe_runs(tmp_path: Path):
+    import asyncio
+    db = DB(tmp_path / "m.db")
+    rid = db.add_router("home", "192.168.1.1", 22, "ssh-ed25519 AAAA")
+    sent = db.add_version(rid, {"sections": []}, [], "x", "fp")
+    db.update_version(sent, job="j1", state="running")
+    lost = db.add_version(rid, {"sections": []}, [], "y", "fp")         # never got to the router
+    run = db.add_probe_run(rid, "schedule")
+    hub = Hub(db, tmp_path / "key", tmp_path)
+    followed = []
+
+    async def track_job(rt, vid, job):
+        followed.append(("job", vid, job))
+
+    async def track_probe(rt, run_id, trigger):
+        followed.append(("probe", run_id, trigger))
+
+    async def main():
+        hub._track_job, hub._track_probe = track_job, track_probe
+        hub._poll_loop = hub._watch_loop = hub._usage_loop = lambda rt: asyncio.sleep(3600)
+        await hub.start()
+        await asyncio.sleep(0)
+        await hub.stop()
+
+    asyncio.run(main())
+    assert sorted(followed) == [("job", sent, "j1"), ("probe", run, "schedule")]
+    assert db.version(lost)["state"] == "unknown"
+
+
+def test_traffic_is_credited_to_links_counted_by_the_agent(tmp_path: Path):
+    import asyncio
+    db = DB(tmp_path / "m.db")
+    rid = db.add_router("home", "192.168.1.1", 22, "ssh-ed25519 AAAA")
+    hub = Hub(db, tmp_path / "key", tmp_path)
+    readings = iter([{"since": "s", "servers": {"main-1-out": 100}, "links": {"main\tvless://a@h:1#A": 100}},
+                     {"since": "s", "servers": {"main-1-out": 100 + 50},
+                      "links": {"main\tvless://a@h:1#A": 130, "main\tvless://b@h:2#B": 20}}])
+
+    class Agent:
+        async def call(self, *a, **kw):
+            return next(readings)
+
+    # the config now has B first: the tag main-1-out is B, but the agent says where the bytes went
+    rt = type("RT", (), {"id": rid, "agent": Agent(), "config": {"config": {"sections": [
+        {"name": "main", "type": "section", "options": {"proxy_config_type": "urltest",
+                                                         "urltest_proxy_links": ["vless://b@h:2#B", "vless://a@h:1#A"]}}]}}})()
+    asyncio.run(hub.read_traffic(rt))
+    asyncio.run(hub.read_traffic(rt))
+    got = {r["server"]: r["bytes"] for r in db.traffic(rid, 0)}
+    assert got == {"vless://a@h:1#A": 30, "vless://b@h:2#B": 20}

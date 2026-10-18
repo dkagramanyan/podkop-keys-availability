@@ -133,7 +133,9 @@ def test_auto_pick_filters_limits_and_order():
     p = podkop.auto_pick(ROWS, yt)
     assert p["links"] == ["vless://g@h:1#R"] and p["youtube"]
     why = {x["name"]: x["reason"] for x in p["left_out"]}
-    assert "ads" in why["DE"] and "not checked" in why["PL Fast"] and "500" in why["PL Krakow 1"]
+    assert "not RU" in why["DE"] and "not checked" in why["PL Fast"] and "500" in why["PL Krakow 1"]
+    de = podkop.auto_pick(ROWS, dict(yt, youtube="DE"))           # any region YouTube detects
+    assert [m["name"] for m in de["matched"]] == ["DE"] and "not DE" in {x["name"]: x["reason"] for x in de["left_out"]}["DE RU"]
 
 
 def test_check_auto_rule_refuses_bad_input():

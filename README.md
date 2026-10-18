@@ -1,8 +1,9 @@
 # podkop-manager
 
 A web interface on a Linux server for [podkop](https://github.com/itdoginfo/podkop)
-on one or more OpenWrt routers: rules and settings, servers, a nightly test of
-your VPN subscriptions ("keys"), logs and a history of every change. Needs
+on one or more OpenWrt routers: rules and settings, a nightly test of your VPN
+subscriptions ("keys"), saved configs, backups, logs and a history of every
+change. Needs
 podkop and [podkop-engine](https://github.com/FiyeroT/podkop-engine) on the
 router.
 
@@ -48,6 +49,12 @@ all of it.
   protocol, exit IP, name, ping, speed, YouTube and how many to keep. Its
   servers are refreshed after every probe run; **Run probe** is in the rule.
 - Nightly probe: **Global settings** → Nightly probe.
+- **Configs**: save a router's config (podkop plus each rule's probe
+  parameters), download it, import a file (one from here or podkop's
+  `/etc/config/podkop`) and load any saved config into a router's draft.
+- **Settings → Backup**: the whole manager in one file (routers, keys, rules,
+  configs, history, SSH key), and **Restore…** on a new server. Keep the file
+  private.
 - **Keys and usage**: add subscriptions and single links here, and see each
   key's traffic against its limit (from the provider or your own). At 90% it warns, or moves the probe's rules to other keys
   until the reset.
