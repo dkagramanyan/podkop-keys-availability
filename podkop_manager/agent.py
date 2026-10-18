@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shlex
 from pathlib import Path
 from typing import AsyncIterator
@@ -139,48 +140,64 @@ class Agent:
 AGENT_FILES = ("router/podkop-agent", "router/podkop-agent.init", "router/install.sh", "router/probe.sh")
 
 
-async def install(host: str, port: int, password: str, public_key: str, src: Path,
-                  allow_clash: list[str], close_clash: bool = True, host_key: str | None = None) -> str:
-    """Log in once with the root password, copy podkop-agent and podkop-probe
-    to the router and run install.sh. Returns the router's host key, which
-    every later connection is checked against. The password is not kept.
-    With <host_key> (a reinstall), the router must still have that key before
-    the password is sent."""
-    known = asyncssh.import_known_hosts(known_hosts_line(host, port, host_key)) if host_key else None
+REPO_URL = "https://github.com/dkagramanyan/podkop-manager"
+
+
+def release_tag(src: Path) -> str:
+    """The release with this manager's router files: podkop-probe's VERSION."""
+    m = re.search(r'^VERSION="([^"]+)"', (src / "router" / "probe.sh").read_text(), re.M)
+    return f"v{m.group(1)}" if m else "latest"
+
+
+def install_command(tag: str, public_key: str, forward_key: str = "", allow_clash: list[str] = (),
+                    close_clash: bool = True) -> str:
+    """The command to run on the router (as root): installs podkop-agent and
+    podkop-probe of this release and the manager's key (and, if given, the
+    forwarding-only key), then prints the line for Add router."""
+    url = f"{REPO_URL}/releases/download/{tag}/install.sh"
+    cmd = f"wget -qO /tmp/podkop-install.sh {url} && sh /tmp/podkop-install.sh --release {tag} --key {shlex.quote(public_key)}"
+    if forward_key:
+        cmd += f" --forward-key {shlex.quote(forward_key)}"
+    if not close_clash:
+        cmd += " --keep-clash-open"
+    for ip in allow_clash:
+        cmd += f" --allow-clash {shlex.quote(ip)}"
+    return cmd
+
+
+HOST_KEY_RE = re.compile(r"(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp\d+) [A-Za-z0-9+/]+=*")
+
+
+def parse_pairing(text: str) -> dict:
+    """"podkop-router <address> <port> <host key type> <host key>", printed by
+    install.sh -> {host, port, host_key}. Raises ValueError."""
+    f = text.split()
+    if len(f) != 5 or f[0] != "podkop-router" or not f[2].isdigit() or not HOST_KEY_RE.fullmatch(f"{f[3]} {f[4]}"):
+        raise ValueError("paste the whole line the command printed: podkop-router <address> <port> <key>")
+    return {"host": f[1], "port": int(f[2]), "host_key": f"{f[3]} {f[4]}"}
+
+
+async def pair(host: str, port: int, host_key: str, key: Path) -> dict:
+    """The router has this host key and lets the manager's key run
+    podkop-agent: returns its version answer."""
+    async def go():
+        async with asyncssh.connect(
+                host, port=port, username="root", client_keys=[str(key)], agent_path=None, password=None,
+                known_hosts=asyncssh.import_known_hosts(known_hosts_line(host, port, host_key)),
+                preferred_auth="publickey") as conn:
+            r = await conn.run("podkop-agent version", check=False)
+            return r.stdout or ""
     try:
-        conn = await asyncio.wait_for(asyncssh.connect(
-            host, port=port, username="root", password=password, known_hosts=known,
-            client_keys=None, agent_path=None, preferred_auth="password,keyboard-interactive"), timeout=20)
+        out = await asyncio.wait_for(go(), 20)
     except asyncssh.PermissionDenied:
-        raise AgentError("auth", "wrong root password") from None
+        raise AgentError("auth", "the router does not accept this manager's key: run the command on it first") from None
     except asyncssh.HostKeyNotVerifiable:
-        raise AgentError("host_key", f"{host} has another SSH host key than when it was added; "
-                         "if the router was reset, remove it and add it again") from None
+        raise AgentError("host_key", f"{host} has another SSH host key than the pasted line: is it the right address?") from None
     except (OSError, asyncssh.Error, asyncio.TimeoutError) as e:
         raise AgentError("unreachable", f"cannot connect to {host}: {e or type(e).__name__}") from None
-
-    async def run(cmd: str, timeout: float = 30, **kw):
-        try:
-            return await asyncio.wait_for(conn.run(cmd, **kw), timeout=timeout)
-        except asyncio.TimeoutError:
-            raise AgentError("install", f"{cmd.split()[0]} took longer than {timeout:.0f} s on the router") from None
-        except (OSError, asyncssh.Error) as e:
-            raise AgentError("install", f"on the router: {e}") from None
-
-    async with conn:
-        key = conn.get_server_host_key().export_public_key().decode().strip()
-        tmp = "/tmp/podkop-agent-src"
-        await run(f"rm -rf {tmp} && mkdir -p {tmp}", check=True)
-        for f in AGENT_FILES:
-            data = (src / f).read_bytes()
-            await run(f"cat > {tmp}/{Path(f).name}", input=data, encoding=None, check=True)
-        cmd = f"sh {tmp}/install.sh --src {tmp} --key {shlex.quote(public_key)}"
-        for ip in allow_clash:
-            cmd += f" --allow-clash {shlex.quote(ip)}"
-        if not close_clash:
-            cmd += " --keep-clash-open"
-        r = await run(cmd, timeout=300, check=False)        # may install jq first
-        await run(f"rm -rf {tmp}", check=False)
-        if r.exit_status != 0:
-            raise AgentError("install", ((r.stderr or "") + (r.stdout or "")).strip()[-500:] or "install.sh failed")
-    return " ".join(key.split()[:2])
+    try:
+        msg = json.loads(out.strip().splitlines()[-1])
+        assert msg["ok"]
+        return msg["data"]
+    except (ValueError, IndexError, KeyError, TypeError, AssertionError):
+        raise AgentError("no_agent", "podkop-agent does not answer on the router: run the command on it again") from None

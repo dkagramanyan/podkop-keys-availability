@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
 from . import __version__, backup, configs, podkop
-from .agent import AgentError, forward_line, install
+from .agent import AgentError, forward_line, install_command, pair, parse_pairing, release_tag
 from .db import DB
 from .hub import Hub
 
@@ -40,11 +40,8 @@ def check_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(hash_password(password, salt), stored)
 
 
-def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password: str = "",
-               username: str = "admin") -> FastAPI:
-    """username and password: the web login; router_password: routers' root
-    password, used when the form leaves it empty. All come from the
-    environment, not stored."""
+def create_app(db: DB, hub: Hub, public_key: str, password: str, username: str = "admin") -> FastAPI:
+    """username and password: the web login, from the environment, not stored."""
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI):
         await hub.start()
@@ -127,7 +124,7 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
     @app.get("/api/manager", dependencies=[api])
     async def manager_info():
         missing = hub.local_probe_missing()
-        return {"version": __version__, "public_key": keys["public"], "router_password": bool(router_password),
+        return {"version": __version__, "public_key": keys["public"],
                 "local_probe": {"ready": not missing, "missing": missing,
                                 "forward_line": "" if missing else forward_line(hub.forward_public())}}
 
@@ -139,37 +136,42 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
     async def routers():
         return [rt.snapshot() for rt in hub.routers.values()]
 
+    @app.post("/api/install-command", dependencies=[api])
+    async def router_command(body: dict):
+        """The command that installs podkop-agent and this manager's key on a
+        router; it prints the line Add router takes."""
+        allow = [x.strip() for x in str(body.get("allow_clash", "")).replace(",", " ").split() if x.strip()]
+        if not all(re.fullmatch(r"[0-9A-Fa-f.:/]+", x) for x in allow):
+            raise HTTPException(400, "computers for the Clash API: IP addresses or subnets")
+        fwd = hub.forward_public() if body.get("forward") and hub.forward_key.exists() else ""
+        return {"command": install_command(release_tag(hub.src), keys["public"], fwd, allow,
+                                           body.get("close_clash", True) is not False)}
+
     @app.post("/api/routers", dependencies=[api])
     async def add_router(body: dict):
-        host = str(body.get("host", "")).strip()
-        if not host:
-            raise HTTPException(400, "host is required")
+        """A router the install command ran on: the line it printed, and the
+        address the manager reaches it at if that differs."""
         try:
-            port = int(body.get("port") or 22)
+            p = parse_pairing(str(body.get("pairing", "")))
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+        host = str(body.get("host") or "").strip() or p["host"]
+        try:
+            port = int(body.get("port") or p["port"])
         except (TypeError, ValueError):
             port = 0
         if not 0 < port < 65536:
             raise HTTPException(400, "port must be a number from 1 to 65535")
-        allow = [x.strip() for x in str(body.get("allow_clash", "")).replace(",", " ").split() if x.strip()]
-        host_key = await install(host, port, str(body.get("password") or router_password), keys["public"], hub.src, allow,
-                                 body.get("close_clash", True) is not False)
-        rid = db.add_router(str(body.get("name") or host), host, port, host_key)
+        if any(r["host"] == host and r["port"] == port for r in db.routers()):
+            raise HTTPException(400, f"{host} is already added")
+        await pair(host, port, p["host_key"], hub.key)
+        rid = db.add_router(str(body.get("name") or "").strip() or host, host, port, p["host_key"])
         hub.add_router(db.router(rid))
         # podkop as it is: kept in Configs, and the probe it runs by itself taken into Keys and rules
         task = asyncio.create_task(hub.import_found(rid))
         hub.jobs.add(task)
         task.add_done_callback(hub.jobs.discard)
         return {"id": rid}
-
-    @app.post("/api/routers/{rid}/reinstall", dependencies=[api])
-    async def reinstall(rid: int, body: dict):
-        rt = router_or_404(rid)
-        allow = [x.strip() for x in str(body.get("allow_clash", "")).replace(",", " ").split() if x.strip()]
-        # the router must still have its host key before the password goes out
-        await install(rt.row["host"], rt.row["port"], str(body.get("password") or router_password), keys["public"],
-                      hub.src, allow, body.get("close_clash", True) is not False, host_key=rt.row["host_key"])
-        await hub.refresh(rt)
-        return {"ok": True}
 
     @app.patch("/api/routers/{rid}", dependencies=[api])
     async def rename_router(rid: int, body: dict):

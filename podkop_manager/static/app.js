@@ -2284,7 +2284,7 @@ async function viewGlobal(main, id) {
                 ? "The servers still see the router's address. Servers that use UDP (hysteria2, TUIC) are not tested."
                 : lp.ready ? "On this server the test is faster and leaves the router's processor free" : `Not possible here: ${lp.missing}`))),
           probe.test_from === "manager" ? h("div", { class: "col", style: "gap: 8px" },
-            h("span", { class: "small" }, "Add this line to the router's /etc/dropbear/authorized_keys. It lets this server open connections through the router and nothing else: no shell, no commands."),
+            h("span", { class: "small" }, "The router must accept this server's forwarding key: Settings → Reinstall agent with \"Let this manager test servers through the router\" adds it, or add this line to the router's /etc/dropbear/authorized_keys. It lets this server open connections through the router and nothing else: no shell, no commands."),
             h("div", { class: "row", style: "align-items: flex-start; flex-wrap: nowrap; padding: 10px 12px; border-radius: 6px; background: var(--chip)" },
               h("code", { class: "grow", style: "font-size: 12px; line-height: 1.5; color: var(--text-2); word-break: break-all" }, lp.forward_line || lp.missing),
               lp.forward_line ? h("button", { type: "button", class: "btn xs", onclick: async () => {
@@ -2580,7 +2580,38 @@ const splitIps = (v) => v.split(/[\s,]+/).filter(Boolean).join(" ");
 
 async function viewSettings(main) {
   const info = S.manager || (S.manager = await api("GET", "/api/manager"));
-  const pwHelp = (text) => info.router_password ? "Empty: the one from .env. Used once, not stored" : text;
+  // the command that installs podkop-agent and this manager's key on a router, from the options
+  const commandPart = (prefix) => {
+    const close = h("input", { type: "checkbox", checked: true });
+    const allow = h("input", { class: "input mono", id: `${prefix}-clash`, placeholder: "e.g. 192.168.1.10, optional" });
+    const forward = h("input", { type: "checkbox" });
+    const code = h("code", { class: "grow", style: "font-size: 12px; line-height: 1.5; color: var(--text-2); word-break: break-all" }, "…");
+    let cmd = "", timer = null;
+    const update = async () => {
+      try {
+        cmd = (await api("POST", "/api/install-command", { close_clash: close.checked, allow_clash: splitIps(allow.value), forward: forward.checked })).command;
+        put(code, cmd);
+      } catch (e) { cmd = ""; put(code, e.message); }
+    };
+    close.onchange = forward.onchange = update;
+    allow.oninput = () => { clearTimeout(timer); timer = setTimeout(update, 400); };
+    update();
+    return [
+      h("label", { class: "check" }, close, h("span", { class: "col" }, h("span", {}, "Close podkop's Clash API (port 9090) to the LAN"),
+        h("span", {}, "Anyone on the LAN can switch its servers otherwise. Off: the firewall is not changed."))),
+      h("div", { class: "field", style: "max-width: 560px" }, h("label", { for: `${prefix}-clash` }, "Computers that may still reach the Clash API"), allow,
+        h("span", { class: "help" }, "Only when it is closed")),
+      info.local_probe && info.local_probe.ready ? h("label", { class: "check" }, forward, h("span", { class: "col" },
+        h("span", {}, "Let this manager test servers through the router"),
+        h("span", {}, "Adds a second key that may only open connections through the router: no shell, no commands"))) : null,
+      h("span", { style: "font-size: 13px; font-weight: 500" }, "Run this on the router as root, over SSH"),
+      h("div", { class: "row", style: "align-items: flex-start; flex-wrap: nowrap; padding: 10px 12px; border-radius: 6px; background: var(--chip)" },
+        code, h("button", { type: "button", class: "btn xs", onclick: async () => {
+          if (!cmd) return;
+          try { await navigator.clipboard.writeText(cmd); toast("Command copied"); } catch { toast("Select the command and copy it", true); }
+        } }, "Copy")),
+    ];
+  };
   const page = h("div", { class: "page" });
   put(main, page);
 
@@ -2598,24 +2629,13 @@ async function viewSettings(main) {
   };
 
   const reinstall = (rt) => {
-    const pw = h("input", { class: "input", id: "ri-pw", type: "password", autocomplete: "off" });
-    const allow = h("input", { class: "input mono", id: "ri-allow", placeholder: "e.g. 192.168.1.10, optional" });
-    const close = h("input", { type: "checkbox", checked: true });
-    const out = h("div");
-    const go = h("button", { type: "button", class: "btn primary" }, "Reinstall");
-    go.onclick = async () => {
-      go.disabled = true; put(out, h("p", { class: "small muted" }, "Installing, up to a minute…"));
-      try {
-        await api("POST", `/api/routers/${rt.id}/reinstall`, { password: pw.value, allow_clash: splitIps(allow.value), close_clash: close.checked });
-        pw.value = ""; m.close(); toast(`podkop-agent reinstalled on ${rt.name}`);
-      } catch (e) { put(out, h("p", { class: "problem-box" }, e.message)); go.disabled = false; }
-    };
     const m = modal({ title: `Reinstall podkop-agent on ${rt.name}`, narrow: true,
       sub: "Puts this manager's podkop-agent, podkop-probe and key on the router again. podkop's settings stay as they are.",
-      body: [h("div", { class: "field" }, h("label", { for: "ri-pw" }, "Root password"), pw, h("span", { class: "help" }, pwHelp("Used once, not stored"))),
-        h("label", { class: "check" }, close, h("span", {}, "Close podkop's Clash API (port 9090) to the LAN")),
-        h("div", { class: "field" }, h("label", { for: "ri-allow" }, "Computers that may still reach the Clash API"), allow), out],
-      foot: [h("span"), h("div", { class: "row" }, h("button", { type: "button", class: "btn", onclick: () => m.close() }, "Cancel"), go)] });
+      body: [commandPart("ri")],
+      foot: [h("span"), h("div", { class: "row" }, h("button", { type: "button", class: "btn", onclick: () => m.close() }, "Cancel"),
+        h("button", { type: "button", class: "btn primary", onclick: busyClick(async () => {
+          try { await api("POST", `/api/routers/${rt.id}/refresh`); m.close(); toast(`${rt.name} checked`); } catch (e) { toast(e.message, true); }
+        }) }, "Done, check the router"))] });
   };
 
   const remove = (rt) => {
@@ -2639,37 +2659,35 @@ async function viewSettings(main) {
 
   const f = {
     name: h("input", { class: "input", id: "a-name", placeholder: "e.g. country-house" }),
-    host: h("input", { class: "input mono", id: "a-host", placeholder: "192.168.1.1" }),
-    port: h("input", { class: "input", id: "a-port", value: "22", inputmode: "numeric" }),
-    pass: h("input", { class: "input", id: "a-pass", type: "password", autocomplete: "off" }),
-    allow: h("input", { class: "input mono", id: "a-clash", placeholder: "e.g. 192.168.1.10, optional" }),
-    close: h("input", { type: "checkbox", checked: true }),
+    pairing: h("input", { class: "input mono", id: "a-pair", placeholder: "podkop-router 192.168.1.1 22 ssh-ed25519 AAAA…", autocomplete: "off",
+      oninput: () => {
+        const p = f.pairing.value.trim().split(/\s+/);
+        if (p[0] === "podkop-router" && p.length === 5) { f.host.placeholder = p[1]; f.port.placeholder = p[2]; }
+      } }),
+    host: h("input", { class: "input mono", id: "a-host", placeholder: "from the line" }),
+    port: h("input", { class: "input", id: "a-port", placeholder: "from the line", inputmode: "numeric" }),
   };
   const addOut = h("div");
-  const addBtn = h("button", { type: "submit", class: "btn primary lg" }, "Install and add");
+  const addBtn = h("button", { type: "submit", class: "btn primary lg" }, "Add");
   const addForm = h("form", { class: "card pad", "aria-labelledby": "s-add", onsubmit: async (e) => {
     e.preventDefault();
-    if (!f.host.value.trim()) { f.host.focus(); return; }
-    addBtn.disabled = true; put(addOut, h("p", { class: "small muted" }, "Installing podkop-agent, up to a minute…"));
+    if (!f.pairing.value.trim()) { f.pairing.focus(); return; }
+    addBtn.disabled = true; put(addOut, h("p", { class: "small muted" }, "Checking the router…"));
     try {
-      const r = await api("POST", "/api/routers", { name: f.name.value.trim(), host: f.host.value.trim(), port: +f.port.value || 22,
-        password: f.pass.value, allow_clash: splitIps(f.allow.value), close_clash: f.close.checked });
-      f.pass.value = "";
+      const r = await api("POST", "/api/routers", { name: f.name.value.trim(), pairing: f.pairing.value.trim(),
+        host: f.host.value.trim(), port: +f.port.value || null });
       await loadRouters();
       location.hash = `#/r/${r.id}`;
     } catch (err) { put(addOut, h("p", { class: "problem-box" }, err.message)); addBtn.disabled = false; }
   } },
   h("div", { class: "col" }, h("h2", { id: "s-add" }, "Add router"),
     h("span", { class: "small muted" }, "podkop stays as it is: its settings are kept in Configs. The probe needs podkop-engine.")),
+  commandPart("a"),
+  h("div", { class: "field" }, h("label", { for: "a-pair" }, "The line the command printed at the end"), f.pairing),
   h("div", { class: "auto-grid", style: "grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr))" },
     h("div", { class: "field" }, h("label", { for: "a-name" }, "Name"), f.name),
-    h("div", { class: "field" }, h("label", { for: "a-host" }, "Address"), f.host),
-    h("div", { class: "field" }, h("label", { for: "a-port" }, "SSH port"), f.port),
-    h("div", { class: "field" }, h("label", { for: "a-pass" }, "Root password"), f.pass, h("span", { class: "help" }, pwHelp("Used once to install, not stored")))),
-  h("label", { class: "check" }, f.close, h("span", { class: "col" }, h("span", {}, "Close podkop's Clash API (port 9090) to the LAN"),
-    h("span", {}, "Anyone on the LAN can switch its servers otherwise. Off: the firewall is not changed."))),
-  h("div", { class: "field", style: "max-width: 560px" }, h("label", { for: "a-clash" }, "Computers that may still reach the Clash API"), f.allow,
-    h("span", { class: "help" }, "Only when it is closed")),
+    h("div", { class: "field" }, h("label", { for: "a-host" }, "Address"), f.host, h("span", { class: "help" }, "If this server reaches the router at another address")),
+    h("div", { class: "field" }, h("label", { for: "a-port" }, "SSH port"), f.port)),
   addOut, h("div", {}, addBtn));
 
   const restore = () => {

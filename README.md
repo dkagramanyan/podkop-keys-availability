@@ -23,22 +23,27 @@ Needs Docker with the compose plugin.
 ```sh
 git clone https://github.com/dkagramanyan/podkop-manager
 cd podkop-manager
-cp .env.example .env && chmod 600 .env   # set your login and passwords in it
+cp .env.example .env && chmod 600 .env   # set your login and password in it
 docker compose up -d --build
 ```
 
 Open `http://<server>:8080`. Everything you set lives in `.env`: the port,
-the web login and password, and optionally the routers' root password. After changing
+the web login and password. After changing
 it: `docker compose up -d`. Update: `git pull && docker compose up -d --build`.
-Data (database, SSH key) is in the `podkop-manager_data` volume. Logs:
+Data (database, SSH keys) is in the `podkop-manager_data` volume. Logs:
 `docker compose logs -f`.
 
 ## Add a router
 
-**Add router** → address, root password (used once, not stored). It installs
-podkop-agent with a watchdog, podkop-probe and the manager's key (allowed to
-run only podkop-agent), and optionally closes podkop's Clash API (port 9090)
-to the LAN, except the computers you list. podkop itself is not changed: its
+**Settings → Add router** shows a command: run it on the router as root
+over SSH. It installs podkop-agent with a watchdog,
+podkop-probe and the manager's key (allowed to run only podkop-agent), and
+optionally closes podkop's Clash API (port 9090) to the LAN, except the
+computers you list, and adds the manager's forwarding-only key (to test
+servers on the manager's server). At the end it prints a line
+`podkop-router <address> <port> <host key>`: paste it into Add router, which
+checks that the manager reaches that router with its key. No password is
+needed; **Reinstall agent** shows the command again. podkop itself is not changed: its
 settings are saved in **Configs**, and the keys and lists of a podkop-probe
 that already runs there are taken into **Keys and usage** and the rules.
 **Settings → Remove** undoes all of it.
@@ -117,8 +122,9 @@ before: nothing is written to the router's flash and podkop isn't restarted. Log
 ## Коротко по-русски
 
 Веб-интерфейс для podkop на сервере: `git clone`, `cp .env.example .env`,
-впишите порт и пароли в `.env`, `docker compose up -d --build`, откройте
-`http://<сервер>:<порт>` и добавьте роутер. Без сервера: выполните
+впишите порт и пароль в `.env`, `docker compose up -d --build`, откройте
+`http://<сервер>:<порт>` и добавьте роутер: выполните на роутере команду
+из **Add router** и вставьте строку, которую она напечатает. Без сервера: выполните
 команду из **podkop-probe without the manager** на роутере, вставьте ключи,
 Enter — лучшие серверы попадут в podkop (`main`, `youtube` и по 5 резервных).
 Каждую ночь: **Система → Планировщик**, строка `30 4 * * * podkop-probe --cron`.

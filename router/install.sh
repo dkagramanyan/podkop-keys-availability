@@ -1,29 +1,41 @@
 #!/bin/sh
 # shellcheck shell=dash disable=SC2015
 #
-# Installs podkop-agent on the router (run as root on the router):
+# Installs podkop-agent on the router (run as root on the router; podkop-manager
+# → Add router shows the whole command):
 #
-#   sh install.sh --key 'ssh-ed25519 AAAA... podkop-manager' [--allow-clash IP ...] [--keep-clash-open] [--src DIR]
+#   sh install.sh --key 'ssh-ed25519 AAAA... podkop-manager' [--forward-key 'ssh-ed25519 AAAA...']
+#                 [--allow-clash IP ...] [--keep-clash-open] [--release TAG | --src DIR]
 #   sh install.sh --uninstall
 #
+# At the end it prints a line to paste into podkop-manager: the router's
+# address, SSH port and SSH host key, so the manager knows it is this router.
+#
 # --key          the manager's public key; it may run only podkop-agent
+# --forward-key  the manager's second key; it may only open connections
+#                through the router (for testing servers on the manager's
+#                server), nothing else. Without it such a key is removed.
 # --allow-clash  computers that may still open podkop's Clash API (port 9090,
 #                e.g. for the dashboard in LuCI); the rest of the LAN is blocked
 # --keep-clash-open  leave the firewall as it is (the Clash API stays open to the LAN)
-# --src DIR      take podkop-agent, podkop-agent.init and probe.sh from DIR
-#                instead of the latest release
+# --release TAG  take podkop-agent, podkop-agent.init and probe.sh from this
+#                release (the manager's own version) instead of the latest
+# --src DIR      take them from DIR
 
 REPO_URL="https://github.com/dkagramanyan/podkop-manager"
 RELEASE="$REPO_URL/releases/latest/download"
 KEYS=/etc/dropbear/authorized_keys
 MARK=podkop-agent
+FWD_MARK=podkop-agent-forward
 KEEP="/usr/bin/podkop-agent /etc/init.d/podkop-agent /etc/podkop-agent/ /usr/bin/podkop-probe /usr/share/podkop-agent/"
 
 set -u
-KEY=""; ALLOW=""; SRC=""; UNINSTALL=0; BLOCK=on
+KEY=""; FWD_KEY=""; ALLOW=""; SRC=""; UNINSTALL=0; BLOCK=on
 while [ $# -gt 0 ]; do
   case "$1" in
     --key) KEY=${2:-}; shift 2 ;;
+    --forward-key) FWD_KEY=${2:-}; shift 2 ;;
+    --release) RELEASE="$REPO_URL/releases/download/${2:-}"; shift 2 ;;
     --allow-clash) ALLOW="$ALLOW ${2:-}"; shift 2 ;;
     --keep-clash-open) BLOCK=off; shift ;;
     --src) SRC=${2:-}; shift 2 ;;
@@ -65,7 +77,7 @@ firewall_rules() {
 if [ "$UNINSTALL" = 1 ]; then
   /etc/init.d/podkop-agent stop 2>/dev/null; /etc/init.d/podkop-agent disable 2>/dev/null
   rm -rf /usr/bin/podkop-agent /etc/init.d/podkop-agent /etc/podkop-agent /tmp/podkop-agent /usr/share/podkop-agent
-  [ -f "$KEYS" ] && sed -i "/ $MARK\$/d" "$KEYS"
+  [ -f "$KEYS" ] && sed -i "/ $MARK\$/d; / $FWD_MARK\$/d" "$KEYS"
   firewall_rules "" off
   for _f in $KEEP; do
     [ "$_f" = /usr/bin/podkop-probe ] && continue      # podkop-probe stays
@@ -77,6 +89,7 @@ fi
 
 [ -n "$KEY" ] || die "--key 'ssh-ed25519 AAAA...' is required"
 case "$KEY" in ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-*) ;; *) die "--key must be an SSH public key" ;; esac
+case "$FWD_KEY" in ""|ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-*) ;; *) die "--forward-key must be an SSH public key" ;; esac
 [ -x /usr/bin/podkop ] && [ -f /usr/lib/podkop/sing_box_config_facade.sh ] || die "podkop is not installed"
 # without podkop-engine the agent works (reading, applying, the watchdog), podkop-probe does not
 sing-box version 2>/dev/null | grep -q 'tools.decode-link' ||
@@ -111,6 +124,16 @@ set -f
 set -- $KEY
 set +f
 printf 'restrict,command="/usr/bin/podkop-agent" %s %s %s\n' "$1" "$2" "$MARK" >> "$KEYS"
+# the second key, only if asked for: connections through the router, no
+# shell or command (it ends at once), no terminal, no agent or X11 forwarding
+sed -i "/ $FWD_MARK\$/d" "$KEYS"
+if [ -n "$FWD_KEY" ]; then
+  set -f
+  # shellcheck disable=SC2086
+  set -- $FWD_KEY
+  set +f
+  printf 'command="/bin/false",no-agent-forwarding,no-X11-forwarding,no-pty %s %s %s\n' "$1" "$2" "$FWD_MARK" >> "$KEYS"
+fi
 
 if [ "$BLOCK" = on ]; then firewall_rules "$ALLOW" on
 # nothing to change: only remove rules an earlier install of ours added
@@ -122,3 +145,18 @@ for _f in $KEEP; do grep -qxF "$_f" /etc/sysupgrade.conf 2>/dev/null || echo "$_
 
 /etc/init.d/podkop-agent enable && /etc/init.d/podkop-agent restart 2>/dev/null || die "could not start podkop-agent"
 echo "podkop-agent $(sed -n 's/^AGENT_VERSION="\(.*\)"/\1/p' /usr/bin/podkop-agent) installed"
+
+# the line for podkop-manager: LAN address, SSH port and host key (ed25519
+# when the router has one)
+_hk=""
+for _t in ed25519 ecdsa rsa; do
+  [ -f "/etc/dropbear/dropbear_${_t}_host_key" ] || continue
+  _hk=$(dropbearkey -y -f "/etc/dropbear/dropbear_${_t}_host_key" 2>/dev/null | grep -E '^(ssh|ecdsa)-' | cut -d ' ' -f 1-2)
+  [ -n "$_hk" ] && break
+done
+_ip=$(uci -q get network.lan.ipaddr | cut -d / -f 1)
+_port=$(uci -q get 'dropbear.@dropbear[0].Port')
+echo
+echo "Paste this line into podkop-manager (Add router):"
+echo
+echo "podkop-router ${_ip:-192.168.1.1} ${_port:-22} ${_hk:-unknown-host-key}"
