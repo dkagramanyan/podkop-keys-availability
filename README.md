@@ -3,9 +3,8 @@
 A web interface on a Linux server for [podkop](https://github.com/itdoginfo/podkop)
 on one or more OpenWrt routers: rules and settings, a nightly test of your VPN
 subscriptions ("keys"), saved configs, backups, logs and a history of every
-change. Needs
-podkop and [podkop-engine](https://github.com/FiyeroT/podkop-engine) on the
-router.
+change. The probe needs
+[podkop-engine](https://github.com/FiyeroT/podkop-engine) on the router.
 
 ```
 server: podkop-manager ── SSH, a key that may run only podkop-agent ──▶ router: podkop-agent
@@ -37,10 +36,12 @@ Data (database, SSH key) is in the `podkop-manager_data` volume. Logs:
 ## Add a router
 
 **Add router** → address, root password (used once, not stored). It installs
-podkop-agent with a watchdog, podkop-probe, the manager's key (allowed to run
-only podkop-agent) and firewall rules that close podkop's Clash API (port
-9090) to the LAN, except the computers you list. **Settings → Remove** undoes
-all of it.
+podkop-agent with a watchdog, podkop-probe and the manager's key (allowed to
+run only podkop-agent), and optionally closes podkop's Clash API (port 9090)
+to the LAN, except the computers you list. podkop itself is not changed: its
+settings are saved in **Configs**, and the keys and lists of a podkop-probe
+that already runs there are taken into **Keys and usage** and the rules.
+**Settings → Remove** undoes all of it.
 
 ## Good to know
 

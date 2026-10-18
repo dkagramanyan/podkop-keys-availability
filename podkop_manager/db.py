@@ -85,6 +85,7 @@ COLUMNS = [
     ("auto_rules", "max_ping", "INTEGER NOT NULL DEFAULT 700"),
     ("auto_rules", "min_speed", "REAL NOT NULL DEFAULT 40"),
     ("auto_rules", "youtube", "TEXT NOT NULL DEFAULT ''"),
+    ("probe_settings", "fix_fingerprint", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -156,7 +157,7 @@ class DB:
             self.x(f"DELETE FROM {table} WHERE router_id = ?", rid)
         self.x("DELETE FROM probe_settings WHERE router_id = ?", rid)
         # the hub's per-router settings, so a router that gets this id later starts clean
-        for name in ("traffic", "avoid", "moved", "lists_to_rules", "countries_to_rules", "rules_base"):
+        for name in ("traffic", "avoid", "moved", "lists_to_rules", "countries_to_rules", "rules_base", "imported"):
             self.x("DELETE FROM settings WHERE key = ?", f"{name}:{rid}")
         self.x("DELETE FROM routers WHERE id = ?", rid)
 
@@ -245,7 +246,7 @@ class DB:
         self.x("INSERT OR IGNORE INTO probe_settings (router_id) VALUES (?)", rid)
         for k, v in fields.items():
             assert k in {"keys", "options", "schedule", "auto_apply", "main_section", "youtube_section",
-                         "last_run_day"}
+                         "last_run_day", "fix_fingerprint"}
             self.x(f"UPDATE probe_settings SET {k} = ? WHERE router_id = ?",
                    json.dumps(v) if k in ("keys", "options") else v, rid)
 

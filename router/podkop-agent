@@ -12,13 +12,14 @@
 # $SSH_ORIGINAL_COMMAND, requests come as JSON on stdin, answers go as JSON to
 # stdout: {"v":1,"ok":true,"data":...} or {"v":1,"ok":false,"error":{...}}.
 
-AGENT_VERSION="0.3.0"
+AGENT_VERSION="0.3.1"
 PROTO=1
 ETC=/etc/podkop-agent
 RUN=/tmp/podkop-agent
 CFG=/etc/config/podkop
 PODKOP_LIB=/usr/lib/podkop
 PROBE=/usr/bin/podkop-probe
+PROBE_CONF=/etc/podkop-probe.conf     # podkop-probe's own saved keys and settings
 EVENTS=$RUN/events.ndjson
 TAB=$(printf '\t')
 BOOT=$(cut -c 1-8 /proc/sys/kernel/random/boot_id 2>/dev/null || echo 00000000)
@@ -591,12 +592,14 @@ cmd_status() {
     --arg probe "$_probe" --argjson pins "${_pins:-[]}" \
     --arg fs "$(tail -n 1 /etc/sing-box/failsafe.last 2>/dev/null)" --arg fst "$(head -n 1 /etc/sing-box/failsafe.last 2>/dev/null)" \
     --arg pb "$([ -x "$PROBE" ] && sed -n 's/^VERSION="\(.*\)"/\1/p' "$PROBE")" \
+    --arg pcron "$(probe_cron)" --arg eng "$(sing-box version 2>/dev/null | grep -q 'tools.decode-link' && echo 1)" \
     '{agent: {version: $av, protocol: $pv}, boot: $boot, uptime: ($up | tonumber? // 0),
       router: {model: $model, openwrt: $os},
       podkop: {version: $pk, enabled: ($en == "1"), paused: ($pa == "1"), start: $st,
                running: ($pid != ""), busy: ($busy == "1")},
       singbox: {version: $sb, features: ($feat | split(",") | map(select(. != "")))},
-      fingerprint: $fp, last_good: $lg, pins: $pins, probe: {state: $probe, version: $pb},
+      fingerprint: $fp, last_good: $lg, pins: $pins, probe: {state: $probe, version: $pb, cron: $pcron},
+      engine: ($eng == "1"),
       failsafe: (if $fs == "" then null else {time: $fst, message: $fs} end)}')"
 }
 
@@ -737,7 +740,7 @@ cmd_service() {
 # --- podkop-probe -----------------------------------------------------------------
 
 # options passed through to podkop-probe, with the number of values each takes
-PROBE_OPTS="-q:0 -F:0 -v:0 --no-speed:0 --no-youtube:0 --no-entry-check:0 -n:1 -c:1 -j:1 -t:1
+PROBE_OPTS="-q:0 -F:0 -v:0 --no-speed:0 --no-youtube:0 --no-entry-check:0 --fix-fingerprint:0 -n:1 -c:1 -j:1 -t:1
 --countries:1 --top:1 --max-ping:1 --min-speed:1 --speed-jobs:1 --youtube-noads:1"
 
 # probe_check: a "running" probe whose runner is gone (killed, e.g. out of
@@ -829,6 +832,36 @@ CSV_JQ='split("\n") | .[1:] | map(select(. != "") | split(",") as $f
      mbit: $f[7], exit_ip: $f[8], country: $f[9], youtube: $f[10], youtube_ms: $f[11],
      node: ($f[12:] | join(",") | ltrimstr("\"") | rtrimstr("\"") | split("\"\"") | join("\""))})'
 
+# probe-config: what podkop-probe set up on the router by itself (its keys and
+# settings for the nightly run, and its cron line), for the manager to take over
+probe_cron() { grep -s 'podkop-probe --cron' /etc/crontabs/root | grep -v '^[[:space:]]*#' | head -n 1; }
+cmd_probe_config() {
+  [ -f "$PROBE_CONF" ] || reply "$(jq -nc --arg c "$(probe_cron)" '{saved: false, cron: $c}')"
+  # its own file, written by podkop-probe as shell assignments
+  # shellcheck disable=SC1090
+  reply "$( (SUBS=""; COUNTRIES=""; TOP=""; SECTION=""; YOUTUBE=""; YT_NOADS=""; YT_SECTION=""; APPLY_TO=""; MAX_PING=""; MIN_SPEED=""
+    . "$PROBE_CONF" >/dev/null 2>&1
+    jq -nc --arg subs "$SUBS" --arg c "$COUNTRIES" --arg top "$TOP" --arg sec "$SECTION" --arg yt "$YOUTUBE" \
+      --arg noads "$YT_NOADS" --arg ysec "$YT_SECTION" --arg to "$APPLY_TO" --arg mp "$MAX_PING" --arg ms "$MIN_SPEED" \
+      --arg cron "$(probe_cron)" \
+      '{saved: true, keys: ($subs | split("\n") | map(select(. != ""))), countries: $c, top: ($top | tonumber? // 10),
+        section: (if $sec == "" then "main" else $sec end), youtube: ($yt != "0"),
+        youtube_noads: (if $noads == "" then "RU" else $noads end),
+        youtube_section: (if $ysec == "" then "youtube" else $ysec end),
+        apply_to: (if $to == "" then "both" else $to end),
+        max_ping: ($mp | tonumber? // 700), min_speed: ($ms | tonumber? // 40), cron: $cron}') )"
+}
+
+# probe-cron off: the manager runs the nightly probe from now on
+cmd_probe_cron() {
+  [ "${1:-}" = off ] || fail bad_request "usage: probe-cron off"
+  if [ -n "$(probe_cron)" ]; then
+    sed -i '/podkop-probe --cron/d' /etc/crontabs/root && /etc/init.d/cron restart >/dev/null 2>&1
+    event probe_cron_off '{}'
+  fi
+  reply '{"cron": ""}'
+}
+
 cmd_probe_status() {
   exec 7> "$RUN/probe.lock"; flock 7; probe_check; exec 7>&-
   _log=$(tail -n 400 "$RUN/probe/log" 2>/dev/null | jq -Rsc 'split("\n") | map(select(. != ""))')
@@ -882,6 +915,8 @@ case "$_cmd" in
   service)       cmd_service "$@" ;;
   probe-start)   cmd_probe_start ;;
   probe-status)  cmd_probe_status ;;
+  probe-config)  cmd_probe_config ;;
+  probe-cron)    cmd_probe_cron "$@" ;;
   sub-info)      cmd_sub_info ;;
   traffic)       cmd_traffic ;;
   uninstall)
@@ -898,6 +933,6 @@ case "$_cmd" in
       _run-probe) run_probe ;;
     esac ;;
   help|-h|--help)
-    echo "podkop-agent $AGENT_VERSION: status config-get validate apply job pin proxies delays logs watch service probe-start probe-status sub-info traffic uninstall version" ;;
+    echo "podkop-agent $AGENT_VERSION: status config-get validate apply job pin proxies delays logs watch service probe-start probe-status probe-config probe-cron sub-info traffic uninstall version" ;;
   *) fail bad_request "unknown command $_cmd" ;;
 esac

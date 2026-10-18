@@ -243,3 +243,76 @@ def test_traffic_is_credited_to_links_counted_by_the_agent(tmp_path: Path):
     asyncio.run(hub.read_traffic(rt))
     got = {r["server"]: r["bytes"] for r in db.traffic(rid, 0)}
     assert got == {"vless://a@h:1#A": 30, "vless://b@h:2#B": 20}
+
+
+def test_fixed_fingerprint_still_matches_its_key_and_reaches_the_probe(tmp_path: Path):
+    import asyncio
+    assert usage.norm("vless://a@h:1?security=reality&fp=chrome&pbk=x#A") == usage.norm("vless://a@h:1?security=reality&fp=qq&pbk=x#B")
+    assert usage.norm("vless://a@h:1?fp=qq") == "vless://a@h:1"
+    db = DB(tmp_path / "m.db")
+    rid = db.add_router("home", "192.168.1.1", 22, "ssh-ed25519 AAAA")
+    db.set_probe_settings(rid, keys=["https://s"], fix_fingerprint=1)
+    db.set_auto_rule(rid, "main", podkop.check_auto_rule({"top": 1, "fallback": 0}))
+    hub = Hub(db, tmp_path / "key", tmp_path)
+    link = "vless://a@h:1?security=reality&fp=qq#A"
+    picks = hub.auto_picks(rid, {"rows": [ROW(link, "0.2")]})
+    assert picks["main"]["links"] == ["vless://a@h:1?security=reality&fp=chrome#A"]
+    assert picks["main"]["matched"][0]["link"].endswith("fp=chrome#A")
+    sent = []
+
+    class Agent:
+        async def call(self, cmd, payload=None, timeout=0):
+            sent.append(payload["options"])
+            return {}
+
+    for version in ("0.3.0", "0.3.1"):
+        rt = type("RT", (), {"id": rid, "agent": Agent(), "status": {"agent": {"version": version}}})()
+        hub.routers = {rid: rt}
+        hub.probes = {}
+        hub._track_probe = lambda *a: asyncio.sleep(0)
+        asyncio.run(hub.start_probe(rid))
+    assert ["--fix-fingerprint" in o for o in sent] == [False, True]      # only agents that allow it
+
+
+def test_adding_a_running_router_imports_and_changes_nothing(tmp_path: Path):
+    import asyncio
+    db = DB(tmp_path / "m.db")
+    rid = db.add_router("prod", "192.168.1.1", 22, "ssh-ed25519 AAAA")
+    hub = Hub(db, tmp_path / "key", tmp_path)
+    cfg = {"sections": [{"name": "settings", "type": "settings", "options": {"shutdown_correctly": "0"}},
+                        {"name": "youtube", "type": "section", "options": {"connection_type": "proxy"}},
+                        {"name": "main", "type": "section", "options": {"connection_type": "proxy"}}]}
+    calls = []
+
+    class Agent:
+        async def call(self, cmd, *args, payload=None, timeout=0):
+            calls.append((cmd,) + args)
+            return {"status": {"podkop": {"version": "0.7.21", "running": True}, "fingerprint": "fp", "probe": {
+                        "cron": "30 4 * * * podkop-probe --cron"}},
+                    "config-get": {"fingerprint": "fp", "config": cfg},
+                    "probe-config": {"saved": True, "keys": ["https://a.example/s/1", "https://b.example/2", "junk"],
+                                     "countries": "europe", "top": 10, "section": "main", "youtube": True,
+                                     "youtube_noads": "RU", "youtube_section": "youtube", "apply_to": "both",
+                                     "max_ping": 800, "min_speed": 40, "cron": "30 4 * * * podkop-probe --cron"},
+                    "probe-cron": {"cron": ""}}.get(cmd)
+
+    from podkop_manager.hub import RouterRuntime
+    r = RouterRuntime(db.router(rid), tmp_path / "key")
+    r.agent = Agent()
+    hub.routers = {rid: r}
+    asyncio.run(hub.import_found(rid))
+    assert {c[0] for c in calls} == {"status", "config-get", "proxies", "probe-config"}      # only reads
+    [saved] = db.configs()
+    assert saved["name"].startswith("prod, as found") and saved["podkop"] == "0.7.21"
+    assert "shutdown_correctly" not in saved["config"]["sections"][0]["options"]
+    assert db.probe_settings(rid)["keys"] == ["https://a.example/s/1", "https://b.example/2"]
+    rules = {x["section"]: x for x in db.auto_rules(rid)}
+    assert (rules["main"]["max_ping"], rules["main"]["youtube"], len(rules["main"]["countries"])) == (800, "", len(podkop.EUROPE))
+    assert rules["youtube"]["youtube"] == "RU"
+    assert db.probe_settings(rid)["schedule"] == ""            # the router's own cron still runs it
+    asyncio.run(hub.import_found(rid))                          # once
+    assert len(db.configs()) == 1
+    # "Let the manager run it": the cron line goes, the manager runs it at that time
+    asyncio.run(hub.take_over_probe(r))
+    ps = db.probe_settings(rid)
+    assert calls[-1] == ("probe-cron", "off") and (ps["schedule"], ps["auto_apply"]) == ("04:30", 1)

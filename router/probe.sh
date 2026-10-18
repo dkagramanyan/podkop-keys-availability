@@ -12,7 +12,7 @@
 #
 # https://github.com/dkagramanyan/podkop-manager
 
-VERSION="1.19.0"
+VERSION="1.20.0"
 REPO_URL="https://github.com/dkagramanyan/podkop-manager"
 RELEASE_URL="$REPO_URL/releases/latest/download/probe.sh"
 BIN=/usr/bin/podkop-probe            # installed copy, used by the nightly run
@@ -37,7 +37,7 @@ FILE=""; SUBS=""; CONFIG=""; CSV=""
 VERBOSE=0; ASSUME_YES=0; COLOR=auto; SOURCE=""
 TOP=10; APPLY=ask; SECTION=main
 FALLBACK=5                           # servers after the top ones: podkop's fallback links
-SPEED=1; SPEED_URL=""; SPEED_T=8; SPEED_J=""; SPEED_J_USER=""; ENTRY_CHECK=1
+SPEED=1; SPEED_URL=""; SPEED_T=8; SPEED_J=""; SPEED_J_USER=""; ENTRY_CHECK=1; FIX_FP=0
 # direct download used to measure the router's own line (not Cloudflare,
 # which some providers block without a VPN)
 LINE_URL="https://fsn1-speed.hetzner.com/100MB.bin"
@@ -101,6 +101,9 @@ Sources:
                     by name, by the server's IP and by the exit IP
   --no-entry-check  don't look up the server's IP country (keeps relays
                     whose entry point is elsewhere, e.g. "via RU")
+  --fix-fingerprint REALITY links with a TLS fingerprint new servers reject
+                    (fp=qq, 360, ios, android, edge) are tested and saved
+                    with fp=chrome
 
 Test:
   -n N              requests per node               (default $N)
@@ -226,6 +229,7 @@ while [ $# -gt 0 ]; do
     --no-apply) APPLY=no; shift ;;
     --no-speed) SPEED=0; shift ;;
     --no-entry-check) ENTRY_CHECK=0; shift ;;
+    --fix-fingerprint) FIX_FP=1; shift ;;
     --no-youtube) YOUTUBE=0; shift ;;
     --install) INSTALL=1; shift ;;
     --uninstall|--nightly-off) UNINSTALL=1; shift ;;
@@ -490,6 +494,15 @@ extract_links() {
 
 # link_name <link>: the server name from the link's #fragment, else host:port;
 # control characters (a %0A newline...) become spaces, so it stays one line
+# fix_fp <link>: fp=chrome instead of a fingerprint REALITY servers since
+# Xray-core v26.9.8 reject (no X25519MLKEM768 key share), with --fix-fingerprint
+fix_fp() {
+  case "$FIX_FP:$1" in
+    1:*security=reality*) printf '%s\n' "$1" | sed -E 's/([?&]fp=)(qq|360|ios|android|edge)([&#]|$)/\1chrome\3/' ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
 link_name() {
   case "$1" in
     *#?*) printf '%s\n' "${1#*#}" | awk "$URLDEC_AWK"'{ s = dec($0); gsub(/[[:cntrl:]]/, " ", s); print s }' ;;
@@ -1429,7 +1442,7 @@ while IFS= read -r _line; do
   _i=$((_i + 1)); _d="$WORK/n/$_i"; mkdir -p "$_d"
   case "$_line" in
     L"$TAB"*)
-      printf '%s\n' "${_line#L"$TAB"}" > "$_d/link"
+      fix_fp "${_line#L"$TAB"}" > "$_d/link"
       link_name "${_line#L"$TAB"}" > "$_d/name" ;;
     O"$TAB"*)
       _r=${_line#O"$TAB"}

@@ -37,8 +37,9 @@ def parse_title(header: str) -> str:
 
 
 def norm(link: str) -> str:
-    """A link without its #name, to match the same server in different lists."""
-    return link.split("#", 1)[0].strip()
+    """A link without its #name and TLS fingerprint, to match the same server in
+    different lists (the manager may have changed the fingerprint)."""
+    return re.sub(r"([?&])fp=[^&#]*&?", r"\1", link.split("#", 1)[0].strip()).rstrip("?&")
 
 
 def link_index(keys: list) -> dict:
