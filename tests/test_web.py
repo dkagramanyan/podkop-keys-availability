@@ -26,6 +26,7 @@ class FakeRouter:
 class FakeHub:
     src = None
     auto_picks = Hub.auto_picks
+    usage = Hub.usage
 
     def __init__(self, db=None):
         self.db = db
@@ -40,6 +41,9 @@ class FakeHub:
         rt.draft = {"changes": 1, "base": d["base"]} if d else None
 
     async def start(self):
+        pass
+
+    async def check_usage(self, rt):
         pass
 
     async def stop(self):
@@ -186,3 +190,24 @@ def test_auto_rules_api_and_preview_from_last_run(tmp_path):
         assert [m["name"] for m in p["fallback"]] == ["PL Krakow 1"] and p["has_links"]
         assert c.delete("/api/routers/1/auto-rules/netflix", headers=H).json() == {"ok": True}
         assert c.get("/api/routers/1/auto-rules/netflix").status_code == 404
+
+
+def test_keys_api(tmp_path):
+    with client(tmp_path, with_router=True) as c:
+        c.post("/login", data={"password": "secret-pass"})
+        c.put("/api/routers/1/probe", json={"keys": ["https://sub.example.com/a", "not a url"]}, headers=H)
+        assert [(k["kind"], k["url"]) for k in c.db.keys(1)] == [("sub", "https://sub.example.com/a")]
+        assert c.post("/api/routers/1/keys", json={"link": "vmess://x"}, headers=H).status_code == 400
+        kid = c.post("/api/routers/1/keys", json={"link": "vless://x@h:1#fra", "limit_gb": 10}, headers=H).json()["id"]
+        assert c.post("/api/routers/1/keys", json={"link": "vless://x@h:1#fra"}, headers=H).status_code == 400
+        assert c.put(f"/api/keys/{kid}", json={"threshold": 20}, headers=H).status_code == 400
+        assert c.put(f"/api/keys/{kid}", json={"reset_time": "25:00"}, headers=H).status_code == 400
+        k = c.put(f"/api/keys/{kid}", json={"action": "avoid", "threshold": 80, "limit_source": "provider"}, headers=H).json()
+        assert (k["action"], k["threshold"], k["limit_source"]) == ("avoid", 80, "manual")   # a link has no provider
+        u = c.get("/api/routers/1/usage").json()
+        assert [(x["label"], x["limit"]) for x in u["keys"]] == [("sub.example.com", 0), ("fra", 10 * 1024 ** 3)]
+        sub = c.db.keys(1)[0]["id"]
+        assert c.delete(f"/api/keys/{sub}", headers=H).status_code == 400
+        assert c.delete(f"/api/keys/{kid}", headers=H).json() == {"ok": True}
+        c.put("/api/routers/1/probe", json={"keys": []}, headers=H)
+        assert c.db.keys(1) == []

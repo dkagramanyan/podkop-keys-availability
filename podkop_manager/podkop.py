@@ -233,8 +233,8 @@ def link_name(link: str) -> str:
     return rest.split("@", 1)[-1].split("?", 1)[0].split("/", 1)[0]
 
 
-def tag_names(config: dict) -> dict:
-    """sing-box outbound tag -> server name, the way podkop names outbounds."""
+def tag_links(config: dict) -> dict:
+    """sing-box outbound tag -> (section, link), the way podkop names outbounds."""
     out = {}
     for s in config.get("sections", []):
         o = s.get("options", {})
@@ -242,16 +242,24 @@ def tag_names(config: dict) -> dict:
 
         def add(links, mid=""):
             for i, link in enumerate(links if isinstance(links, list) else [links] if links else []):
-                out[f"{name}-{mid}{i + 1}-out"] = link_name(link)
+                out[f"{name}-{mid}{i + 1}-out"] = (name, link)
 
         if o.get("proxy_config_type") == "urltest":
             add(o.get("urltest_proxy_links"))
             add(o.get("urltest_fallback_links"), "fallback-")
-            out[f"{name}-urltest-out"] = "automatic"
         elif o.get("proxy_config_type") == "selector":
             add(o.get("selector_proxy_links"))
         elif o.get("proxy_config_type") == "url" and o.get("proxy_string"):
-            out[f"{name}-out"] = link_name(o["proxy_string"])
+            out[f"{name}-out"] = (name, o["proxy_string"])
+    return out
+
+
+def tag_names(config: dict) -> dict:
+    """sing-box outbound tag -> server name, the way podkop names outbounds."""
+    out = {tag: link_name(link) for tag, (_, link) in tag_links(config).items()}
+    for s in config.get("sections", []):
+        if s.get("options", {}).get("proxy_config_type") == "urltest":
+            out[f"{s['name']}-urltest-out"] = "automatic"
     return out
 
 

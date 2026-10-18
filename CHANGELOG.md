@@ -3,6 +3,24 @@
 Versions are podkop-probe's (`probe.sh`); a release also carries
 podkop-agent and podkop-manager.
 
+## 1.16.0 — 2026-10-18
+
+- Manager 0.6.0: new page **Keys and usage**. For each key: used today
+  against its limit, a forecast at the last 3 hours' rate, the split by rule,
+  the last 14 days and today's traffic by server. The menu shows the highest
+  daily limit used, Overview warns when a key will run out today.
+- Limits come from the provider (subscription-userinfo, read every 10 min)
+  or are set by you; single links can be added as keys with their own limit.
+- At 90% (or your threshold) a key either only warns or moves its rules:
+  the probe's rules that use its servers are rebuilt from the last probe
+  without them, through the usual checked apply, and put back after the
+  reset. History shows these changes as "traffic limit".
+- Agent 0.2.0: counts traffic per server from sing-box's connections, and
+  reads each key's usage through podkop-probe (same device for the
+  provider). Reinstall the agent from Settings to get it.
+- probe: `--sub-info` prints each key's usage header and links.
+- `.env`: `TZ` sets the time zone for "today" and the nightly probe.
+
 ## 1.15.0 — 2026-10-18
 
 - Manager 0.5.0: pages swap in when their data is loaded, with a short fade,
