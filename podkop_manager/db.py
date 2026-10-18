@@ -1,6 +1,6 @@
 """SQLite storage: routers, their events and logs, every applied config
 version, unapplied drafts, probe settings and runs, keys with their usage and
-traffic, and the manager's own settings."""
+traffic, saved configs, and the manager's own settings."""
 
 from __future__ import annotations
 
@@ -67,6 +67,10 @@ CREATE TABLE IF NOT EXISTS traffic (
   server TEXT NOT NULL, bytes INTEGER NOT NULL, PRIMARY KEY (router_id, hour, key_id, rule, server)
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS configs (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, t REAL NOT NULL, source TEXT NOT NULL DEFAULT '',
+  podkop TEXT NOT NULL DEFAULT '', config TEXT NOT NULL, rules TEXT NOT NULL DEFAULT '{}'
+);
 """
 
 KEY_FIELDS = {"label", "limit_source", "limit_gb", "period", "reset_time", "action", "threshold",
@@ -91,6 +95,11 @@ class DB:
         self.lock = threading.Lock()
         with self.lock:
             self.conn.execute("PRAGMA journal_mode=WAL")
+        self.migrate()
+
+    def migrate(self) -> None:
+        """Tables and columns of this version, also for a restored backup."""
+        with self.lock:
             self.conn.executescript(SCHEMA)
             added = set()
             for table, col, decl in COLUMNS:
@@ -146,6 +155,9 @@ class DB:
         for table in ("events", "logs", "versions", "probe_runs", "drafts", "auto_rules", "keys", "traffic"):
             self.x(f"DELETE FROM {table} WHERE router_id = ?", rid)
         self.x("DELETE FROM probe_settings WHERE router_id = ?", rid)
+        # the hub's per-router settings, so a router that gets this id later starts clean
+        for name in ("traffic", "avoid", "moved", "lists_to_rules", "countries_to_rules", "rules_base"):
+            self.x("DELETE FROM settings WHERE key = ?", f"{name}:{rid}")
         self.x("DELETE FROM routers WHERE id = ?", rid)
 
     # --- events and logs ----------------------------------------------------------
@@ -176,12 +188,18 @@ class DB:
         rows = self.q(sql + " ORDER BY id DESC LIMIT ?", *args, limit)
         return rows[::-1]
 
-    def prune(self, log_days: int = 14, event_days: int = 180) -> None:
+    def prune(self, log_days: int = 14, event_days: int = 180, versions: int = 500, probe_results: int = 30) -> None:
         now = time.time()
         self.x("DELETE FROM logs WHERE t < ?", now - log_days * 86400)
         self.x("DELETE FROM events WHERE t < ?", now - event_days * 86400)
         self.x("DELETE FROM key_usage WHERE t < ?", now - 60 * 86400)
         self.x("DELETE FROM traffic WHERE hour < ?", now - 60 * 86400)
+        # each version holds a whole config and each probe run all its rows: keep the newest
+        self.x("DELETE FROM versions WHERE id IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER "
+               "(PARTITION BY router_id ORDER BY id DESC) AS n FROM versions) WHERE n > ?)", versions)
+        self.x("UPDATE probe_runs SET result = NULL WHERE result IS NOT NULL AND id IN (SELECT id FROM (SELECT id, "
+               "ROW_NUMBER() OVER (PARTITION BY router_id ORDER BY id DESC) AS n FROM probe_runs) WHERE n > ?)",
+               probe_results)
 
     # --- config versions ------------------------------------------------------------
     def add_version(self, rid: int, config: dict, diff: list, note: str, base: str, trigger: str = "web") -> int:
@@ -292,6 +310,7 @@ class DB:
 
     def delete_key(self, kid: int) -> None:
         self.x("DELETE FROM key_usage WHERE key_id = ?", kid)
+        self.x("DELETE FROM traffic WHERE key_id = ?", kid)
         self.x("DELETE FROM keys WHERE id = ?", kid)
 
     def add_key_usage(self, kid: int, t: float, used: int, total: int, expire: int | None) -> None:
@@ -332,6 +351,8 @@ class DB:
         for r in rows:
             for k in ("countries", "protocols", "exit_ips"):
                 r[k] = json.loads(r[k])
+            if r["youtube"] == "ru":          # before 0.9.0: "sees Russia"
+                r["youtube"] = "RU"
         return rows
 
     def auto_rule(self, rid: int, section: str) -> dict | None:
@@ -348,6 +369,50 @@ class DB:
 
     def delete_auto_rule(self, rid: int, section: str) -> None:
         self.x("DELETE FROM auto_rules WHERE router_id = ? AND section = ?", rid, section)
+
+    # --- saved configs (not tied to a router) ------------------------------------
+    def configs(self) -> list[dict]:
+        rows = self.q("SELECT * FROM configs ORDER BY id DESC")
+        for r in rows:
+            r["config"], r["rules"] = json.loads(r["config"]), json.loads(r["rules"])
+        return rows
+
+    def saved_config(self, cid: int) -> dict | None:
+        return next((r for r in self.configs() if r["id"] == cid), None)
+
+    def add_config(self, name: str, config: dict, rules: dict, source: str, podkop: str = "") -> int:
+        return self.x("INSERT INTO configs (name, t, source, podkop, config, rules) VALUES (?, ?, ?, ?, ?, ?)",
+                      name, time.time(), source, podkop, json.dumps(config), json.dumps(rules))
+
+    def rename_config(self, cid: int, name: str) -> None:
+        self.x("UPDATE configs SET name = ? WHERE id = ?", name, cid)
+
+    def delete_config(self, cid: int) -> None:
+        self.x("DELETE FROM configs WHERE id = ?", cid)
+
+    def copy_to(self, path: Path) -> None:
+        """A consistent copy of the whole database, for a backup."""
+        dst = sqlite3.connect(str(path))
+        try:
+            with self.lock:
+                self.conn.backup(dst)
+        finally:
+            dst.close()
+
+    def restore_from(self, path: Path) -> None:
+        """Replaces everything with the database at path (a backup)."""
+        src = sqlite3.connect(str(path))
+        try:
+            tables = {r[0] for r in src.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if not {"routers", "versions", "settings"} <= tables:
+                raise ValueError("the backup's database is not podkop-manager's")
+            with self.lock:
+                src.backup(self.conn)
+        except sqlite3.DatabaseError as e:
+            raise ValueError(f"the backup's database is damaged: {e}") from None
+        finally:
+            src.close()
+        self.migrate()
 
 
 def _seconds(start: str | None, end: str | None) -> int | None:

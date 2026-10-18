@@ -323,8 +323,6 @@ def _ip_in(ip: str, nets: list) -> bool:
 
 
 # what a rule needs from YouTube: nothing, that videos play, that YouTube
-# sees Russia (no ads)
-YOUTUBE_NEEDS = ("", "plays", "ru")
 # podkop-probe's "europe" (EUROPE in router/probe.sh)
 EUROPE = ("EU AD AL AT BA BE BG CH CY CZ DE DK EE ES FI FR GB GR HR HU IE IS IT LI LT LU LV MC MD ME MK MT NL NO PL PT RO RS "
           "SE SI SK SM UA VA XK").split()
@@ -336,14 +334,19 @@ def _youtube_why(row: dict, need: str) -> str:
         return "YouTube was not checked on this server"
     if st != "ok":
         return {"bot": "YouTube asks to confirm you're not a bot", "no": "YouTube videos don't play"}.get(st, "YouTube failed")
-    if need == "ru" and cc.upper() != "RU":
-        return f"YouTube sees {cc or 'another country'}, not Russia (ads)"
+    if need != "plays" and cc.upper() != need:
+        return f"YouTube sees {cc or 'another country'}, not {need}"
     return ""
 
 
 def check_auto_rule(rule: dict) -> dict:
     """A rule that takes servers from the probe, as stored: lists cleaned up;
     raises ValueError. No countries = any country."""
+    if not isinstance(rule, dict):
+        raise ValueError("a rule's probe parameters are an object")
+    for k in ("countries", "protocols", "exit_ips"):
+        if not isinstance(rule.get(k) or [], list) or not all(isinstance(x, str) for x in rule.get(k) or []):
+            raise ValueError(f"{k} is a list of text")
     countries = sorted({str(c).strip().upper() for c in rule.get("countries") or [] if str(c).strip()})
     if any(not re.fullmatch(r"[A-Z]{2}", c) for c in countries):
         raise ValueError("countries are two-letter codes like PL")
@@ -359,15 +362,17 @@ def check_auto_rule(rule: dict) -> dict:
     try:
         top, fallback = int(rule.get("top", 5)), int(rule.get("fallback", 2))
         max_ping, min_speed = int(rule.get("max_ping", 700)), float(rule.get("min_speed", 40))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ValueError("server counts and limits must be numbers") from None
     if not 1 <= top <= 50 or not 0 <= fallback <= 50:
         raise ValueError("keep 1 to 50 servers and 0 to 50 fallback")
     if not 100 <= max_ping <= 5000 or not 0 <= min_speed <= 10000:
         raise ValueError("max ping is 100 to 5000 ms, min speed 0 to 10000 Mbit/s")
-    youtube = rule.get("youtube") or ""
-    if youtube not in YOUTUBE_NEEDS:
-        raise ValueError("YouTube is '', 'plays' or 'ru'")
+    # YouTube: not checked (""), plays anywhere ("plays"), or the country it must see ("RU": no ads)
+    youtube = str(rule.get("youtube") or "").strip()
+    youtube = youtube if youtube in ("", "plays") else youtube.upper()
+    if youtube not in ("", "plays") and not re.fullmatch(r"[A-Z]{2}", youtube):
+        raise ValueError("YouTube is '', 'plays' or a two-letter country code like RU")
     return {"countries": countries, "protocols": protocols, "exit_ips": exit_ips,
             "name_contains": str(rule.get("name_contains") or "").strip(), "top": top, "fallback": fallback,
             "max_ping": max_ping, "min_speed": min_speed, "youtube": youtube}

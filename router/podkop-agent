@@ -12,7 +12,7 @@
 # $SSH_ORIGINAL_COMMAND, requests come as JSON on stdin, answers go as JSON to
 # stdout: {"v":1,"ok":true,"data":...} or {"v":1,"ok":false,"error":{...}}.
 
-AGENT_VERSION="0.2.0"
+AGENT_VERSION="0.3.0"
 PROTO=1
 ETC=/etc/podkop-agent
 RUN=/tmp/podkop-agent
@@ -273,11 +273,14 @@ health() {
 # restart_podkop <marker>
 restart_podkop() {
   logger -t podkop-agent "$1"
-  /etc/init.d/podkop restart >/dev/null 2>&1
+  # 9>&-: podkop must not inherit (and keep holding) the apply lock
+  /etc/init.d/podkop restart >/dev/null 2>&1 9>&-
 }
 
+# through temp files, so a full disk can't leave a cut-off copy
 save_last_good() {
-  cp "$CFG" "$ETC/last-good" && config_json | fingerprint > "$ETC/last-good.fp"
+  cp "$CFG" "$ETC/last-good.t" && mv "$ETC/last-good.t" "$ETC/last-good" &&
+    config_json | fingerprint > "$ETC/last-good.fp.t" && mv "$ETC/last-good.fp.t" "$ETC/last-good.fp"
 }
 
 backup_config() {
@@ -398,9 +401,12 @@ run_apply() {
   jq -r "$TOUCI" "$_new" > "$RUN/stage/podkop"
   uci -c "$RUN/stage" -q show podkop >/dev/null 2>&1 || { job_end "$_id" rejected "could not write the settings file"; return; }
   _bak=$(backup_config) || { job_end "$_id" failed "could not back up $CFG"; return; }
-  install_config "$RUN/stage/podkop" || { job_end "$_id" failed "could not write $CFG"; return; }
+  # survives a reboot: the daemon puts the backup back if this apply never ends
+  printf '%s\t%s\n' "$_id" "$_bak" > "$ETC/apply-pending" || { job_end "$_id" failed "could not write $ETC/apply-pending"; return; }
+  install_config "$RUN/stage/podkop" || { rm -f "$ETC/apply-pending"; job_end "$_id" failed "could not write $CFG"; return; }
   _x=$(jq -nc --arg b "$_cur" --arg a "$_nfp" --arg k "$_bak" '{fingerprint_before: $b, fingerprint_after: $a, backup: $k}')
   if [ -f "$ETC/paused" ] || ! podkop_enabled; then
+    rm -f "$ETC/apply-pending"
     job_end "$_id" saved "saved; podkop is stopped, so it was not restarted" "$_x"
     event applied "$(jq -nc --arg j "$_id" '{job: $j, restarted: false}')"
     return
@@ -408,13 +414,18 @@ run_apply() {
   job_set "$_id" '.state = "restarting"'
   restart_podkop "apply $_id"
   if _why=$(health "apply $_id"); then
-    save_last_good; reapply_pins
+    save_last_good; rm -f "$ETC/apply-pending"; reapply_pins
     job_end "$_id" applied "applied, podkop is running" "$_x"
     event applied "$(jq -nc --arg j "$_id" '{job: $j, restarted: true}')"
     return
   fi
   job_set "$_id" '.state = "reverting"'
-  install_config "$_bak"
+  if ! install_config "$_bak"; then
+    rm -f "$ETC/apply-pending"
+    job_end "$_id" failed "$_why; the old settings could not be restored (could not write $CFG from $_bak)" "$_x"
+    event revert_failed "$(jq -nc --arg j "$_id" --arg r "$_why" --arg r2 "could not write $CFG from $_bak" '{job: $j, reason: $r, revert_reason: $r2}')"
+    return
+  fi
   restart_podkop "revert $_id"
   if _why2=$(health "revert $_id"); then
     reapply_pins
@@ -424,6 +435,30 @@ run_apply() {
     job_end "$_id" failed "$_why; the old settings are back, but podkop does not run with them either: $_why2" "$_x"
     event revert_failed "$(jq -nc --arg j "$_id" --arg r "$_why" --arg r2 "$_why2" '{job: $j, reason: $r, revert_reason: $r2}')"
   fi
+  rm -f "$ETC/apply-pending"
+}
+
+# undo_interrupted: an apply cut off by a reboot or a kill left
+# $ETC/apply-pending ("<job><TAB><backup>"); put the backup back
+undo_interrupted() {
+  [ -s "$ETC/apply-pending" ] || return 0
+  exec 9> "$RUN/apply.lock"
+  flock -n 9 || { exec 9>&-; return 0; }   # that apply is still running
+  IFS="$TAB" read -r _id _bak < "$ETC/apply-pending"
+  if [ -f "$_bak" ] && install_config "$_bak"; then
+    _st=reverted; _m="the apply was interrupted (reboot or killed); the old settings were put back"
+    [ -f "$ETC/paused" ] || ! podkop_enabled || restart_podkop "undo interrupted apply $_id"
+  else
+    _st=failed; _m="the apply was interrupted (reboot or killed); the old settings could not be put back from $_bak"
+  fi
+  rm -f "$ETC/apply-pending"
+  if [ -f "$(job_file "$_id")" ]; then
+    case "$(jq -r .state "$(job_file "$_id")" 2>/dev/null)" in
+      queued|checking|restarting|reverting) job_end "$_id" "$_st" "$_m" ;;
+    esac
+  fi
+  event apply_interrupted "$(jq -nc --arg j "$_id" --arg b "$_bak" --arg m "$_m" '{job: $j, backup: $b, message: $m}')"
+  exec 9>&-
 }
 
 # --- watchdog -------------------------------------------------------------------
@@ -459,7 +494,9 @@ recover() {
 # traffic_poll: add each connection's new bytes to its server (the first
 # outbound of its chain, e.g. main-2-out). Bytes of connections that ended
 # between two polls are shared out like the seen ones. Kept since the agent
-# started in $RUN/traffic/state.json.
+# started in $RUN/traffic/state.json; "links" also keeps them per
+# "<section><TAB><link>", the link behind each tag at the time of the poll, so
+# a reorder of the links doesn't move bytes to another server.
 traffic_poll() {
   _cfg=$(uci -q get podkop.settings.config_path); [ -n "$_cfg" ] || _cfg=/etc/sing-box/config.json
   _addr=$(jq -r '.experimental.clash_api.external_controller // empty' "$_cfg" 2>/dev/null)
@@ -468,24 +505,41 @@ traffic_poll() {
   if [ -n "$_sec" ]; then _c=$(curl -s --max-time 5 -H "Authorization: Bearer $_sec" "http://$_addr/connections")
   else _c=$(curl -s --max-time 5 "http://$_addr/connections"); fi
   [ -n "$_c" ] || return 0
+  # tag -> "<section><TAB><link>", named like tag_link does (and "<section>-out" for a url section)
+  _tl=$(ubus call uci get '{"config":"podkop"}' 2>/dev/null | jq -c '
+    def lst: if . == null then [] elif type == "array" then . else [.] end;
+    '"$UBUS2CONF"' | [.sections[] | select(.options.connection_type == "proxy") | .name as $s | .options as $o
+    | if $o.proxy_config_type == "urltest" then
+        ($o.urltest_proxy_links | lst | to_entries[] | {key: "\($s)-\(.key + 1)-out", value: "\($s)\t\(.value)"}),
+        ($o.urltest_fallback_links | lst | to_entries[] | {key: "\($s)-fallback-\(.key + 1)-out", value: "\($s)\t\(.value)"})
+      elif $o.proxy_config_type == "selector" then
+        ($o.selector_proxy_links | lst | to_entries[] | {key: "\($s)-\(.key + 1)-out", value: "\($s)\t\(.value)"})
+      elif $o.proxy_config_type == "url" and ($o.proxy_string // "") != "" then
+        {key: "\($s)-out", value: "\($s)\t\($o.proxy_string)"}
+      else empty end] | from_entries')
+  [ -n "$_tl" ] || _tl='{}'
   _d="$RUN/traffic"; mkdir -p "$_d"
-  [ -s "$_d/state.json" ] || jq -nc --arg t "$(now)" '{since: $t, total: 0, conns: {}, servers: {}}' > "$_d/state.json"
-  printf '%s' "$_c" | jq -c --slurpfile st "$_d/state.json" '
+  # a missing, empty or broken state starts over
+  jq -e .servers "$_d/state.json" >/dev/null 2>&1 || jq -nc --arg t "$(now)" '{since: $t, total: 0, conns: {}, servers: {}, links: {}}' > "$_d/state.json"
+  printf '%s' "$_c" | jq -c --slurpfile st "$_d/state.json" --argjson tl "$_tl" '
     $st[0] as $s
     | [.connections[]? | {id, b: ((.upload // 0) + (.download // 0)), tag: ((.chains // [])[0] // "")}] as $cs
     | ((.uploadTotal // 0) + (.downloadTotal // 0)) as $total
     | [$cs[] | {tag, d: ([.b - ($s.conns[.id] // 0), 0] | max)}] as $ds
     | ([$ds[].d] | add // 0) as $seen
     | ([(if $total >= $s.total then $total - $s.total else $total end) - $seen, 0] | max) as $gone
+    | [$ds[] | {tag, n: (.d + (if $seen > 0 then $gone * .d / $seen else 0 end) | floor)}] as $ns
     | {since: $s.since, total: $total, conns: ($cs | map({key: .id, value: .b}) | from_entries),
-       servers: (reduce $ds[] as $x ($s.servers; .[$x.tag] += ($x.d + (if $seen > 0 then $gone * $x.d / $seen else 0 end) | floor))
-                 | if $seen == 0 and $gone > 0 then .[""] += $gone else . end)}' > "$_d/state.new" 2>/dev/null &&
+       servers: (reduce $ns[] as $x ($s.servers; .[$x.tag] += $x.n)
+                 | if $seen == 0 and $gone > 0 then .[""] += $gone else . end),
+       links: (reduce $ns[] as $x ($s.links // {}; if $tl[$x.tag] then .[$tl[$x.tag]] += $x.n else . end))}' > "$_d/state.new" 2>/dev/null &&
     mv "$_d/state.new" "$_d/state.json"
 }
 
 daemon() {
   mkdir -p "$RUN/jobs" "$ETC"
   event agent_started "$(jq -nc --arg v "$AGENT_VERSION" '{version: $v}')"
+  undo_interrupted
   _last=""; _down=0
   while :; do
     sleep 15
@@ -686,11 +740,25 @@ cmd_service() {
 PROBE_OPTS="-q:0 -F:0 -v:0 --no-speed:0 --no-youtube:0 --no-entry-check:0 -n:1 -c:1 -j:1 -t:1
 --countries:1 --top:1 --max-ping:1 --min-speed:1 --speed-jobs:1 --youtube-noads:1"
 
+# probe_check: a "running" probe whose runner is gone (killed, e.g. out of
+# memory) has failed; call it holding the probe lock (fd 7)
+probe_check() {
+  [ "$(cat "$RUN/probe/state" 2>/dev/null)" = running ] || return 0
+  _pp=$(cat "$RUN/probe/pid" 2>/dev/null)
+  [ -n "$_pp" ] || return 0   # the runner has not started yet
+  tr '\0' ' ' < "/proc/$_pp/cmdline" 2>/dev/null | grep -q _run-probe && return 0
+  echo "podkop-agent: the probe was killed (out of memory?)" >> "$RUN/probe/log"
+  now > "$RUN/probe/finished"
+  echo failed > "$RUN/probe/state"
+}
+
 # probe-start: stdin {"keys": [subscription urls], "options": ["--countries", "europe", ...]}
 cmd_probe_start() {
   [ -x "$PROBE" ] || fail no_probe "podkop-probe is not installed"
-  [ "$(cat "$RUN/probe/state" 2>/dev/null)" = running ] && fail busy "a probe is already running"
   mkdir -p "$RUN/probe"
+  exec 7> "$RUN/probe.lock"; flock 7
+  probe_check
+  [ "$(cat "$RUN/probe/state" 2>/dev/null)" = running ] && fail busy "a probe is already running"
   cat > "$RUN/probe/req.json"
   jq -e '(.keys | type == "array" and length > 0) and ((.options // []) | type == "array")' \
     "$RUN/probe/req.json" >/dev/null 2>&1 || fail bad_request "expected {\"keys\": [...], \"options\": [...]}"
@@ -704,14 +772,16 @@ cmd_probe_start() {
   done
   set +f
   echo running > "$RUN/probe/state"
-  rm -f "$RUN/probe/result.csv" "$RUN/probe/result.csv.links" "$RUN/probe/exit"
+  rm -f "$RUN/probe/result.csv" "$RUN/probe/result.csv.links" "$RUN/probe/exit" "$RUN/probe/pid"
   now > "$RUN/probe/started"
+  exec 7>&-   # the runner must not inherit the lock
   spawn _run-probe
   event probe_started
   reply '{"state":"running"}'
 }
 
 run_probe() {
+  echo $$ > "$RUN/probe/pid"
   set -f
   set --
   for _o in $(jq -r '.options // [] | .[]' "$RUN/probe/req.json"); do set -- "$@" "$_o"; done
@@ -720,9 +790,12 @@ run_probe() {
     /tmp/podkop-probe-youtube-fallback.txt
   "$PROBE" --no-apply --no-color -o "$RUN/probe/result.csv" "$@" > "$RUN/probe/log" 2>&1
   _rc=$?
-  echo "$_rc" > "$RUN/probe/exit"
-  now > "$RUN/probe/finished"
-  if [ "$_rc" = 0 ]; then echo "done" > "$RUN/probe/state"; else echo failed > "$RUN/probe/state"; fi
+  (
+    flock 7
+    echo "$_rc" > "$RUN/probe/exit"
+    now > "$RUN/probe/finished"
+    if [ "$_rc" = 0 ]; then echo "done" > "$RUN/probe/state"; else echo failed > "$RUN/probe/state"; fi
+  ) 7> "$RUN/probe.lock"
   event probe_done "$(jq -nc --argjson rc "$_rc" '{exit: $rc}')"
 }
 
@@ -745,7 +818,7 @@ cmd_sub_info() {
 
 # traffic: bytes per server since the agent started (see traffic_poll)
 cmd_traffic() {
-  reply "$(jq -c '{since, servers}' "$RUN/traffic/state.json" 2>/dev/null || echo '{"since":"","servers":{}}')"
+  reply "$(jq -c '{since, servers, links: (.links // {})}' "$RUN/traffic/state.json" 2>/dev/null || echo '{"since":"","servers":{},"links":{}}')"
 }
 
 lines_json() { if [ -f "$1" ]; then jq -Rsc 'split("\n") | map(select(. != ""))' "$1"; else echo '[]'; fi; }
@@ -757,6 +830,7 @@ CSV_JQ='split("\n") | .[1:] | map(select(. != "") | split(",") as $f
      node: ($f[12:] | join(",") | ltrimstr("\"") | rtrimstr("\"") | split("\"\"") | join("\""))})'
 
 cmd_probe_status() {
+  exec 7> "$RUN/probe.lock"; flock 7; probe_check; exec 7>&-
   _log=$(tail -n 400 "$RUN/probe/log" 2>/dev/null | jq -Rsc 'split("\n") | map(select(. != ""))')
   _rows='[]'; [ -s "$RUN/probe/result.csv" ] && _rows=$(jq -Rsc "$CSV_JQ" "$RUN/probe/result.csv")
   # the link of each row, from podkop-probe's result.csv.links ("n<TAB>link")

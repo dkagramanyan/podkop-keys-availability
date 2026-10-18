@@ -12,7 +12,7 @@
 #
 # https://github.com/dkagramanyan/podkop-manager
 
-VERSION="1.18.0"
+VERSION="1.19.0"
 REPO_URL="https://github.com/dkagramanyan/podkop-manager"
 RELEASE_URL="$REPO_URL/releases/latest/download/probe.sh"
 BIN=/usr/bin/podkop-probe            # installed copy, used by the nightly run
@@ -372,7 +372,8 @@ REAL_AWK="$URLDEC_AWK"'
   if (host == "" || host ~ /^(0\.0\.0\.0|127\.|localhost$|::1?$|example\.)/) next
   if ($0 ~ /00000000-0000-0000-0000-000000000000/) next
   if (name ~ /not supported|unsupported|please update|update (the |your )?app|expired|traffic limit|device limit|hwid|renew/) next
-  if (name ~ /не поддерж|обнови|истек|истёк|лимит|устройств|продли|осталось/) next
+  # tolower does not lower Cyrillic here (LC_ALL=C); not "Безлимит" or "Для всех устройств"
+  if (name ~ /не поддерж|обнови|истек|истёк|(Л|л)имит (устройств|трафика)|(П|п)ревышен лимит|(Д|д)остигнут лимит|(З|з)акончил|исчерпан|продли|осталось/) next
   print
 }'
 
@@ -487,11 +488,13 @@ extract_links() {
   printf '%s\n' "$_t" | tr -d '\r' | grep -oE "$LINK_RE"
 }
 
-# link_name <link>: the server name from the link's #fragment, else host:port
+# link_name <link>: the server name from the link's #fragment, else host:port;
+# control characters (a %0A newline...) become spaces, so it stays one line
 link_name() {
   case "$1" in
-    *#?*) printf '%s\n' "${1#*#}" | awk "$URLDEC_AWK"'{ print dec($0) }' ;;
-    vmess://*) printf '%s' "${1#*://}" | b64d | jq -r '.ps // "vmess"' 2>/dev/null || echo vmess ;;
+    *#?*) printf '%s\n' "${1#*#}" | awk "$URLDEC_AWK"'{ s = dec($0); gsub(/[[:cntrl:]]/, " ", s); print s }' ;;
+    vmess://*) printf '%s' "${1#*://}" | b64d |
+      jq -r '.ps // "vmess" | tostring | explode | map(if . < 32 or . == 127 then 32 else . end) | implode' 2>/dev/null || echo vmess ;;
     *) _h=${1#*://}; _h=${_h##*@}; printf '%s\n' "${_h%%[?/#]*}" ;;
   esac
 }
@@ -878,13 +881,14 @@ speed_node() {
   sb_stop "$_sn"
 }
 
-# same_key <idx>: links to the same server/port/transport share a speed test
-# (e.g. "Германия #1" and "Германия #1 (для iOS)")
+# same_key <idx>: links that differ only in the name share a speed test
+# (e.g. "Германия #1" and "Германия #1 (для iOS)"); relays with one entry
+# host:port but another SNI, path or key are different servers
 same_key() {
   if [ -f "$WORK/n/$1/link" ]; then
-    sed -e 's/#.*//' -e 's|^\([a-z0-9]*\)://[^@]*@\([^?/]*\).*|\1 \2|' "$WORK/n/$1/link" | tr -d '\n'
-    printf ' %s %s\n' "$(sed -n 's/.*[?&]type=\([^&#]*\).*/\1/p' "$WORK/n/$1/link")" \
-      "$(sed -n 's/.*[?&]security=\([^&#]*\).*/\1/p' "$WORK/n/$1/link")"
+    printf 'L %s\n' "$(sed 's/#.*//' "$WORK/n/$1/link" | tr -d '\t\n')"
+  elif _ob=$(jq -cS 'del(.tag)' "$WORK/n/$1/ob.json" 2>/dev/null) && [ -n "$_ob" ]; then
+    printf 'O %s\n' "$_ob"
   else
     echo "node $1"
   fi
@@ -1108,6 +1112,11 @@ cron_line() {
   printf '    %s %s * * * podkop-probe --cron\n\n' "$_mi" "$_h"
 }
 
+# script_ok <file>: a whole podkop-probe (a cut-off download lacks the last line)
+script_ok() {
+  grep -q '^VERSION=' "$1" 2>/dev/null && [ "$(tail -n 1 "$1")" = "# end of podkop-probe" ] && sh -n "$1" 2>/dev/null
+}
+
 # install_self: copy this script to $BIN (download it when run from a pipe)
 install_self() {
   _src=""
@@ -1116,9 +1125,9 @@ install_self() {
     [ "$_src" -ef "$BIN" ] && return 0
     cp "$_src" "$BIN.new" || return 1
   else
-    fetch "$RELEASE_URL" > "$BIN.new" 2>/dev/null
+    fetch "$RELEASE_URL" > "$BIN.new" 2>/dev/null || { rm -f "$BIN.new"; return 1; }
   fi
-  grep -q '^VERSION=' "$BIN.new" 2>/dev/null || { rm -f "$BIN.new"; return 1; }
+  script_ok "$BIN.new" || { rm -f "$BIN.new"; return 1; }
   chmod +x "$BIN.new" && mv "$BIN.new" "$BIN"
   grep -qxF "$BIN" /etc/sysupgrade.conf 2>/dev/null || echo "$BIN" >> /etc/sysupgrade.conf
 }
@@ -1178,7 +1187,7 @@ nightly_setup() {
 # self_update: replace $BIN with the latest release if it differs
 self_update() {
   [ -f "$BIN" ] || return 1
-  fetch "$RELEASE_URL" > "$BIN.new" 2>/dev/null
+  if ! fetch "$RELEASE_URL" > "$BIN.new" 2>/dev/null || ! script_ok "$BIN.new"; then rm -f "$BIN.new"; return 1; fi
   _nv=$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$BIN.new" 2>/dev/null)
   if [ -n "$_nv" ] && awk -v a="$_nv" -v b="$VERSION" 'BEGIN { n = split(a, x, "."); split(b, y, ".")
        for (i = 1; i <= n; i++) if (x[i] + 0 != y[i] + 0) exit !(x[i] + 0 > y[i] + 0); exit 1 }'; then
@@ -1315,19 +1324,30 @@ if [ "$CRON" = 1 ] && [ "$NO_UPDATE" = 0 ] && [ "$0" -ef "$BIN" ] && self_update
 fi
 
 if [ "$CRON" = 1 ]; then
-  mkdir /tmp/podkop-probe.lock 2>/dev/null || { echo "another run is in progress" >&2; exit 1; }
-  trap 'rmdir /tmp/podkop-probe.lock 2>/dev/null' EXIT
+  # the lock holds the run's pid; a run killed with SIGKILL leaves a stale one
+  if ! mkdir /tmp/podkop-probe.lock 2>/dev/null; then
+    _lp=$(cat /tmp/podkop-probe.lock/pid 2>/dev/null)
+    # stale: its run is gone, or it still has no pid a minute after it was made
+    if { [ -n "$_lp" ] && ! kill -0 "$_lp" 2>/dev/null; } ||
+       { [ -z "$_lp" ] && find /tmp/podkop-probe.lock -mmin +1 2>/dev/null | grep -q .; }; then
+      rm -f /tmp/podkop-probe.lock/pid; rmdir /tmp/podkop-probe.lock 2>/dev/null
+    fi
+    mkdir /tmp/podkop-probe.lock 2>/dev/null || { echo "another run is in progress" >&2; exit 1; }
+  fi
+  echo $$ > /tmp/podkop-probe.lock/pid
+  trap 'rm -f /tmp/podkop-probe.lock/pid; rmdir /tmp/podkop-probe.lock 2>/dev/null' EXIT
 fi
 
 cleanup() {
   for _f in "$WORK"/pids/*; do [ -f "$_f" ] && kill "$(cat "$_f")" 2>/dev/null; done
   rm -rf "$WORK"
-  [ "$CRON" = 1 ] && rmdir /tmp/podkop-probe.lock 2>/dev/null
+  [ "$CRON" = 1 ] && rm -f /tmp/podkop-probe.lock/pid && rmdir /tmp/podkop-probe.lock 2>/dev/null
 }
 mkdir -p "$WORK/n" "$WORK/pids" || die "cannot create $WORK"
 
 trap cleanup EXIT
 trap 'echo; warn "interrupted"; exit 130' INT TERM
+trap 'exit 129' HUP   # SSH session closed: nothing to print to, just clean up
 
 if [ "$SUB_INFO" = 1 ]; then
   set -f
@@ -1527,7 +1547,7 @@ if [ "$SPEED" = 1 ]; then
     printf '%s\t%s\t%s\n' "$_md" "$_i" "$(same_key "$_i")" >> "$WORK/speedlist"
   done
   sort -t "$TAB" -k1,1g "$WORK/speedlist" -o "$WORK/speedlist"
-  # one test per server/port/transport; duplicates get its result afterwards
+  # one test per server; duplicates (same link but the name) get its result afterwards
   awk -F "$TAB" '!seen[$3]++ { print $2 }' "$WORK/speedlist" > "$WORK/speed.uniq"
   _ns=$(wc -l < "$WORK/speed.uniq" | tr -d ' ')
   if [ "$_ns" -gt 0 ]; then
@@ -1546,6 +1566,7 @@ if [ "$SPEED" = 1 ]; then
       fi
     fi
     [ "$SPEED_J" -gt "$_ns" ] && SPEED_J=$_ns
+    [ "$SPEED_J" -gt "$_max" ] && SPEED_J=$_max   # ~40 MB of RAM per test
     [ "$VERBOSE" = 1 ] && info "speed test: $_ns server(s), $SPEED_J at a time, until the result is stable (max ${SPEED_T}s)"
     mkfifo "$WORK/ssem" && exec 5<>"$WORK/ssem"
     _k=0; while [ "$_k" -lt "$SPEED_J" ]; do echo >&5; _k=$((_k + 1)); done
@@ -1580,8 +1601,8 @@ fi
 # --- YouTube -----------------------------------------------------------------
 
 # normally the speed test has already checked YouTube on the fast servers;
-# the rest (e.g. with --no-speed) are checked here, 4 at a time, one check
-# per server/port/transport
+# the rest (e.g. with --no-speed) are checked here, up to 4 at a time (fewer
+# with little free RAM), one check per server
 : > "$WORK/ytlist"
 if [ "$YOUTUBE" = 1 ]; then
   _i=0
@@ -1596,7 +1617,8 @@ _ny=$(wc -l < "$WORK/yt.uniq" | tr -d ' ')
 if [ "$_ny" -gt 0 ]; then
   [ "$VERBOSE" = 1 ] && { echo; info "YouTube check: $_ny server(s)"; }
   mkfifo "$WORK/ysem" && exec 6<>"$WORK/ysem"
-  _k=0; while [ "$_k" -lt 4 ]; do echo >&6; _k=$((_k + 1)); done
+  _yj=4; [ "$_yj" -gt "$_max" ] && _yj=$_max
+  _k=0; while [ "$_k" -lt "$_yj" ]; do echo >&6; _k=$((_k + 1)); done
   : > "$WORK/yt.done"
   while IFS= read -r _n; do
     read -r _ <&6
@@ -1929,3 +1951,4 @@ if [ -n "$SUBS" ] && [ "$CRON" = 0 ] && [ -n "$TTY" ] && [ "$ASSUME_YES" = 0 ] &
   fi
 fi
 exit 0
+# end of podkop-probe

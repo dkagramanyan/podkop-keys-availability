@@ -18,6 +18,8 @@ class FakeRouter:
     id = 1
     draft = None
     agent = FakeAgent()
+    status = {"fingerprint": "fp1", "podkop": {"version": "0.7.24"}}
+    row = {"name": "home"}
 
     def snapshot(self):
         return {"id": self.id, "draft": self.draft}
@@ -27,6 +29,16 @@ class FakeHub:
     src = None
     auto_picks = Hub.auto_picks
     usage = Hub.usage
+    load_config = Hub.load_config
+    keep_rules = Hub.keep_rules
+    restore_rules = Hub.restore_rules
+    probe_config = Hub.probe_config
+    _avoided_links = Hub._avoided_links
+
+    async def config(self, rid):
+        return {"fingerprint": "fp1", "config": {"sections": [
+            {"name": "settings", "type": "settings", "options": {"shutdown_correctly": "1"}},
+            {"name": "main", "type": "section", "options": {"connection_type": "proxy", "proxy_config_type": "urltest"}}]}}
 
     def __init__(self, db=None):
         self.db = db
@@ -38,7 +50,7 @@ class FakeHub:
 
     def update_draft(self, rt):
         d = self.db.draft(rt.id)
-        rt.draft = {"changes": 1, "base": d["base"]} if d else None
+        rt.draft = {"changes": 1, "base": d["base"], "updated": d["updated"]} if d else None
 
     async def start(self):
         pass
@@ -179,7 +191,7 @@ def test_auto_rules_api_and_preview_from_last_run(tmp_path):
     from test_podkop import ROWS
     with client(tmp_path, with_router=True) as c:
         c.post("/login", data={"user": "admin", "password": "secret-pass"})
-        assert c.put("/api/routers/1/auto-rules/main", json={"youtube": "ru", "max_ping": 500}, headers=H).json()["youtube"] == "ru"
+        assert c.put("/api/routers/1/auto-rules/main", json={"youtube": "ru", "max_ping": 500}, headers=H).json()["youtube"] == "RU"
         assert c.put("/api/routers/1/auto-rules/bad-name", json={}, headers=H).status_code == 400
         assert c.put("/api/routers/1/auto-rules/netflix", json={"countries": ["Poland"]}, headers=H).status_code == 400
         r = c.put("/api/routers/1/auto-rules/netflix", json={"countries": ["pl"], "protocols": ["vless"], "top": 2,
@@ -217,3 +229,71 @@ def test_keys_api(tmp_path):
         assert c.delete(f"/api/keys/{kid}", headers=H).json() == {"ok": True}
         c.put("/api/routers/1/probe", json={"keys": []}, headers=H)
         assert c.db.keys(1) == []
+
+
+def test_configs_save_export_import_load(tmp_path):
+    from test_configs import UCI
+    from test_podkop import ROWS
+    with client(tmp_path, with_router=True) as c:
+        c.post("/login", data={"user": "admin", "password": "secret-pass"})
+        c.put("/api/routers/1/auto-rules/main", json={"countries": ["PL"], "top": 1, "fallback": 0}, headers=H)
+        saved = c.post("/api/configs", json={"router_id": 1, "name": "now"}, headers=H).json()
+        assert (saved["name"], saved["source"], saved["podkop"], saved["from_probe"]) == ("now", "home", "0.7.24", ["main"])
+        r = c.get(f"/api/configs/{saved['id']}/file")
+        assert "podkop-now.json" in r.headers["content-disposition"]
+        assert "shutdown_correctly" not in r.text and r.json()["rules"]["main"]["countries"] == ["PL"]
+        assert c.post("/api/configs", json={"router_id": 1, "from": "draft"}, headers=H).status_code == 400
+        assert c.post("/api/configs", json={"router_id": "abc"}, headers=H).status_code == 400
+        assert c.post("/api/routers/1/diff", json={"config": "x"}, headers=H).status_code == 400
+        # a file back in: our JSON, and podkop's own UCI
+        again = c.post("/api/configs/import", json={"text": r.text, "file": "podkop-now.json"}, headers=H).json()
+        assert (again["name"], again["source"], again["from_probe"]) == ("now", "file podkop-now.json", ["main"])
+        uci = c.post("/api/configs/import", json={"text": UCI, "file": "podkop"}, headers=H).json()
+        assert (uci["name"], uci["rules"], uci["from_probe"]) == ("podkop", ["main"], [])
+        assert c.post("/api/configs/import", json={"text": "nonsense here"}, headers=H).status_code == 400
+        # loading puts it into the draft; its rules get the last probe's servers
+        c.db.delete_auto_rule(1, "main")
+        run = c.db.add_probe_run(1, "manual")
+        c.db.finish_probe_run(run, "done", {"finished": "2026-10-17T21:00:00Z", "rows": ROWS})
+        assert c.post(f"/api/routers/1/configs/{again['id']}/load", headers=H).json() == {"ok": True}
+        assert c.db.auto_rule(1, "main")["countries"] == ["PL"]
+        main = c.db.draft(1)["config"]["sections"][1]["options"]
+        assert main["urltest_proxy_links"] == [r["link"] for r in ROWS if r["node"] == "PL Fast"]
+        c.post(f"/api/routers/1/configs/{uci['id']}/load", headers=H)     # a UCI file has no probe rules
+        assert c.db.auto_rule(1, "main") is None
+        assert c.put(f"/api/configs/{uci['id']}", json={"name": "lab"}, headers=H).json()["name"] == "lab"
+        assert c.delete(f"/api/configs/{uci['id']}", headers=H).json() == {"ok": True}
+        assert [x["name"] for x in c.get("/api/configs").json()] == ["now", "now"]
+
+
+def test_draft_from_another_tab_is_not_overwritten(tmp_path):
+    with client(tmp_path, with_router=True) as c:
+        c.post("/login", data={"user": "admin", "password": "secret-pass"})
+        cfg = {"sections": [{"name": "settings", "type": "settings", "options": {"a": "1"}}]}
+        rev = c.put("/api/routers/1/draft", json={"config": cfg, "base": "fp1", "rev": None}, headers=H).json()["updated"]
+        # tab B saves on top of the same draft
+        assert c.put("/api/routers/1/draft", json={"config": cfg, "rev": rev}, headers=H).status_code == 200
+        # tab A still holds the old revision: refused, both for a save and for dropping an empty draft
+        assert c.put("/api/routers/1/draft", json={"config": cfg, "rev": rev}, headers=H).status_code == 409
+        assert c.delete(f"/api/routers/1/draft?rev={rev}", headers=H).status_code == 409
+        assert c.put("/api/routers/1/draft", json={"config": cfg, "rev": None}, headers=H).status_code == 409
+
+
+def test_discard_puts_the_probe_rules_back(tmp_path):
+    with client(tmp_path, with_router=True) as c:
+        c.post("/login", data={"user": "admin", "password": "secret-pass"})
+        c.db.set_auto_rule(1, "main", podkop_rule(countries=["DE"]))
+        c.put("/api/routers/1/auto-rules/main", json={"countries": ["PL"]}, headers=H)
+        c.put("/api/routers/1/auto-rules/netflix", json={}, headers=H)
+        c.delete("/api/routers/1/draft", headers=H)                  # a page dropping an empty draft: rules stay
+        assert sorted(r["section"] for r in c.db.auto_rules(1)) == ["main", "netflix"]
+        c.delete("/api/routers/1/draft?discard=1", headers=H)        # Discard: as before the edits
+        assert [(r["section"], r["countries"]) for r in c.db.auto_rules(1)] == [("main", ["DE"])]
+        c.delete("/api/routers/1/auto-rules/main", headers=H)       # a new round of edits snapshots again
+        c.delete("/api/routers/1/draft?discard=1", headers=H)
+        assert [r["section"] for r in c.db.auto_rules(1)] == ["main"]
+
+
+def podkop_rule(**kw):
+    from podkop_manager import podkop
+    return podkop.check_auto_rule(kw)

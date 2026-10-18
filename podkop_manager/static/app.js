@@ -86,7 +86,7 @@ async function api(method, path, body) {
   const data = await r.json().catch(() => ({}));
   if (!r.ok) {
     const e = new Error((data.error && data.error.message) || data.detail || r.statusText);
-    e.info = data.error;
+    e.info = data.error; e.status = r.status;
     throw e;
   }
   return data;
@@ -238,6 +238,7 @@ const SECTIONS = {
   usage: { title: "Keys and usage", view: (m, id) => viewUsage(m, id) },
   rules: { title: "Routing rules", view: (m, id, sub) => viewRules(m, id, sub) },
   global: { title: "Global settings", view: (m, id) => viewGlobal(m, id) },
+  configs: { title: "Configs", view: (m, id) => viewConfigs(m, id) },
   logs: { title: "Logs", view: (m, id) => viewLogs(m, id) },
   history: { title: "History", view: (m, id) => viewHistory(m, id) },
 };
@@ -326,6 +327,7 @@ function drawSide() {
         n ? h("span", { class: "count", title: `${plural(n, "change")} not applied` }, n) : null),
       h("a", { href: `#/r/${rt.id}/rules`, class: "sub", "aria-current": cur("rules") }, "Rules"),
       h("a", { href: `#/r/${rt.id}/global`, class: "sub", "aria-current": cur("global") }, "Global settings"),
+      h("a", { href: `#/r/${rt.id}/configs`, class: "sub", "aria-current": cur("configs") }, "Configs"),
       link("logs", "Logs", "logs"),
       link("history", "History", "history")) : null,
     h("div", { class: "nav nav-bottom" },
@@ -520,6 +522,7 @@ const EVENT_TEXT = {
   applied: (d) => (d.restarted ? "Settings applied, podkop restarted" : "Settings saved, podkop is stopped"),
   reverted: (d) => `Change undone: ${d.reason}`,
   revert_failed: (d) => `Change failed and podkop does not run with the old settings either: ${d.revert_reason}`,
+  apply_interrupted: (d) => d.message || "A change was cut off (reboot?): the old settings are back",
   podkop_down: (d) => `podkop is down${d.failsafe ? ": " + d.failsafe : ""}`,
   podkop_up: () => "podkop is up again",
   recovered: (d) => `Watchdog: ${d.action}`,
@@ -540,7 +543,7 @@ const EVENT_TEXT = {
   usage_move_failed: (d) => `Rules not moved for the traffic limit: ${d.message}`,
 };
 const EVENT_DOT = {
-  applied: "ok", podkop_up: "ok", reverted: "bad", revert_failed: "bad", podkop_down: "bad", recovery_failed: "bad",
+  applied: "ok", podkop_up: "ok", reverted: "bad", revert_failed: "bad", apply_interrupted: "bad", podkop_down: "bad", recovery_failed: "bad",
   recovery_gave_up: "bad", probe_apply_failed: "bad", probe_not_started: "bad", recovered: "warn", pin_dropped: "warn",
   auto_rule_empty: "warn", usage_threshold: "warn", usage_move_failed: "bad",
   pinned: "accent", pin_cleared: "accent", pin_restored: "accent",
@@ -733,7 +736,10 @@ async function viewOverview(main, id) {
   const later = () => { clearTimeout(timer); timer = setTimeout(async () => { await load(); draw(); }, 800); };
   S.view = {
     leave: () => clearTimeout(timer),
-    onRouter: (r) => { if (r.id !== id) return; if (data.config && r.status && r.status.fingerprint !== data.config.fingerprint) later(); else draw(); },
+    onRouter: (r) => {
+      if (r.id !== id) return;
+      if (r.status && (data.config ? r.status.fingerprint !== data.config.fingerprint : r.online)) later(); else draw();
+    },
     onEvent: (m) => m.router_id === id && later(),
     onProbe: (m) => m.router_id === id && m.state !== "running" && later(),
   };
@@ -1296,6 +1302,7 @@ async function loadWork(id) {
     id, orig: cur.config, fp: cur.fingerprint,
     ctx: { lists: cur.community_lists || [], devices: cur.devices || [], interfaces: cur.interfaces || [] },
     config: draft ? draft.config : clone(cur.config), base: draft ? draft.base : cur.fingerprint,
+    rev: draft ? draft.updated : null,     // the draft this page started from, see saveWork
     versions, auto: Object.fromEntries(rules.map((r) => [r.section, r])),
     problems: old && old.problems && draft && same(old.config, draft.config) ? old.problems : null,
     saving: null, redraw: () => {},
@@ -1310,13 +1317,24 @@ async function saveWork(w) {
   clearTimeout(w.saving);
   w.saving = null;
   try {
-    if (workChanges(w).length) await api("PUT", `/api/routers/${w.id}/draft`, { config: w.config, base: w.base });
-    else await api("DELETE", `/api/routers/${w.id}/draft`);
-  } catch (e) { toast(`The draft was not saved: ${e.message}`, true); }
+    if (workChanges(w).length) {
+      const d = await api("PUT", `/api/routers/${w.id}/draft`, { config: w.config, base: w.base, rev: w.rev });
+      w.rev = d ? d.updated : null;
+    } else {
+      await api("DELETE", `/api/routers/${w.id}/draft${w.rev !== null ? `?rev=${w.rev}` : ""}`);
+      w.rev = null;
+    }
+  } catch (e) {
+    if (e.status !== 409) { toast(`The draft was not saved: ${e.message}`, true); return; }
+    // another tab, or "Load into draft", changed it: show that one instead of overwriting it
+    toast("The draft was changed elsewhere; showing that one", true);
+    if (S.work[w.id] === w) { await loadWork(w.id); render(); }
+  }
 }
 
 // after every edit: save the draft a moment later, update the bar
 function touch(w) {
+  if (S.work[w.id] !== w) return;      // left behind by a newer load of the draft: never save it
   w.problems = w.problems ? Object.assign(w.problems, { stale: true }) : null;
   clearTimeout(w.saving);
   w.saving = setTimeout(() => saveWork(w), 500);
@@ -1326,7 +1344,7 @@ function touch(w) {
 async function discardWork(w) {
   clearTimeout(w.saving);
   w.saving = null;
-  await api("DELETE", `/api/routers/${w.id}/draft`);
+  await api("DELETE", `/api/routers/${w.id}/draft?discard=1`);
   await loadWork(w.id);
   render();
 }
@@ -1377,7 +1395,7 @@ function draftBar(w) {
       p.section && rulesOf(w.config).some((s) => s.name === p.section)
         ? h("a", { href: `#/r/${w.id}/rules/${p.section}`, style: "color: inherit; text-decoration: underline" }, problemText(p)) : problemText(p)))) : null);
   };
-  w.drawBar();
+  w.drawBar && w.drawBar();
   return box;
 }
 
@@ -1596,7 +1614,7 @@ async function viewRules(main, id, sub) {
     const rules = rulesOf(w.config);
     return rules.find((s) => s.name === sub) || rules[0] || null;
   };
-  w.redraw = () => keepFocus(() => { drawList(); drawEditor(); w.drawBar(); });
+  w.redraw = () => keepFocus(() => { drawList(); drawEditor(); w.drawBar && w.drawBar(); });
 
   const reorder = (from, to) => {
     const rules = rulesOf(w.config);
@@ -1666,7 +1684,7 @@ async function viewRules(main, id, sub) {
     onRouter: (r) => {
       if (r.id !== id || !r.status) return;
       if (r.status.fingerprint !== w.fp) w.fp = r.status.fingerprint;
-      w.drawBar();
+      w.drawBar && w.drawBar();
     },
     // a probe started or finished: the rules that take its servers read them again
     onProbe: (m) => {
@@ -1884,7 +1902,7 @@ async function toggleAuto(w, s, on) {
   try {
     if (on) {
       w.auto[s.name] = await api("PUT", `/api/routers/${w.id}/auto-rules/${s.name}`, { countries: [], protocols: [], top: 5, fallback: 2,
-        youtube: asList(s.options.community_lists).includes("youtube") ? "ru" : "" });
+        youtube: asList(s.options.community_lists).includes("youtube") ? "RU" : "" });
       const o = s.options;
       o.proxy_config_type = "urltest";
       touch(w);
@@ -1905,7 +1923,7 @@ function autoRuleEditor(w, s, rule) {
   // the preview's servers go into the draft right away, so the rule can be applied now
   const fillDraft = (p) => {
     const links = p.matched.map((m) => m.link), fb = p.fallback.map((m) => m.link);
-    if (!links.length) return;
+    if (!links.length || S.work[w.id] !== w) return;
     const o = s.options;
     if (same(asList(o.urltest_proxy_links), links) && same(asList(o.urltest_fallback_links), fb)) return;
     o.urltest_proxy_links = links;
@@ -1914,10 +1932,12 @@ function autoRuleEditor(w, s, rule) {
     w.redraw();
   };
   const preview = async () => {
-    ui.loading = true; draw();
+    ui.loading = true; keepFocus(draw);
     try { ui.preview = await api("GET", `/api/routers/${w.id}/auto-rules/${s.name}/preview`); fillDraft(ui.preview); }
     catch (e) { toast(e.message, true); }
-    ui.loading = false; draw();
+    ui.loading = false;
+    // fillDraft may have redrawn the editor: then this box is gone and the new one shows the result
+    if (box.isConnected) keepFocus(draw); else if (S.work[w.id] === w) w.redraw();
   };
   const runProbe = async () => {
     try {
@@ -1934,7 +1954,7 @@ function autoRuleEditor(w, s, rule) {
       catch (e) { toast(e.message, true); }
     };
     if (now) go(); else saveTimer = setTimeout(go, 600);
-    draw();
+    keepFocus(draw);
   };
 
   const draw = () => {
@@ -1976,8 +1996,9 @@ function autoRuleEditor(w, s, rule) {
               onclick: () => update({ protocols: rule.protocols.includes(x) ? rule.protocols.filter((y) => y !== x) : [...rule.protocols, x] }, true) }, x))),
           h("label", { for: "ipf", class: "lbl", style: "font-weight: 500; padding-top: 8px" }, "Exit IP"),
           h("div", { class: "ctl" }, h("input", { id: "ipf", class: "input mid mono", style: "max-width: 360px; font-size: 12.5px", "data-k": "auto-ip",
-            placeholder: "Any. Or an IP or subnet, e.g. 203.0.113.0/24", value: rule.exit_ips.join(" "),
-            oninput: (e) => update({ exit_ips: e.target.value.split(/[\s,]+/).filter(Boolean) }) }),
+            placeholder: "Any. Or an IP or subnet, e.g. 203.0.113.0/24", value: ui.ip ?? rule.exit_ips.join(" "),
+            oninput: (e) => { ui.ip = e.target.value; update({ exit_ips: e.target.value.split(/[\s,]+/).filter(Boolean) }); },
+            onblur: () => { ui.ip = null; } }),
           h("span", { class: "help" }, "Several, separated by spaces")),
           h("label", { for: "namef", class: "lbl", style: "font-weight: 500; padding-top: 8px" }, "Name contains"),
           h("div", { class: "ctl" }, h("input", { id: "namef", class: "input mid", style: "max-width: 360px", "data-k": "auto-name", placeholder: "Any, e.g. Warsaw",
@@ -2002,9 +2023,17 @@ function autoRuleEditor(w, s, rule) {
             h("input", { id: "mins", class: "input mid", style: "width: 56px", inputmode: "numeric", "data-k": "auto-speed", value: rule.min_speed,
               oninput: (e) => { const n = parseFloat(e.target.value); if (n >= 0) update({ min_speed: n }); } }),
             h("span", {}, "Mbit/s")),
-          h("span", { class: "lbl", style: "font-weight: 500; padding-top: 6px" }, "YouTube"),
-          seg([["", "Not needed"], ["plays", "Plays"], ["ru", "Sees Russia, no ads"]], rule.youtube, (v) => update({ youtube: v }, true),
-            { small: true, label: "YouTube" }))),
+          h("label", { for: "ytr", class: "lbl", style: "font-weight: 500; padding-top: 8px" }, "YouTube region"),
+          h("div", { class: "ctl" },
+            h("select", { id: "ytr", class: "input mid", style: "width: auto", onchange: (e) => {
+              let v = e.target.value;
+              if (v === "?") v = (prompt("Two-letter country code YouTube must detect, e.g. RU") || "").trim().toUpperCase();
+              if (v === "" || v === "plays" || /^[A-Z]{2}$/.test(v)) update({ youtube: v }, true); else draw();
+            } },
+            [["", "Not checked"], ["plays", "Any, video plays"],
+              ...[...new Set(["RU", ...seen, ...(/^[A-Z]{2}$/.test(rule.youtube) ? [rule.youtube] : [])])].map((c) => [c, `${c}, ${countryName(c)}${c === "RU" ? ", no ads" : ""}`]),
+              ["?", "Other…"]].map(([v, t]) => h("option", { value: v, selected: v === rule.youtube }, t))),
+            h("span", { class: "help" }, "The country YouTube detects through the server")))),
       h("div", { class: "servers" },
         h("div", { class: "part-head", style: "padding: 12px 14px" },
           h("div", { class: "col", style: "gap: 2px" },
@@ -2031,7 +2060,9 @@ function autoRuleEditor(w, s, rule) {
           h("span", { class: "warn-text", style: "flex: none" }, "!"),
           h("span", { class: "xs", style: "color: var(--warn-deep); line-height: 1.5" }, matched.length
             ? `Only ${matched.length} match, so podkop gets ${matched.length === 1 ? "this one" : `these ${matched.length}`} and no fallback. Add a country or another protocol for more. If none match after a run, the rule keeps its last list and you get a warning.`
-            : "No server matches now. Widen the filter, or run the probe. If none match after a run, the rule keeps its last list and you get a warning.")) : null,
+            : rule.countries.length && seen.length && !rule.countries.some((c) => seen.includes(c))
+              ? `No tested server exits in ${countriesText(rule.countries)}. Exits seen: ${seen.join(", ")}.`
+              : "No server matches now. Widen the filter, or run the probe. If none match after a run, the rule keeps its last list and you get a warning.")) : null,
         p && p.left_out.length ? h("details", { style: "border-top: 1px solid var(--line-soft)" },
           h("summary", { style: "padding: 10px 14px; font-size: 13px; font-weight: 500" }, icon("right", 14, { width: 1.6, class: "chev" }),
             `${plural(p.left_out.length, "server")}${rule.countries.length === 1 ? ` in ${countryName(rule.countries[0])}` : ""} left out, and why`),
@@ -2150,7 +2181,7 @@ async function viewGlobal(main, id) {
           h("label", { class: "check" }, h("input", { type: "checkbox", checked: !!probe.auto_apply, onchange: (e) => saveProbe({ auto_apply: e.target.checked }) }),
             h("span", {}, "Apply the result by itself"))) : null),
       settingsOther(o, defs));
-    w.drawBar();
+    w.drawBar && w.drawBar();
   };
 
   draw();
@@ -2162,6 +2193,82 @@ function settingsOther(o, defs) {
   const other = Object.keys(o).filter((k) => !known.has(k));
   return h("p", { class: "small muted" }, "Other options are kept as they are",
     other.length ? `: ${other.join(", ")}.` : ".");
+}
+
+// --- saved configs: archive, export, import -------------------------------------------------------------------
+
+async function viewConfigs(main, id) {
+  const page = h("div", { class: "page" });
+  put(main, page);
+  let list = [];
+  const load = async () => { list = await api("GET", "/api/configs"); };
+  const run = async (fn, ok) => {
+    try { await fn(); if (ok) toast(ok); await load(); draw(); } catch (e) { toast(e.message, true); }
+  };
+
+  const fileInput = h("input", { type: "file", hidden: true, onchange: async (e) => {
+    const file = e.target.files[0];
+    e.target.value = "";
+    if (file) run(async () => api("POST", "/api/configs/import", { text: await file.text(), file: file.name }), `Imported ${file.name}`);
+  } });
+
+  const confirm = (title, text, label, cls, go) => {
+    const m = modal({ title, narrow: true, body: h("p", { class: "small" }, text),
+      foot: [h("span"), h("div", { class: "row" }, h("button", { type: "button", class: "btn", onclick: () => m.close() }, "Cancel"),
+        h("button", { type: "button", class: `btn ${cls}`, onclick: () => { m.close(); go(); } }, label))] });
+  };
+
+  const rename = (c) => {
+    const input = h("input", { class: "input", id: "cfg-name", value: c.name });
+    const save = () => { m.close(); run(() => api("PUT", `/api/configs/${c.id}`, { name: input.value })); };
+    input.onkeydown = (e) => { if (e.key === "Enter") save(); };
+    const m = modal({ title: "Rename config", narrow: true, body: h("div", { class: "field" }, h("label", { for: "cfg-name" }, "Name"), input),
+      foot: [h("span"), h("div", { class: "row" }, h("button", { type: "button", class: "btn", onclick: () => m.close() }, "Cancel"),
+        h("button", { type: "button", class: "btn primary", onclick: save }, "Rename"))] });
+    input.select();
+  };
+
+  const loadInto = (c) => {
+    const rt = S.routers[id];
+    confirm(`Load ${c.name}?`, `It becomes the draft of ${rt.name}${draftChanges(rt) ? ", replacing the draft you have" : ""}. Rules that take links from probe get the last probe's servers. Nothing changes on the router until you apply.`,
+      "Load into draft", "primary", async () => {
+        try { await api("POST", `/api/routers/${id}/configs/${c.id}/load`); location.hash = `#/r/${id}/rules`; }
+        catch (e) { toast(e.message, true); }
+      });
+  };
+
+  const draw = () => {
+    const rt = S.routers[id];
+    if (!rt) return;
+    put(page,
+      pageHead("Configs", "podkop's settings with each rule's probe parameters",
+        h("button", { type: "button", class: "btn", onclick: () => fileInput.click() }, "Import file"),
+        draftChanges(rt) ? h("button", { type: "button", class: "btn", onclick: () => run(() => api("POST", "/api/configs", { router_id: id, from: "draft" }), "Draft saved") }, "Save draft") : null,
+        h("button", { type: "button", class: "btn primary", disabled: !rt.online,
+          onclick: () => run(() => api("POST", "/api/configs", { router_id: id }), "Saved") }, `Save ${rt.name}'s config`)),
+      fileInput,
+      h("section", { class: "card clip", "aria-label": "Saved configs" },
+        list.length ? h("div", { class: "scroll-x" }, h("table", { class: "wide" },
+          h("tr", {}, h("th", { scope: "col" }, "Name"), h("th", { scope: "col" }, "From"), h("th", { scope: "col" }, "Saved"),
+            h("th", { scope: "col" }, "Rules"), h("th", { scope: "col", class: "r" }, h("span", { class: "sr" }, "Actions"))),
+          list.map((c) => h("tr", {},
+            h("td", { style: "font-weight: 500" }, c.name),
+            h("td", { style: "color: var(--text-2)" }, c.source, c.podkop ? h("span", { class: "xs muted" }, ` · podkop ${c.podkop}`) : null),
+            h("td", { class: "num nowrap", style: "color: var(--text-2)" }, shortWhen(c.t)),
+            h("td", { style: "color: var(--text-2)" }, c.rules.join(", ") || "–",
+              c.from_probe.length ? h("span", { class: "xs muted" }, ` · ${c.from_probe.length} from probe`) : null),
+            h("td", { class: "r nowrap" }, h("span", { class: "row", style: "gap: 6px; justify-content: flex-end; flex-wrap: nowrap" },
+              h("button", { type: "button", class: "btn xs", onclick: () => loadInto(c) }, "Load into draft"),
+              h("a", { class: "btn xs", href: `/api/configs/${c.id}/file`, download: "" }, "Download"),
+              h("button", { type: "button", class: "btn xs", onclick: () => rename(c) }, "Rename"),
+              h("button", { type: "button", class: "btn xs danger", onclick: () => confirm(`Delete ${c.name}?`, "The saved config goes away; routers keep what they run.",
+                "Delete", "danger", () => run(() => api("DELETE", `/api/configs/${c.id}`), "Deleted")) }, "Delete")))))))
+          : h("p", { class: "empty" }, "No saved configs. Save this router's config, or import a file: one downloaded here, or podkop's /etc/config/podkop.")));
+  };
+
+  await load();
+  draw();
+  S.view = { onRouter: (r) => { if (r.id === id) draw(); } };
 }
 
 // --- review and apply ------------------------------------------------------------------------------------
@@ -2443,6 +2550,27 @@ async function viewSettings(main) {
     h("span", { class: "help" }, "Port 9090 is closed to the rest of the LAN")),
   addOut, h("div", {}, addBtn));
 
+  const restore = () => {
+    const file = h("input", { type: "file", id: "bak-file", class: "input", accept: ".gz,.tgz,application/gzip" });
+    const out = h("div");
+    const go = h("button", { type: "button", class: "btn danger" }, "Restore");
+    go.onclick = async () => {
+      const f = file.files[0];
+      if (!f) { file.focus(); return; }
+      go.disabled = true; put(out, h("p", { class: "small muted" }, "Restoring…"));
+      try {
+        const r = await fetch("/api/backup", { method: "POST", headers: { "X-Podkop-Manager": "1", "Content-Type": "application/gzip" }, body: f });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.detail || r.statusText);
+        location.hash = "#/"; location.reload();
+      } catch (e) { put(out, h("p", { class: "problem-box" }, e.message)); go.disabled = false; }
+    };
+    const m = modal({ title: "Restore a backup?", narrow: true,
+      body: [h("p", { class: "small" }, "Everything in this manager is replaced by the backup: routers, keys, rules, configs, history and the SSH key."),
+        h("div", { class: "field" }, h("label", { for: "bak-file" }, "Backup file"), file), out],
+      foot: [h("span"), h("div", { class: "row" }, h("button", { type: "button", class: "btn", onclick: () => m.close() }, "Cancel"), go)] });
+  };
+
   const draw = () => {
     const list = routerList();
     put(page,
@@ -2480,7 +2608,13 @@ async function viewSettings(main) {
           h("h2", { id: "s-acc" }, "Login"),
           h("span", { class: "small muted" }, "Login and password are set in .env (PODKOP_MANAGER_USER, PODKOP_MANAGER_PASSWORD)"),
           h("div", { class: "row" },
-            h("form", { method: "post", action: "/logout", style: "display: contents" }, h("button", { type: "submit", class: "btn" }, "Log out"))))));
+            h("form", { method: "post", action: "/logout", style: "display: contents" }, h("button", { type: "submit", class: "btn" }, "Log out")))),
+        h("section", { class: "card pad", "aria-labelledby": "s-bak", style: "gap: 12px" },
+          h("h2", { id: "s-bak" }, "Backup"),
+          h("span", { class: "small muted" }, "Everything in one file: routers, keys, rules, configs, history and the SSH key. Keep it private."),
+          h("div", { class: "row" },
+            h("a", { class: "btn", href: "/api/backup", download: "" }, "Download backup"),
+            h("button", { type: "button", class: "btn", onclick: restore }, "Restore…")))));
   };
 
   draw();
@@ -2502,7 +2636,13 @@ function connect() {
     S.view && S.view.onLive && S.view.onLive();
   };
   es.onopen = () => live(true);
-  es.onerror = () => live(false);
+  es.onerror = () => {
+    live(false);
+    // a 401 or a proxy error closes it for good: check the login, then connect again
+    if (es.readyState === EventSource.CLOSED) {
+      setTimeout(() => api("GET", "/api/manager").then(connect).catch(() => setTimeout(connect, 10000)), 3000);
+    }
+  };
   es.onmessage = (e) => {
     const m = JSON.parse(e.data);
     const v = S.view || {};
@@ -2512,7 +2652,7 @@ function connect() {
       v.onRouter && v.onRouter(m.router);
     } else if (m.type === "event") {
       v.onEvent && v.onEvent(m);
-      if (["reverted", "revert_failed", "podkop_down", "recovery_failed"].includes(m.event)) {
+      if (["reverted", "revert_failed", "apply_interrupted", "podkop_down", "recovery_failed"].includes(m.event)) {
         toast(`${(S.routers[m.router_id] || {}).name}: ${eventText(m.event, m.data)}`, true);
       }
     } else if (m.type === "log") v.onLog && v.onLog(m);

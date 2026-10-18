@@ -10,14 +10,15 @@ import hmac
 import json
 import re
 import secrets
+import time
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import __version__, podkop
+from . import __version__, backup, configs, podkop
 from .agent import AgentError, install
 from .db import DB
 from .hub import Hub
@@ -56,6 +57,8 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
         secret = secrets.token_hex(32)
         db.set_setting("session_secret", secret)
     password_hash = hash_password(password)
+    keys = {"public": public_key}     # replaced when a backup is restored
+    restoring = asyncio.Lock()
     # a new password logs everyone out
     secret += hashlib.sha256(f"{username}\n{password}".encode()).hexdigest()
     app.add_middleware(SessionMiddleware, secret_key=secret, session_cookie="podkop_manager",
@@ -71,6 +74,12 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
         # a page from another site can't add this header to its requests
         if request.method not in ("GET", "HEAD") and request.headers.get("x-podkop-manager") != "1":
             raise HTTPException(403, "missing request header")
+
+    def config_of(body: dict) -> dict:
+        cfg = body.get("config") if isinstance(body, dict) else None
+        if not isinstance(cfg, dict) or not isinstance(cfg.get("sections"), list):
+            raise HTTPException(400, "expected {\"config\": {\"sections\": [...]}}")
+        return cfg
 
     def router_or_404(rid: int):
         try:
@@ -95,7 +104,8 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
     async def login(request: Request):
         form = await request.form()
         name_ok = hmac.compare_digest(str(form.get("user", "")).strip().encode(), username.encode())
-        if check_password(str(form.get("password", "")), password_hash) and name_ok:
+        # the slow hash runs off the event loop, so guessing can't stall the live updates
+        if await asyncio.to_thread(check_password, str(form.get("password", "")), password_hash) and name_ok:
             request.session["auth"] = True
             return RedirectResponse("/", status_code=303)
         await asyncio.sleep(1)
@@ -111,7 +121,7 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
 
     @app.get("/api/manager", dependencies=[api])
     async def manager_info():
-        return {"version": __version__, "public_key": public_key, "router_password": bool(router_password)}
+        return {"version": __version__, "public_key": keys["public"], "router_password": bool(router_password)}
 
     @app.get("/api/schema", dependencies=[api])
     async def schema():
@@ -128,7 +138,7 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
             raise HTTPException(400, "host is required")
         port = int(body.get("port") or 22)
         allow = [x.strip() for x in str(body.get("allow_clash", "")).replace(",", " ").split() if x.strip()]
-        host_key = await install(host, port, str(body.get("password") or router_password), public_key, hub.src, allow)
+        host_key = await install(host, port, str(body.get("password") or router_password), keys["public"], hub.src, allow)
         rid = db.add_router(str(body.get("name") or host), host, port, host_key)
         hub.add_router(db.router(rid))
         return {"id": rid}
@@ -137,7 +147,7 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
     async def reinstall(rid: int, body: dict):
         rt = router_or_404(rid)
         allow = [x.strip() for x in str(body.get("allow_clash", "")).replace(",", " ").split() if x.strip()]
-        host_key = await install(rt.row["host"], rt.row["port"], str(body.get("password") or router_password), public_key,
+        host_key = await install(rt.row["host"], rt.row["port"], str(body.get("password") or router_password), keys["public"],
                                  hub.src, allow)
         if host_key != rt.row["host_key"]:
             raise HTTPException(400, "the router's host key changed; remove and add the router again")
@@ -179,12 +189,14 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
     @app.post("/api/routers/{rid}/diff", dependencies=[api])
     async def diff(rid: int, body: dict):
         router_or_404(rid)
-        return await hub.diff(rid, body["config"])
+        cfg = config_of(body)
+        return await hub.diff(rid, cfg)
 
     @app.post("/api/routers/{rid}/validate", dependencies=[api])
     async def validate(rid: int, body: dict):
         router_or_404(rid)
-        return {"problems": await hub.validate(rid, body["config"])}
+        cfg = config_of(body)
+        return {"problems": await hub.validate(rid, cfg)}
 
     @app.post("/api/routers/{rid}/apply", dependencies=[api])
     async def apply(rid: int, body: dict):
@@ -192,7 +204,7 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
         trigger = str(body.get("trigger") or "web")
         if trigger not in ("web", "restore", "probe"):
             raise HTTPException(400, "trigger must be web, restore or probe")
-        return await hub.apply(rid, str(body.get("base", "")), body["config"], str(body.get("note", "")), trigger)
+        return await hub.apply(rid, str(body.get("base", "")), config_of(body), str(body.get("note", "")), trigger)
 
     @app.get("/api/routers/{rid}/versions", dependencies=[api])
     async def versions(rid: int, limit: int = 30, before: int | None = None):
@@ -212,14 +224,23 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
         cfg = body.get("config")
         if not isinstance(cfg, dict) or not isinstance(cfg.get("sections"), list):
             raise HTTPException(400, "expected {\"config\": {\"sections\": [...]}, \"base\": ...}")
+        # the draft the page started from: another tab, or "Load into draft", may have changed it since
+        if "rev" in body and body["rev"] != ((db.draft(rid) or {}).get("updated")):
+            raise HTTPException(409, "the draft was changed elsewhere")
         db.set_draft(rid, cfg, str(body.get("base", "")))
         hub.update_draft(rt)
         hub.publish({"type": "router", "router": rt.snapshot()})
         return rt.draft
 
     @app.delete("/api/routers/{rid}/draft", dependencies=[api])
-    async def delete_draft(rid: int):
+    async def delete_draft(rid: int, discard: bool = False, rev: float | None = None):
+        """discard: the user threw the draft away, so the probe rules go back
+        too; rev: delete only the draft the page started from."""
         rt = router_or_404(rid)
+        if rev is not None and rev != ((db.draft(rid) or {}).get("updated")):
+            raise HTTPException(409, "the draft was changed elsewhere")
+        if discard:
+            hub.restore_rules(rid)
         db.delete_draft(rid)
         hub.update_draft(rt)
         hub.publish({"type": "router", "router": rt.snapshot()})
@@ -443,12 +464,14 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
             rule = podkop.check_auto_rule(body)
         except ValueError as e:
             raise HTTPException(400, str(e)) from None
+        hub.keep_rules(rid)
         db.set_auto_rule(rid, section, rule)
         return db.auto_rule(rid, section)
 
     @app.delete("/api/routers/{rid}/auto-rules/{section}", dependencies=[api])
     async def delete_auto_rule(rid: int, section: str):
         router_or_404(rid)
+        hub.keep_rules(rid)
         db.delete_auto_rule(rid, section)
         return {"ok": True}
 
@@ -477,6 +500,117 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
                 "countries": sorted({r["country"] for r in st.get("rows") or [] if len(r.get("country") or "") == 2}),
                 "matched": pick["matched"], "fallback": pick["fallback_rows"],
                 "left_out": pick["left_out"]}
+
+    # --- saved configs: archive, export, import -------------------------------------------
+    def config_or_404(cid: int) -> dict:
+        c = db.saved_config(cid)
+        if not c:
+            raise HTTPException(404, "no such config")
+        return c
+
+    def config_row(c: dict) -> dict:
+        rules = [s for s in c["config"]["sections"] if s["type"] == "section"]
+        return {k: c[k] for k in ("id", "name", "t", "source", "podkop")} | {
+            "rules": [s["name"] for s in rules], "from_probe": sorted(c["rules"])}
+
+    def config_name(name, fallback: str) -> str:
+        name = str(name or "").strip()[:80]
+        return name or fallback
+
+    @app.get("/api/configs", dependencies=[api])
+    async def saved_configs():
+        return [config_row(c) for c in db.configs()]
+
+    @app.post("/api/configs", dependencies=[api])
+    async def save_config(body: dict):
+        """Saves a router's running config ("from": "router") or its draft."""
+        try:
+            rt = router_or_404(int(body.get("router_id") or 0))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "router_id is a number") from None
+        if body.get("from") == "draft":
+            d = db.draft(rt.id)
+            if not d:
+                raise HTTPException(400, "this router has no draft")
+            config, source = d["config"], f"{rt.row['name']}, draft"
+        else:
+            config, source = (await hub.config(rt.id))["config"], rt.row["name"]
+        try:
+            config = configs.check_config(config)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+        names = {s["name"] for s in config["sections"]}
+        rules = {r["section"]: podkop.check_auto_rule(r) for r in db.auto_rules(rt.id) if r["section"] in names}
+        version = (((rt.status or {}).get("podkop")) or {}).get("version") or ""
+        cid = db.add_config(config_name(body.get("name"), f"{source} {time.strftime('%Y-%m-%d %H:%M')}"),
+                            config, rules, source, version)
+        return config_row(config_or_404(cid))
+
+    @app.post("/api/configs/import", dependencies=[api])
+    async def import_config(body: dict):
+        """A file's text: our JSON export or podkop's /etc/config/podkop."""
+        try:
+            f = configs.read(str(body.get("text") or ""))
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+        file = str(body.get("file") or "").strip()[:120]
+        cid = db.add_config(config_name(body.get("name") or f["name"], file or "Imported"),
+                            f["config"], f["rules"], f"file {file}".strip(), f["podkop"])
+        return config_row(config_or_404(cid))
+
+    @app.get("/api/configs/{cid}/file", dependencies=[api])
+    async def export_config(cid: int):
+        c = config_or_404(cid)
+        data = configs.to_file(c["name"], c["config"], c["rules"], c["podkop"])
+        fname = re.sub(r"[^A-Za-z0-9_.-]+", "-", c["name"]).strip("-")[:60] or "config"
+        return Response(json.dumps(data, ensure_ascii=False, indent=1), media_type="application/json",
+                        headers={"Content-Disposition": f'attachment; filename="podkop-{fname}.json"'})
+
+    @app.put("/api/configs/{cid}", dependencies=[api])
+    async def rename_config(cid: int, body: dict):
+        c = config_or_404(cid)
+        db.rename_config(cid, config_name(body.get("name"), c["name"]))
+        return config_row(config_or_404(cid))
+
+    @app.delete("/api/configs/{cid}", dependencies=[api])
+    async def delete_config(cid: int):
+        config_or_404(cid)
+        db.delete_config(cid)
+        return {"ok": True}
+
+    @app.post("/api/routers/{rid}/configs/{cid}/load", dependencies=[api])
+    async def load_config(rid: int, cid: int):
+        """Puts a saved config into the router's draft, to review and apply."""
+        router_or_404(rid)
+        hub.load_config(rid, config_or_404(cid))
+        return {"ok": True}
+
+    # --- the whole manager: backup and restore ---------------------------------------------
+    @app.get("/api/backup", dependencies=[api])
+    async def get_backup():
+        data = await asyncio.to_thread(backup.make, db, hub.key)
+        return Response(data, media_type="application/gzip", headers={
+            "Content-Disposition": f'attachment; filename="podkop-manager-{time.strftime("%Y%m%d-%H%M")}.tar.gz"'})
+
+    @app.post("/api/backup", dependencies=[api])
+    async def restore_backup(request: Request):
+        """Replaces everything with a backup; the routers reconnect with its key."""
+        if restoring.locked():
+            raise HTTPException(409, "a restore is already running")
+        data = bytearray()
+        async for chunk in request.stream():
+            data += chunk
+            if len(data) > backup.MAX_SIZE:
+                raise HTTPException(400, "the file is too big for a backup")
+        async with restoring:
+            await hub.stop()
+            try:
+                keys["public"] = await asyncio.to_thread(backup.restore, db, hub.key, bytes(data))
+            except ValueError as e:
+                raise HTTPException(400, str(e)) from None
+            finally:
+                await hub.start()
+        return {"ok": True, "routers": len(hub.routers)}
 
     # --- live stream --------------------------------------------------------------------
     @app.get("/api/stream", dependencies=[api])
