@@ -3,6 +3,19 @@
 Versions are podkop-probe's (`probe.sh`); a release also carries
 podkop-agent and podkop-manager.
 
+## 1.17.0 — 2026-10-18
+
+- Manager 0.7.0: every rule, main and youtube included, can take its servers
+  from the probe, each with its own filter (countries, protocols, exit IP,
+  name), how many to keep, ping and speed limits, and a YouTube requirement
+  (plays, or sees Russia without ads). The probe's own main and YouTube
+  lists are gone; existing ones turn into such rules with the same limits.
+- Servers probe keeps what to test (countries, quick run), the schedule and
+  auto-apply; the probe tests with the loosest limits of the rules.
+- Keys are added and removed under **Keys and usage** (subscriptions and
+  single links); Servers probe only lists them.
+- Login name: `PODKOP_MANAGER_USER` in `.env` (default `admin`).
+
 ## 1.16.0 — 2026-10-18
 
 - Manager 0.6.0: new page **Keys and usage**. For each key: used today

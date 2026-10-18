@@ -12,10 +12,14 @@
 <form method="post" action="/login" class="card login-card">
   <h1>podkop-manager</h1>
   <div class="field">
-    <label for="pw">Password</label>
-    <input class="input" id="pw" type="password" name="password" autofocus required autocomplete="current-password">
+    <label for="user">Login</label>
+    <input class="input" id="user" name="user" autofocus required autocomplete="username" autocapitalize="none">
   </div>
-  <p class="bad-text small" id="bad" hidden>Wrong password</p>
+  <div class="field">
+    <label for="pw">Password</label>
+    <input class="input" id="pw" type="password" name="password" required autocomplete="current-password">
+  </div>
+  <p class="bad-text small" id="bad" hidden>Wrong login or password</p>
   <button type="submit" class="btn primary lg">Log in</button>
 </form>
 <script>if (location.search.includes("bad=1")) document.getElementById("bad").hidden = false;</script>
