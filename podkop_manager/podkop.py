@@ -323,6 +323,25 @@ def _ip_in(ip: str, nets: list) -> bool:
 
 
 # what a rule needs from YouTube: nothing, that videos play, that YouTube
+# TLS fingerprints without an X25519MLKEM768 key share: REALITY servers since
+# Xray-core v26.9.8 reject them (sing-box warns "uTLS fingerprint qq carries no ...")
+OLD_FINGERPRINTS = ("qq", "360", "ios", "android", "edge")
+_FP = re.compile(r"([?&]fp=)(" + "|".join(OLD_FINGERPRINTS) + r")(?=[&#]|$)")
+
+
+def old_fingerprint(link: str) -> bool:
+    head = link.split("#", 1)[0]
+    return "security=reality" in head and bool(_FP.search(head))
+
+
+def fix_fingerprint(link: str) -> str:
+    """A REALITY link with fp=chrome instead of a fingerprint new servers reject."""
+    if not old_fingerprint(link):
+        return link
+    head, sep, name = link.partition("#")
+    return _FP.sub(r"\1chrome", head) + sep + name
+
+
 # podkop-probe's "europe" (EUROPE in router/probe.sh)
 EUROPE = ("EU AD AL AT BA BE BG CH CY CZ DE DK EE ES FI FR GB GR HR HU IE IS IT LI LT LU LV MC MD ME MK MT NL NO PL PT RO RS "
           "SE SI SK SM UA VA XK").split()
@@ -461,9 +480,12 @@ def parse_log(line: str) -> dict:
     if lm:
         level = LEVELS.get((lm.group(1) or lm.group(2)).lower(), "info")
         msg = msg[lm.end():]
+    elif tag == "sing-box" or tag == "podkop" or (tag == "crond" and msg.startswith("USER ")):
+        # stderr says nothing: sing-box writes everything there, podkop's own messages carry
+        # a [level] and the rest is its tools' progress (wget), crond logs every job start as err
+        level = "info"
     else:
-        # sing-box writes everything to stderr, so its priority says nothing
-        level = "info" if tag == "sing-box" else LEVELS.get(prio, "info")
+        level = LEVELS.get(prio, "info")
     low = tag.lower()
     if "engine" in low or "failsafe" in low or (tag == "sing-box" and "failsafe" in msg.lower()):
         source = "engine"

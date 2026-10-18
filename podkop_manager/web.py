@@ -138,9 +138,14 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
             raise HTTPException(400, "host is required")
         port = int(body.get("port") or 22)
         allow = [x.strip() for x in str(body.get("allow_clash", "")).replace(",", " ").split() if x.strip()]
-        host_key = await install(host, port, str(body.get("password") or router_password), keys["public"], hub.src, allow)
+        host_key = await install(host, port, str(body.get("password") or router_password), keys["public"], hub.src, allow,
+                                 body.get("close_clash", True) is not False)
         rid = db.add_router(str(body.get("name") or host), host, port, host_key)
         hub.add_router(db.router(rid))
+        # podkop as it is: kept in Configs, and the probe it runs by itself taken into Keys and rules
+        task = asyncio.create_task(hub.import_found(rid))
+        hub.jobs.add(task)
+        task.add_done_callback(hub.jobs.discard)
         return {"id": rid}
 
     @app.post("/api/routers/{rid}/reinstall", dependencies=[api])
@@ -148,7 +153,7 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
         rt = router_or_404(rid)
         allow = [x.strip() for x in str(body.get("allow_clash", "")).replace(",", " ").split() if x.strip()]
         host_key = await install(rt.row["host"], rt.row["port"], str(body.get("password") or router_password), keys["public"],
-                                 hub.src, allow)
+                                 hub.src, allow, body.get("close_clash", True) is not False)
         if host_key != rt.row["host_key"]:
             raise HTTPException(400, "the router's host key changed; remove and add the router again")
         await hub.refresh(rt)
@@ -333,6 +338,8 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
             fields["schedule"] = s
         if "auto_apply" in body:
             fields["auto_apply"] = 1 if body["auto_apply"] else 0
+        if "fix_fingerprint" in body:
+            fields["fix_fingerprint"] = 1 if body["fix_fingerprint"] else 0
         for k in ("main_section", "youtube_section"):
             if k in body:
                 fields[k] = str(body[k]).strip()
@@ -424,6 +431,12 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
         else:
             db.delete_key(kid)
         return {"ok": True}
+
+    @app.post("/api/routers/{rid}/probe/take-over", dependencies=[api])
+    async def probe_take_over(rid: int):
+        """podkop-probe ran by itself on the router (cron): the manager runs it
+        from now on, at the same time, applying the result like it did."""
+        return await hub.take_over_probe(router_or_404(rid))
 
     @app.post("/api/routers/{rid}/probe/start", dependencies=[api])
     async def probe_start(rid: int):

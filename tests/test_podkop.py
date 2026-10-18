@@ -69,6 +69,12 @@ def test_parse_log_sources_and_levels():
     p = podkop.parse_log("Sat Oct 17 23:18:48 2026 daemon.err sing-box[14682]: WARN[0000] outbound/vless[a-1-out]: slow")
     assert (p["source"], p["level"], p["msg"]) == ("sing-box", "warn", "outbound/vless[a-1-out]: slow")
     # sing-box writes to stderr, so daemon.err alone is not an error
+    p = podkop.parse_log("Sat Oct 18 16:08:03 2026 daemon.err podkop[1]: Connecting to 198.18.0.4:443")
+    assert (p["source"], p["level"]) == ("podkop", "info")              # wget's progress, not an error
+    p = podkop.parse_log("Sat Oct 18 09:13:00 2026 cron.err crond[1]: USER root pid 17803 cmd /usr/bin/podkop list_update")
+    assert p["level"] == "info"
+    p = podkop.parse_log("Sat Oct 18 09:13:00 2026 cron.err crond[1]: can't open crontab")
+    assert p["level"] == "error"
     p = podkop.parse_log("Sat Oct 17 23:18:48 2026 daemon.err sing-box[14682]: started")
     assert p["level"] == "info"
     p = podkop.parse_log("Sat Oct  4 03:00:01 2026 user.notice podkop-agent: apply 20261004-1")
@@ -150,3 +156,12 @@ def test_merge_probe_only_existing_sections():
     out = podkop.merge_probe(base, {"netflix": {"links": ["vless://a"], "fallback": []},
                                     "gone": {"links": ["vless://b"], "fallback": []}})
     assert out["sections"][1]["options"]["urltest_proxy_links"] == ["vless://a"] and len(out["sections"]) == 2
+
+
+def test_fix_fingerprint():
+    f = podkop.fix_fingerprint
+    assert f("vless://u@h:443?security=reality&fp=qq&pbk=x#DE fp=qq") == "vless://u@h:443?security=reality&fp=chrome&pbk=x#DE fp=qq"
+    assert f("vless://u@h:443?fp=360&security=reality") == "vless://u@h:443?fp=chrome&security=reality"
+    for same in ("vless://u@h:443?security=reality&fp=chrome#A", "vless://u@h:443?security=tls&fp=qq#A",
+                 "vless://u@h:443?security=reality&fp=qqx#A", "trojan://p@h:443#A"):
+        assert f(same) == same

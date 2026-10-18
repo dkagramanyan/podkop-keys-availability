@@ -3,6 +3,31 @@
 Versions are podkop-probe's (`probe.sh`); a release also carries
 podkop-agent and podkop-manager.
 
+## 1.20.0 — 2026-10-18
+
+- Manager 0.10.0: adding a router that already runs podkop changes nothing in
+  podkop:
+  - its settings are saved in **Configs** ("as found");
+  - the subscriptions of a podkop-probe that runs there by itself go into
+    **Keys and usage**;
+  - its main and YouTube lists become rules that take links from the probe,
+    with the same countries and limits.
+  - Overview says when that podkop-probe still runs by itself every night.
+    **Let the manager run it** turns its cron line off and runs the probe from
+    the manager at the same time.
+- **Add router** and **Reinstall agent** can leave the firewall as it is
+  (Clash API stays open to the LAN).
+- **Without podkop-engine:** the agent installs, reads and applies settings.
+  Overview says the probe can't run there.
+- **TLS fingerprint:** a switch in Global settings → Nightly probe gives REALITY
+  links with fp=qq, 360, ios, android or edge (rejected by servers since
+  Xray-core v26.9.8) fp=chrome, both in the probe's test and in podkop. A rule's
+  own links show a **Use chrome** fix.
+- Logs: wget's progress from podkop's list update and crond's job starts are
+  no longer shown as errors.
+- podkop-agent 0.3.1: `probe-config`, `probe-cron off`, engine and probe cron
+  in the status. podkop-probe: `--fix-fingerprint`.
+
 ## 1.19.0 — 2026-10-18
 
 - Manager 0.9.0: **Routing → Configs**. Save a router's running config or

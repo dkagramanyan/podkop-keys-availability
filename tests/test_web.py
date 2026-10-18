@@ -244,6 +244,7 @@ def test_configs_save_export_import_load(tmp_path):
         assert "shutdown_correctly" not in r.text and r.json()["rules"]["main"]["countries"] == ["PL"]
         assert c.post("/api/configs", json={"router_id": 1, "from": "draft"}, headers=H).status_code == 400
         assert c.post("/api/configs", json={"router_id": "abc"}, headers=H).status_code == 400
+        assert c.put("/api/routers/1/probe", json={"fix_fingerprint": True}, headers=H).json()["fix_fingerprint"] == 1
         assert c.post("/api/routers/1/diff", json={"config": "x"}, headers=H).status_code == 400
         # a file back in: our JSON, and podkop's own UCI
         again = c.post("/api/configs/import", json={"text": r.text, "file": "podkop-now.json"}, headers=H).json()

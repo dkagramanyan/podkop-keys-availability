@@ -200,6 +200,15 @@ function linkDetails(link) {
 
 const isLink = (v) => typeof v === "string" && /^[a-z0-9]+:\/\//i.test(v);
 
+// TLS fingerprints REALITY servers since Xray-core v26.9.8 reject (podkop.OLD_FINGERPRINTS)
+const OLD_FP = /([?&]fp=)(qq|360|ios|android|edge)(?=[&#]|$)/;
+const oldFingerprint = (l) => isLink(l) && /security=reality/.test(l.split("#")[0]) && OLD_FP.test(l.split("#")[0]);
+const fixFingerprint = (l) => {
+  if (!oldFingerprint(l)) return l;
+  const i = l.indexOf("#");
+  return i < 0 ? l.replace(OLD_FP, "$1chrome") : l.slice(0, i).replace(OLD_FP, "$1chrome") + l.slice(i);
+};
+
 // --- routers ------------------------------------------------------------------------
 
 function routerState(rt) {
@@ -523,6 +532,8 @@ const EVENT_TEXT = {
   reverted: (d) => `Change undone: ${d.reason}`,
   revert_failed: (d) => `Change failed and podkop does not run with the old settings either: ${d.revert_reason}`,
   apply_interrupted: (d) => d.message || "A change was cut off (reboot?): the old settings are back",
+  imported: (d) => `Added without changing podkop: its settings are in Configs ("${d.config}")${d.keys ? `, ${plural(d.keys, "subscription")} in Keys` : ""}${(d.rules || []).length ? `, ${d.rules.join(" and ")} take links from probe` : ""}`,
+  probe_cron_off: () => "podkop-probe no longer runs by itself on the router: the manager runs it",
   podkop_down: (d) => `podkop is down${d.failsafe ? ": " + d.failsafe : ""}`,
   podkop_up: () => "podkop is up again",
   recovered: (d) => `Watchdog: ${d.action}`,
@@ -633,6 +644,25 @@ async function viewOverview(main, id) {
         h("div", { class: "col" }, h("span", {}, `Probe from ${shortWhen(agentTime(ps.finished))} has new servers`),
           h("span", {}, `${rules.join(", ")}. ${usable} of ${rows.length} servers usable.`)),
         h("button", { type: "button", class: "btn sm", onclick: applyProbe }, "Review and apply")));
+    }
+    const st = rt.status;
+    if (st && st.engine === false) {
+      notes.push(h("div", { class: "note" }, h("span", { class: "dot warn" }),
+        h("div", { class: "col" }, h("span", {}, "podkop-engine is not installed"),
+          h("span", {}, "The probe can't test servers on this router. Reading and applying settings work.")),
+        h("a", { class: "alink", href: "https://github.com/FiyeroT/podkop-engine", target: "_blank", rel: "noopener" }, "podkop-engine")));
+    }
+    if (st && st.probe && st.probe.cron) {
+      const [mm, hh] = st.probe.cron.split(/\s+/);
+      const at = /^\d+$/.test(mm) && /^\d+$/.test(hh) ? ` at ${hh.padStart(2, "0")}:${mm.padStart(2, "0")}` : "";
+      notes.push(h("div", { class: "note" }, h("span", { class: "dot warn" }),
+        h("div", { class: "col" }, h("span", {}, `podkop-probe also runs by itself every night${at}`),
+          h("span", {}, "Set up on the router before the manager, it changes the servers without it. The manager can run it instead, at the same time.")),
+        h("button", { type: "button", class: "btn sm", onclick: async (e) => {
+          e.currentTarget.disabled = true;
+          try { await api("POST", `/api/routers/${id}/probe/take-over`); toast("The manager runs the nightly probe now"); await load(); draw(); }
+          catch (err) { toast(err.message, true); e.currentTarget.disabled = false; }
+        } }, "Let the manager run it")));
     }
     for (const a of (rt.usage && rt.usage.alerts) || []) {
       const eta = a.forecast && a.forecast.eta;
@@ -1557,7 +1587,12 @@ function serversField(w, b, opt, { title, help, collapsible }) {
     addArea.value = "";
     b.set(opt, [...links, ...found], true);
   };
+  const oldFp = links.filter(oldFingerprint);
   return h("div", { class: "servers" }, head,
+    oldFp.length ? h("div", { class: "row", style: "flex-wrap: nowrap; gap: 10px; padding: 10px 14px; background: var(--warn-row); border-bottom: 1px solid var(--line-soft)" },
+      h("span", { class: "xs grow", style: "color: var(--warn-deep); line-height: 1.5" },
+        `${plural(oldFp.length, "link")} use${oldFp.length === 1 ? "s" : ""} a TLS fingerprint (fp=${(OLD_FP.exec(oldFp[0].split("#")[0]) || [])[2]}) that new REALITY servers reject.`),
+      h("button", { type: "button", class: "btn xs", onclick: () => b.set(opt, links.map(fixFingerprint), true) }, "Use chrome")) : null,
     collapsible ? h("div", { class: "servers-more" }, h("span", { class: "xs muted" }, help), " ",
       h("button", { type: "button", class: "link-btn", onclick: () => { ui.open = false; w.redraw(); } }, "Hide")) : null,
     shown.map((l, i) => {
@@ -1852,6 +1887,8 @@ function oneLinkField(b) {
       oninput: (e) => b.set("proxy_string", e.target.value.trim()), onchange: () => b.set("proxy_string", b.get("proxy_string"), true) }),
     isLink(l) ? h("span", { class: "row xs" }, h("span", { style: "font-weight: 500" }, linkName(l)), h("span", { class: "proto" }, linkProto(l)),
       h("span", { class: "mono muted" }, linkDetails(l))) : null,
+    oldFingerprint(l) ? h("span", { class: "row xs", style: "color: var(--warn-deep)" }, "Its TLS fingerprint is rejected by new REALITY servers.",
+      h("button", { type: "button", class: "btn xs", onclick: () => b.set("proxy_string", fixFingerprint(l), true) }, "Use chrome")) : null,
     b.problemEls("proxy_string"), (b.indexProblem("proxy_string", 0) ? [h("span", { class: "field-problem" }, b.indexProblem("proxy_string", 0).message)] : []));
 }
 
@@ -2179,7 +2216,10 @@ async function viewGlobal(main, id) {
             h("div", { class: "ctl" }, h("input", { id: "sched", type: "time", class: "input mid num", style: "width: 110px", value: probe.schedule || "",
               onchange: (e) => saveProbe({ schedule: e.target.value }) }), h("span", { class: "help" }, "Empty: off"))),
           h("label", { class: "check" }, h("input", { type: "checkbox", checked: !!probe.auto_apply, onchange: (e) => saveProbe({ auto_apply: e.target.checked }) }),
-            h("span", {}, "Apply the result by itself"))) : null),
+            h("span", {}, "Apply the result by itself")),
+          h("label", { class: "check" }, h("input", { type: "checkbox", checked: !!probe.fix_fingerprint, onchange: (e) => saveProbe({ fix_fingerprint: e.target.checked }) }),
+            h("span", { class: "col" }, h("span", {}, "Use the chrome TLS fingerprint"),
+              h("span", {}, "For REALITY links with fp=qq, 360, ios, android or edge, which new servers reject")))) : null),
       settingsOther(o, defs));
     w.drawBar && w.drawBar();
   };
@@ -2483,18 +2523,20 @@ async function viewSettings(main) {
   const reinstall = (rt) => {
     const pw = h("input", { class: "input", id: "ri-pw", type: "password", autocomplete: "off" });
     const allow = h("input", { class: "input mono", id: "ri-allow", placeholder: "e.g. 192.168.1.10, optional" });
+    const close = h("input", { type: "checkbox", checked: true });
     const out = h("div");
     const go = h("button", { type: "button", class: "btn primary" }, "Reinstall");
     go.onclick = async () => {
       go.disabled = true; put(out, h("p", { class: "small muted" }, "Installing, up to a minute…"));
       try {
-        await api("POST", `/api/routers/${rt.id}/reinstall`, { password: pw.value, allow_clash: splitIps(allow.value) });
+        await api("POST", `/api/routers/${rt.id}/reinstall`, { password: pw.value, allow_clash: splitIps(allow.value), close_clash: close.checked });
         pw.value = ""; m.close(); toast(`podkop-agent reinstalled on ${rt.name}`);
       } catch (e) { put(out, h("p", { class: "problem-box" }, e.message)); go.disabled = false; }
     };
     const m = modal({ title: `Reinstall podkop-agent on ${rt.name}`, narrow: true,
       sub: "Puts this manager's podkop-agent, podkop-probe and key on the router again. podkop's settings stay as they are.",
       body: [h("div", { class: "field" }, h("label", { for: "ri-pw" }, "Root password"), pw, h("span", { class: "help" }, pwHelp("Used once, not stored"))),
+        h("label", { class: "check" }, close, h("span", {}, "Close podkop's Clash API (port 9090) to the LAN")),
         h("div", { class: "field" }, h("label", { for: "ri-allow" }, "Computers that may still reach the Clash API"), allow), out],
       foot: [h("span"), h("div", { class: "row" }, h("button", { type: "button", class: "btn", onclick: () => m.close() }, "Cancel"), go)] });
   };
@@ -2524,6 +2566,7 @@ async function viewSettings(main) {
     port: h("input", { class: "input", id: "a-port", value: "22", inputmode: "numeric" }),
     pass: h("input", { class: "input", id: "a-pass", type: "password", autocomplete: "off" }),
     allow: h("input", { class: "input mono", id: "a-clash", placeholder: "e.g. 192.168.1.10, optional" }),
+    close: h("input", { type: "checkbox", checked: true }),
   };
   const addOut = h("div");
   const addBtn = h("button", { type: "submit", class: "btn primary lg" }, "Install and add");
@@ -2533,21 +2576,23 @@ async function viewSettings(main) {
     addBtn.disabled = true; put(addOut, h("p", { class: "small muted" }, "Installing podkop-agent, up to a minute…"));
     try {
       const r = await api("POST", "/api/routers", { name: f.name.value.trim(), host: f.host.value.trim(), port: +f.port.value || 22,
-        password: f.pass.value, allow_clash: splitIps(f.allow.value) });
+        password: f.pass.value, allow_clash: splitIps(f.allow.value), close_clash: f.close.checked });
       f.pass.value = "";
       await loadRouters();
       location.hash = `#/r/${r.id}`;
     } catch (err) { put(addOut, h("p", { class: "problem-box" }, err.message)); addBtn.disabled = false; }
   } },
   h("div", { class: "col" }, h("h2", { id: "s-add" }, "Add router"),
-    h("span", { class: "small muted" }, "Needs podkop and podkop-engine on the router")),
+    h("span", { class: "small muted" }, "podkop stays as it is: its settings are kept in Configs. The probe needs podkop-engine.")),
   h("div", { class: "auto-grid", style: "grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr))" },
     h("div", { class: "field" }, h("label", { for: "a-name" }, "Name"), f.name),
     h("div", { class: "field" }, h("label", { for: "a-host" }, "Address"), f.host),
     h("div", { class: "field" }, h("label", { for: "a-port" }, "SSH port"), f.port),
     h("div", { class: "field" }, h("label", { for: "a-pass" }, "Root password"), f.pass, h("span", { class: "help" }, pwHelp("Used once to install, not stored")))),
+  h("label", { class: "check" }, f.close, h("span", { class: "col" }, h("span", {}, "Close podkop's Clash API (port 9090) to the LAN"),
+    h("span", {}, "Anyone on the LAN can switch its servers otherwise. Off: the firewall is not changed."))),
   h("div", { class: "field", style: "max-width: 560px" }, h("label", { for: "a-clash" }, "Computers that may still reach the Clash API"), f.allow,
-    h("span", { class: "help" }, "Port 9090 is closed to the rest of the LAN")),
+    h("span", { class: "help" }, "Only when it is closed")),
   addOut, h("div", {}, addBtn));
 
   const restore = () => {

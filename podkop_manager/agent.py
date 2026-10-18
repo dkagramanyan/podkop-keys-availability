@@ -104,7 +104,7 @@ AGENT_FILES = ("router/podkop-agent", "router/podkop-agent.init", "router/instal
 
 
 async def install(host: str, port: int, password: str, public_key: str, src: Path,
-                  allow_clash: list[str]) -> str:
+                  allow_clash: list[str], close_clash: bool = True) -> str:
     """Log in once with the root password, copy podkop-agent and podkop-probe
     to the router and run install.sh. Returns the router's host key, which
     every later connection is checked against. The password is not kept."""
@@ -126,6 +126,8 @@ async def install(host: str, port: int, password: str, public_key: str, src: Pat
         cmd = f"sh {tmp}/install.sh --src {tmp} --key {shlex.quote(public_key)}"
         for ip in allow_clash:
             cmd += f" --allow-clash {shlex.quote(ip)}"
+        if not close_clash:
+            cmd += " --keep-clash-open"
         r = await conn.run(cmd, check=False)
         await conn.run(f"rm -rf {tmp}", check=False)
         if r.exit_status != 0:

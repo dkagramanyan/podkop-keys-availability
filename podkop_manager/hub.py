@@ -11,7 +11,7 @@ import logging
 import time
 from pathlib import Path
 
-from . import podkop, usage
+from . import configs, podkop, usage
 from .agent import Agent, AgentError
 from .db import DB
 
@@ -313,7 +313,11 @@ class Hub:
             raise AgentError("no_keys", "add your keys (subscription URLs) first")
         if rid in self.probes and not self.probes[rid].done():
             raise AgentError("busy", "a probe is already running")
-        await rt.agent.call("probe-start", payload={"keys": ps["keys"], "options": self.probe_options(rid)}, timeout=30)
+        options = self.probe_options(rid)
+        agent = (((rt.status or {}).get("agent") or {}).get("version") or "0").split(".")
+        if ps.get("fix_fingerprint") and [int(x) for x in agent if x.isdigit()] >= [0, 3, 1]:
+            options.append("--fix-fingerprint")    # test them as they will be used
+        await rt.agent.call("probe-start", payload={"keys": ps["keys"], "options": options}, timeout=30)
         run_id = self.db.add_probe_run(rid, trigger, ps["keys"])
         self.probes[rid] = asyncio.create_task(self._track_probe(rt, run_id, trigger))
         self.publish({"type": "probe", "router_id": rid, "state": "running", "run": run_id})
@@ -369,8 +373,15 @@ class Hub:
                     {"top": top, "fallback": 5, "max_ping": max_ping, "min_speed": min_speed, "youtube": youtube}))
 
     def auto_picks(self, rid: int, status: dict) -> dict:
-        """The servers of the last probe for each rule that takes them from it."""
-        return {r["section"]: podkop.auto_pick(status.get("rows") or [], r) for r in self.db.auto_rules(rid)}
+        """The servers of the last probe for each rule that takes them from it;
+        with fix_fingerprint, REALITY links get a fingerprint new servers accept."""
+        picks = {r["section"]: podkop.auto_pick(status.get("rows") or [], r) for r in self.db.auto_rules(rid)}
+        if self.db.probe_settings(rid).get("fix_fingerprint"):
+            for p in picks.values():
+                p["links"], p["fallback"] = ([podkop.fix_fingerprint(x) for x in p[k]] for k in ("links", "fallback"))
+                for row in p["matched"] + p["fallback_rows"]:
+                    row["link"] = podkop.fix_fingerprint(row["link"])
+        return picks
 
     def _countries_to_rules(self, rid: int) -> None:
         """Once: the countries the probe page tested become the countries of
@@ -401,6 +412,68 @@ class Hub:
         if not any(r["youtube"] for r in rules):
             out.append("--no-youtube")
         return out
+
+    # --- a router that already runs podkop ---------------------------------------------------
+    async def import_found(self, rid: int) -> None:
+        """Right after a router is added: keep its podkop settings in Configs,
+        and take the keys and lists podkop-probe uses there by itself into the
+        manager. Nothing on the router changes."""
+        if self.db.get_setting(f"imported:{rid}"):
+            return
+        rt = self.get(rid)
+        await self.refresh(rt)
+        try:
+            cur = await self.config(rid)
+        except AgentError as e:
+            log.info("import from %s: %s", rt.row["host"], e.message)
+            return
+        self.db.set_setting(f"imported:{rid}", True)
+        name = f"{rt.row['name']}, as found {time.strftime('%Y-%m-%d %H:%M')}"
+        version = (((rt.status or {}).get("podkop")) or {}).get("version") or ""
+        with contextlib.suppress(ValueError):
+            self.db.add_config(name, configs.check_config(cur["config"]), {}, f"{rt.row['name']}, when added", version)
+        found = {"config": name, "keys": 0, "rules": []}
+        try:
+            pc = await rt.agent.call("probe-config", timeout=30) or {}
+        except AgentError:           # an agent before 0.3.1
+            pc = {}
+        if pc.get("saved"):
+            keys = [k for k in pc.get("keys") or [] if k.startswith(("http://", "https://"))]
+            if keys and not self.db.probe_settings(rid).get("keys"):
+                self.db.set_probe_settings(rid, keys=keys)
+                self.db.sync_sub_keys(rid, keys)
+                found["keys"] = len(keys)
+            found["rules"] = self._probe_rules_from(rid, cur["config"], pc)
+        self._event(rt, "imported", found)
+
+    def _probe_rules_from(self, rid: int, config: dict, pc: dict) -> list:
+        """podkop-probe's own lists (its main and YouTube sections) as rules that
+        take servers from the probe, with its countries and limits."""
+        c = str(pc.get("countries") or "")
+        countries = list(podkop.EUROPE) if c.lower() in ("europe", "eu") else [] if c in ("all", "") else c.split(",")
+        names = {s["name"] for s in config["sections"] if s["type"] == "section"}
+        base = {"countries": countries, "top": pc.get("top") or 10, "fallback": 5,
+                "max_ping": pc.get("max_ping") or 700, "min_speed": pc.get("min_speed") or 40}
+        made = []
+        for section, youtube, used in ((pc.get("section"), "", pc.get("apply_to") in ("both", "main")),
+                                       (pc.get("youtube_section"), pc.get("youtube_noads") or "RU",
+                                        pc.get("youtube") and pc.get("apply_to") in ("both", "youtube"))):
+            if used and section in names and not self.db.auto_rule(rid, section):
+                with contextlib.suppress(ValueError):
+                    self.db.set_auto_rule(rid, section, podkop.check_auto_rule(dict(base, youtube=youtube)))
+                    made.append(section)
+        return made
+
+    async def take_over_probe(self, rt: RouterRuntime) -> dict:
+        """Turn off podkop-probe's own cron line; the manager runs it at that time."""
+        cron = (((rt.status or {}).get("probe") or {}).get("cron") or "").split()
+        await rt.agent.call("probe-cron", "off", timeout=30)
+        fields = {"auto_apply": 1}
+        if len(cron) >= 2 and cron[0].isdigit() and cron[1].isdigit():
+            fields["schedule"] = f"{int(cron[1]):02d}:{int(cron[0]):02d}"
+        self.db.set_probe_settings(rt.id, **fields)
+        rt.wake.set()
+        return self.db.probe_settings(rt.id)
 
     def keep_rules(self, rid: int) -> None:
         """Before the first change of a router's probe rules since its last
