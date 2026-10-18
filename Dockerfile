@@ -1,25 +1,12 @@
 FROM python:3.13.7-slim-trixie
 
 # podkop-probe can also test servers here, through the router (Global
-# settings → Test servers): busybox's sh and tools as on a router, curl, jq
-# and podkop-engine-full's sing-box (static, with the SSH outbound)
-ARG ENGINE=1.13.21-r14
-ARG TARGETARCH
+# settings → Test servers): busybox's sh and tools as on a router, curl and
+# jq. podkop-engine's sing-box is downloaded by the manager into the data
+# volume when that is first asked for, so the build doesn't wait for it.
 RUN apt-get update && apt-get install -y --no-install-recommends busybox curl jq ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
- && mkdir /opt/busybox && busybox --install -s /opt/busybox \
- && case "${TARGETARCH:-amd64}" in \
-      amd64) f=x86_64 sum=7e23ea61e0ce0a58f101706a9bbd3badeea804af165ba12d714cc8c97b753d9d ;; \
-      arm64) f=aarch64_generic sum=275e42156a1e36b71310729b6b5557bb2e91aa3c61a68a4f50eb4c61c9ecb7d9 ;; \
-      *) echo "no podkop-engine for $TARGETARCH" >&2; exit 1 ;; \
-    esac \
- && curl -fsSL -o /tmp/engine.ipk "https://github.com/FiyeroT/podkop-engine/releases/download/v$ENGINE/podkop-engine-full_${ENGINE}_openwrt_$f.ipk" \
- && echo "$sum  /tmp/engine.ipk" | sha256sum -c - \
- && mkdir /tmp/engine && tar -xzf /tmp/engine.ipk -C /tmp/engine \
- && tar -xzf /tmp/engine/data.tar.gz -C /tmp/engine ./usr/bin/sing-box \
- && install -m 755 /tmp/engine/usr/bin/sing-box /usr/local/bin/sing-box \
- && rm -rf /tmp/engine /tmp/engine.ipk \
- && sing-box version
+ && mkdir /opt/busybox && busybox --install -s /opt/busybox
 
 WORKDIR /app
 COPY pyproject.toml ./

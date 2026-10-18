@@ -31,6 +31,7 @@ class FakeHub:
     src = Path(__file__).resolve().parents[1]
     key = Path("/nonexistent/id_ed25519")
     forward_key = Path("/nonexistent/id_forward")
+    engine = {"state": "", "error": ""}
     auto_picks = Hub.auto_picks
     usage = Hub.usage
     load_config = Hub.load_config

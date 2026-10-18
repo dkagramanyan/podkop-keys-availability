@@ -2175,7 +2175,20 @@ async function viewGlobal(main, id) {
   // the nightly probe is the manager's setting: saved right away, not in the draft
   let probe = (await api("GET", `/api/routers/${id}/probe`).catch(() => null) || {}).settings;
   const info = S.manager || (S.manager = await api("GET", "/api/manager").catch(() => null)) || {};
-  const lp = info.local_probe || { ready: false, missing: "this manager is too old" };
+  let lp = info.local_probe || { ready: false, missing: "this manager is too old" };
+  // podkop-engine for probes run here: downloaded once, when asked for
+  const getEngine = busyClick(async () => {
+    try {
+      let e = await api("POST", "/api/engine/download");
+      while (e.state === "downloading") {
+        lp = Object.assign({}, lp, { missing: "podkop-engine is downloading…" }); w.redraw();
+        await new Promise((r) => setTimeout(r, 4000));
+        S.manager = await api("GET", "/api/manager"); lp = S.manager.local_probe; e = lp.engine;
+      }
+      if (e.state === "failed") toast(`podkop-engine was not downloaded: ${e.error}`, true); else toast("podkop-engine downloaded");
+    } catch (err) { toast(err.message, true); }
+    w.redraw();
+  });
   const saveProbe = async (patch) => {
     try { probe = await api("PUT", `/api/routers/${id}/probe`, patch); toast("Saved"); } catch (e) { toast(e.message, true); }
     w.redraw();
@@ -2282,7 +2295,10 @@ async function viewGlobal(main, id) {
                   "On this server, through the router")),
               h("span", { class: "help" }, probe.test_from === "manager"
                 ? "The servers still see the router's address. Servers that use UDP (hysteria2, TUIC) are not tested."
-                : lp.ready ? "On this server the test is faster and leaves the router's processor free" : `Not possible here: ${lp.missing}`))),
+                : lp.ready ? "On this server the test is faster and leaves the router's processor free" : `Not possible here yet: ${lp.missing}`),
+              !lp.ready && /podkop-engine is (not downloaded|downloading)/.test(lp.missing || "")
+                ? h("button", { type: "button", class: "btn sm", onclick: getEngine },
+                  lp.engine && lp.engine.state === "downloading" ? "Downloading podkop-engine…" : "Download podkop-engine, 13 MB") : null)),
           probe.test_from === "manager" ? h("div", { class: "col", style: "gap: 8px" },
             h("span", { class: "small" }, "The router must accept this server's forwarding key: Settings → Reinstall agent with \"Let this manager test servers through the router\" adds it, or add this line to the router's /etc/dropbear/authorized_keys. It lets this server open connections through the router and nothing else: no shell, no commands."),
             h("div", { class: "row", style: "align-items: flex-start; flex-wrap: nowrap; padding: 10px 12px; border-radius: 6px; background: var(--chip)" },
@@ -2601,7 +2617,7 @@ async function viewSettings(main) {
         h("span", {}, "Anyone on the LAN can switch its servers otherwise. Off: the firewall is not changed."))),
       h("div", { class: "field", style: "max-width: 560px" }, h("label", { for: `${prefix}-clash` }, "Computers that may still reach the Clash API"), allow,
         h("span", { class: "help" }, "Only when it is closed")),
-      info.local_probe && info.local_probe.ready ? h("label", { class: "check" }, forward, h("span", { class: "col" },
+      info.local_probe ? h("label", { class: "check" }, forward, h("span", { class: "col" },
         h("span", {}, "Let this manager test servers through the router"),
         h("span", {}, "Adds a second key that may only open connections through the router: no shell, no commands"))) : null,
       h("span", { style: "font-size: 13px; font-weight: 500" }, "Run this on the router as root, over SSH"),
