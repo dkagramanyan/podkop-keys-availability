@@ -23,12 +23,12 @@ Needs Docker with the compose plugin.
 ```sh
 git clone https://github.com/dkagramanyan/podkop-manager
 cd podkop-manager
-cp .env.example .env && chmod 600 .env   # set the passwords in it
+cp .env.example .env && chmod 600 .env   # set your login and passwords in it
 docker compose up -d --build
 ```
 
 Open `http://<server>:8080`. Everything you set lives in `.env`: the port,
-the web password, and optionally the routers' root password. After changing
+the web login and password, and optionally the routers' root password. After changing
 it: `docker compose up -d`. Update: `git pull && docker compose up -d --build`.
 Data (database, SSH key) is in the `podkop-manager_data` volume. Logs:
 `docker compose logs -f`.
@@ -44,11 +44,12 @@ all of it.
 ## Good to know
 
 - Changes collect in a draft until **Review and apply**.
-- A rule can take servers **from your subscriptions** by exit country,
-  protocol, exit IP or name; they are refreshed after every probe run.
+- Any rule can take servers **from your subscriptions**: filter by exit
+  country, protocol, exit IP or name, with its own ping, speed and YouTube
+  limits; they are refreshed after every probe run.
 - Nightly probe: **Servers probe** → time and "Apply the nightly result by itself".
-- **Keys and usage**: each key's traffic against its limit (from the provider
-  or your own). At 90% it warns, or moves the probe's rules to other keys
+- **Keys and usage**: add subscriptions and single links here, and see each
+  key's traffic against its limit (from the provider or your own). At 90% it warns, or moves the probe's rules to other keys
   until the reset.
 - To stop podkop, use **Stop**: otherwise the watchdog starts it again within
   about 30 s (**Disable** in LuCI turns that off).

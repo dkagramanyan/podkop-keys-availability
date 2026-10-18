@@ -78,6 +78,9 @@ COLUMNS = [
     ("logs", "level", "TEXT NOT NULL DEFAULT 'info'"),
     ("versions", "trigger", "TEXT NOT NULL DEFAULT 'web'"),
     ("probe_runs", "keys", "TEXT NOT NULL DEFAULT '[]'"),
+    ("auto_rules", "max_ping", "INTEGER NOT NULL DEFAULT 700"),
+    ("auto_rules", "min_speed", "REAL NOT NULL DEFAULT 40"),
+    ("auto_rules", "youtube", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 
@@ -336,12 +339,13 @@ class DB:
         return next((r for r in self.auto_rules(rid) if r["section"] == section), None)
 
     def set_auto_rule(self, rid: int, section: str, rule: dict) -> None:
-        self.x("INSERT INTO auto_rules (router_id, section, countries, protocols, exit_ips, name_contains, top, fallback) "
-               "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (router_id, section) DO UPDATE SET "
-               "countries = excluded.countries, protocols = excluded.protocols, exit_ips = excluded.exit_ips, "
-               "name_contains = excluded.name_contains, top = excluded.top, fallback = excluded.fallback",
+        self.x("INSERT INTO auto_rules (router_id, section, countries, protocols, exit_ips, name_contains, top, fallback, "
+               "max_ping, min_speed, youtube) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (router_id, section) "
+               "DO UPDATE SET countries = excluded.countries, protocols = excluded.protocols, exit_ips = excluded.exit_ips, "
+               "name_contains = excluded.name_contains, top = excluded.top, fallback = excluded.fallback, "
+               "max_ping = excluded.max_ping, min_speed = excluded.min_speed, youtube = excluded.youtube",
                rid, section, json.dumps(rule["countries"]), json.dumps(rule["protocols"]), json.dumps(rule["exit_ips"]),
-               rule["name_contains"], rule["top"], rule["fallback"])
+               rule["name_contains"], rule["top"], rule["fallback"], rule["max_ping"], rule["min_speed"], rule["youtube"])
 
     def delete_auto_rule(self, rid: int, section: str) -> None:
         self.x("DELETE FROM auto_rules WHERE router_id = ? AND section = ?", rid, section)

@@ -4,11 +4,15 @@ from pathlib import Path
 
 import pytest
 
-from podkop_manager import usage
+from podkop_manager import podkop, usage
 from podkop_manager.db import DB
 from podkop_manager.hub import Hub
 
 GB = usage.GB
+
+
+def ROW(link, median):
+    return {"node": link.split("#")[1], "link": link, "verdict": "GOOD", "median": median, "mbit": "90"}
 
 
 @pytest.fixture(autouse=True)
@@ -93,14 +97,15 @@ def test_probe_config_moves_away_from_avoided_keys(tmp_path: Path):
     db.sync_sub_keys(rid, ["https://sub.example.com/abc"])
     kid = db.keys(rid)[0]["id"]
     db.update_key(kid, links=["vless://a@h:1#A"], action="avoid", acted_until=time.time() + 3600)
+    db.set_auto_rule(rid, "main", podkop.check_auto_rule({"top": 1, "fallback": 1}))
     hub = Hub(db, tmp_path / "key", tmp_path)
     cur = {"config": {"sections": [{"name": "main", "type": "section", "options": {"connection_type": "proxy"}}]}}
-    status = {"lists": {"main": ["vless://a@h:1#A"], "main_fallback": ["vless://c@h:3#C"]}, "rows": []}
+    status = {"rows": [ROW("vless://a@h:1#A", "0.2"), ROW("vless://c@h:3#C", "0.3")]}
     main = hub.probe_config(rid, cur, status)["sections"][0]["options"]
     assert main["urltest_proxy_links"] == ["vless://c@h:3#C"] and "urltest_fallback_links" not in main
     db.update_key(kid, acted_until=time.time() - 1)
     main = hub.probe_config(rid, cur, status)["sections"][0]["options"]
-    assert main["urltest_proxy_links"] == ["vless://a@h:1#A"]
+    assert main["urltest_proxy_links"] == ["vless://a@h:1#A"] and main["urltest_fallback_links"] == ["vless://c@h:3#C"]
 
 
 def test_move_rules_touches_only_rules_with_the_keys_servers(tmp_path: Path):
@@ -111,9 +116,11 @@ def test_move_rules_touches_only_rules_with_the_keys_servers(tmp_path: Path):
     db.sync_sub_keys(rid, ["https://sub.example.com/abc"])
     kid = db.keys(rid)[0]["id"]
     db.update_key(kid, links=["vless://a@h:1#A"], action="avoid", acted_until=time.time() + 3600)
+    db.set_auto_rule(rid, "main", podkop.check_auto_rule({"top": 2, "fallback": 0}))
+    db.set_auto_rule(rid, "youtube", podkop.check_auto_rule({"top": 1, "fallback": 0, "name_contains": "Y"}))
     run = db.add_probe_run(rid, "manual", [])
-    db.finish_probe_run(run, "done", {"rows": [], "lists": {
-        "main": ["vless://a@h:1#A", "vless://c@h:3#C"], "youtube": ["vless://y@h:4#Y"]}})
+    db.finish_probe_run(run, "done", {"rows": [ROW("vless://a@h:1#A", "0.2"), ROW("vless://c@h:3#C", "0.3"),
+                                               ROW("vless://y@h:4#Y", "0.4")]})
     sec = lambda n, links: {"name": n, "type": "section", "options": {
         "connection_type": "proxy", "proxy_config_type": "urltest", "urltest_proxy_links": links}}
     cur = {"fingerprint": "fp", "config": {"sections": [sec("youtube", ["vless://old@h:9#O"]),
@@ -133,7 +140,7 @@ def test_move_rules_touches_only_rules_with_the_keys_servers(tmp_path: Path):
     asyncio.run(hub._move_rules(rt, ["provider-a"]))
     new, note, trigger = applied[0]
     by = {s["name"]: s["options"]["urltest_proxy_links"] for s in new["sections"]}
-    assert by == {"youtube": ["vless://old@h:9#O"], "main": ["vless://c@h:3#C"]}   # youtube had none of the key's servers
+    assert by == {"youtube": ["vless://old@h:9#O"], "main": ["vless://c@h:3#C", "vless://y@h:4#Y"]}   # youtube had none
     assert trigger == "usage" and "provider-a" in note
     # after the reset: main gets the probe's list back, youtube still untouched
     db.update_key(kid, acted_until=time.time() - 1)
@@ -141,3 +148,22 @@ def test_move_rules_touches_only_rules_with_the_keys_servers(tmp_path: Path):
     asyncio.run(hub._move_rules(rt, []))
     by = {s["name"]: s["options"]["urltest_proxy_links"] for s in applied[1][0]["sections"]}
     assert by == {"youtube": ["vless://old@h:9#O"], "main": ["vless://a@h:1#A", "vless://c@h:3#C"]}
+
+
+def test_old_probe_lists_become_rules_once(tmp_path: Path):
+    db = DB(tmp_path / "m.db")
+    rid = db.add_router("home", "192.168.1.1", 22, "ssh-ed25519 AAAA")
+    db.set_probe_settings(rid, keys=["https://s"], options=["--countries", "europe", "--max-ping", "800", "--top", "7"])
+    hub = Hub(db, tmp_path / "key", tmp_path)
+    hub._lists_to_rules(rid)
+    rules = {r["section"]: r for r in db.auto_rules(rid)}
+    assert (rules["main"]["top"], rules["main"]["max_ping"], rules["main"]["youtube"]) == (7, 800, "")
+    assert rules["youtube"]["youtube"] == "ru"
+    assert hub.probe_options(rid) == ["--countries", "europe", "--max-ping", "800", "--min-speed", "40"]
+    db.delete_auto_rule(rid, "youtube")
+    hub._lists_to_rules(rid)                      # only once
+    assert [r["section"] for r in db.auto_rules(rid)] == ["main"]
+    assert hub.probe_options(rid)[-1] == "--no-youtube"
+    fresh = db.add_router("new", "192.168.1.2", 22, "ssh-ed25519 AAAA")
+    hub._lists_to_rules(fresh)                    # never used the probe: no rules
+    assert db.auto_rules(fresh) == []

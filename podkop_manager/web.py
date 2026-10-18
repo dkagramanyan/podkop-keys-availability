@@ -39,9 +39,11 @@ def check_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(hash_password(password, salt), stored)
 
 
-def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password: str = "") -> FastAPI:
-    """password: the web login; router_password: routers' root password, used
-    when the form leaves it empty. Both come from the environment, not stored."""
+def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password: str = "",
+               username: str = "admin") -> FastAPI:
+    """username and password: the web login; router_password: routers' root
+    password, used when the form leaves it empty. All come from the
+    environment, not stored."""
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI):
         await hub.start()
@@ -55,7 +57,7 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
         db.set_setting("session_secret", secret)
     password_hash = hash_password(password)
     # a new password logs everyone out
-    secret += hashlib.sha256(password.encode()).hexdigest()
+    secret += hashlib.sha256(f"{username}\n{password}".encode()).hexdigest()
     app.add_middleware(SessionMiddleware, secret_key=secret, session_cookie="podkop_manager",
                        max_age=14 * 86400, same_site="strict", https_only=False)
 
@@ -92,7 +94,8 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
     @app.post("/login")
     async def login(request: Request):
         form = await request.form()
-        if check_password(str(form.get("password", "")), password_hash):
+        name_ok = hmac.compare_digest(str(form.get("user", "")).strip().encode(), username.encode())
+        if check_password(str(form.get("password", "")), password_hash) and name_ok:
             request.session["auth"] = True
             return RedirectResponse("/", status_code=303)
         await asyncio.sleep(1)
@@ -282,12 +285,16 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
             st = await rt.agent.call("probe-status", timeout=30)
         if st:
             picks = hub.auto_picks(rid, st)
-            st["rows"] = podkop.probe_rows(st, ps.get("options") or [],
-                                           {"main": ps.get("main_section"), "youtube": ps.get("youtube_section")}, picks)
+            st["rows"] = podkop.probe_rows(st, hub.probe_options(rid), picks)
             st["keys"] = podkop.probe_keys(st.get("log") or [], db.last_probe_keys(rid))
+            secs = podkop.sections_by_name(rt.config["config"]) if rt.config else {}
             for r in rules:
-                r["picked"] = len(picks[r["section"]]["links"])
-                r["picked_fallback"] = len(picks[r["section"]]["fallback"])
+                pick = picks[r["section"]]
+                r["picked"], r["picked_fallback"] = len(pick["links"]), len(pick["fallback"])
+                o = (secs.get(r["section"]) or {}).get("options") or {}
+                r["differs"] = bool(pick["links"]) and r["section"] in secs and (
+                    _as_list(o.get("urltest_proxy_links")) != pick["links"]
+                    or _as_list(o.get("urltest_fallback_links")) != pick["fallback"])
         return {"settings": ps, "status": st, "runs": db.probe_runs(rid), "auto_rules": rules}
 
     @app.put("/api/routers/{rid}/probe", dependencies=[api])
@@ -328,11 +335,23 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
 
     @app.post("/api/routers/{rid}/keys", dependencies=[api])
     async def add_key(rid: int, body: dict):
-        """A single link as a key, with a limit of your own."""
+        """A subscription URL (the probe tests its servers) or a single link
+        with a limit of your own."""
         router_or_404(rid)
         link = str(body.get("link", "")).strip()
+        if link.startswith(("http://", "https://")):
+            keys = db.probe_settings(rid)["keys"]
+            if link in keys:
+                raise HTTPException(400, "this subscription is already a key")
+            db.set_probe_settings(rid, keys=keys + [link])
+            db.sync_sub_keys(rid, keys + [link])
+            kid = next(k["id"] for k in db.keys(rid) if k["url"] == link)
+            if body.get("label"):
+                db.update_key(kid, label=str(body["label"]).strip()[:60])
+            return {"id": kid}
         if podkop.link_protocol(link) not in podkop.PROTOCOLS:
-            raise HTTPException(400, f"a link starts with {', '.join(p + '://' for p in podkop.PROTOCOLS)}")
+            raise HTTPException(400, f"a key is a subscription URL (https://) or a link: "
+                                     f"{', '.join(p + '://' for p in podkop.PROTOCOLS)}")
         if any(k["url"] == link for k in db.keys(rid)):
             raise HTTPException(400, "this link is already a key")
         kid = db.add_link_key(rid, link, str(body.get("label", "")).strip()[:60], _gb(body.get("limit_gb", 0)))
@@ -377,9 +396,12 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
         k = db.key(kid)
         if not k:
             raise HTTPException(404, "no such key")
-        if k["kind"] != "link":
-            raise HTTPException(400, "remove a subscription under Servers probe")
-        db.delete_key(kid)
+        if k["kind"] == "sub":
+            keys = [u for u in db.probe_settings(k["router_id"])["keys"] if u != k["url"]]
+            db.set_probe_settings(k["router_id"], keys=keys)
+            db.sync_sub_keys(k["router_id"], keys)
+        else:
+            db.delete_key(kid)
         return {"ok": True}
 
     @app.post("/api/routers/{rid}/probe/start", dependencies=[api])
@@ -417,9 +439,6 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
         router_or_404(rid)
         if not re.fullmatch(r"[A-Za-z0-9_]+", section):
             raise HTTPException(400, "rule names are letters, digits and _")
-        ps = db.probe_settings(rid)
-        if section in (ps.get("main_section"), ps.get("youtube_section")):
-            raise HTTPException(400, f"{section} gets the probe's own list; pick its servers under Servers probe")
         try:
             rule = podkop.check_auto_rule(body)
         except ValueError as e:
@@ -476,6 +495,10 @@ def create_app(db: DB, hub: Hub, public_key: str, password: str, router_password
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
 
     return app
+
+
+def _as_list(v) -> list:
+    return [] if v in (None, "") else v if isinstance(v, list) else [v]
 
 
 def _gb(v) -> float:

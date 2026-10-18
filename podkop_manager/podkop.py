@@ -1,5 +1,5 @@
 """podkop's settings: the option schema of podkop 0.7.24 (from its LuCI app),
-the diff between two configs, putting podkop-probe's lists into a config,
+the diff between two configs, putting the probe's picks into a config,
 reading podkop-probe's results and the router's log lines.
 
 A config is what podkop-agent's config-get returns:
@@ -174,15 +174,6 @@ def diff(old: dict, new: dict) -> list[dict]:
     return out
 
 
-def _move_before(sections: list, name: str, before: str) -> None:
-    names = [s["name"] for s in sections]
-    if name not in names or before not in names:
-        return
-    i, j = names.index(name), names.index(before)
-    if i > j:
-        sections.insert(j, sections.pop(i))
-
-
 def _set_urltest(sec: dict, links: list, fallback: list) -> None:
     o = sec.setdefault("options", {})
     o["connection_type"] = "proxy"
@@ -194,34 +185,18 @@ def _set_urltest(sec: dict, links: list, fallback: list) -> None:
         o.pop("urltest_fallback_links", None)
 
 
-def merge_probe(config: dict, lists: dict, main: str = "main", youtube: str | None = "youtube",
-                auto: dict | None = None) -> dict:
-    """podkop-probe's lists put into a config, the way podkop-probe itself
-    does it: the main list (and its fallbacks) become the URLTest of `main`;
-    the YouTube list goes into `youtube`, created with podkop's youtube list
-    and kept above `main` (podkop routes by the first section that matches).
-    auto: {section: {"links": [...], "fallback": [...]}} from auto_pick, for
-    rules whose servers are picked by country; only existing sections get them.
-    An empty list leaves its section alone."""
+def merge_probe(config: dict, picks: dict) -> dict:
+    """The probe's picks put into a config: {section: {"links", "fallback",
+    "youtube"}} from auto_pick become the URLTest of existing sections;
+    rules that need YouTube test their servers against YouTube. An empty
+    pick leaves its section alone."""
     cfg = copy.deepcopy(config)
-    secs = cfg.setdefault("sections", [])
     by = sections_by_name(cfg)
-    if lists.get("main"):
-        if main not in by:
-            raise ValueError(f"podkop has no section {main!r}")
-        _set_urltest(by[main], lists["main"], lists.get("main_fallback") or [])
-    if youtube and lists.get("youtube"):
-        if youtube not in by:
-            sec = {"name": youtube, "type": "section", "anonymous": False,
-                   "options": {"connection_type": "proxy", "community_lists": ["youtube"]}}
-            secs.append(sec)
-            by[youtube] = sec
-        _set_urltest(by[youtube], lists["youtube"], lists.get("youtube_fallback") or [])
-        by[youtube]["options"]["urltest_testing_url"] = YOUTUBE_PING_URL
-        _move_before(secs, youtube, main)
-    for name, pick in (auto or {}).items():
+    for name, pick in picks.items():
         if name in by and pick["links"]:
             _set_urltest(by[name], pick["links"], pick["fallback"])
+            if pick.get("youtube"):
+                by[name]["options"]["urltest_testing_url"] = YOUTUBE_PING_URL
     return cfg
 
 
@@ -266,7 +241,6 @@ def tag_names(config: dict) -> dict:
 # --- podkop-probe's results -------------------------------------------------------
 
 USABLE = {"GOOD", "OK", "FLAKY"}
-LIST_KEYS = ("main", "main_fallback", "youtube", "youtube_fallback")
 
 
 def _option(options: list, name: str, default: float) -> float:
@@ -311,35 +285,19 @@ def probe_limits(options: list) -> tuple[float, float]:
     return _option(options, "--max-ping", 700), _option(options, "--min-speed", 40)
 
 
-def probe_rows(status: dict, options: list, sections: dict | None = None, picks: dict | None = None) -> list[dict]:
-    """The rows of podkop-probe's CSV with where each server went and, for the
-    others, why it was not picked. goes_to: [{"rule", "kind" (main, youtube,
-    auto), "fallback"}]; sections: {"main": rule, "youtube": rule} the probe's
-    lists go to; picks: auto_pick results by rule."""
-    sections = sections or {"main": "main", "youtube": "youtube"}
+def probe_rows(status: dict, options: list, picks: dict) -> list[dict]:
+    """The rows of podkop-probe's CSV with the rules each server went to and,
+    for the others, why the probe's limits rule it out. goes_to: [{"rule",
+    "fallback"}]; picks: auto_pick results by rule."""
     where: dict[str, list] = {}
-
-    def add(link: str, rule: str, kind: str, fallback: bool) -> None:
-        where.setdefault(link, []).append({"rule": rule, "kind": kind, "fallback": fallback})
-
-    lists = status.get("lists") or {}
-    for kind in ("main", "youtube"):
-        if sections.get(kind):
-            for fb in (False, True):
-                for link in lists.get(kind + ("_fallback" if fb else "")) or []:
-                    add(link, sections[kind], kind, fb)
-    for rule, pick in (picks or {}).items():
+    for rule, pick in picks.items():
         for fb, key in ((False, "links"), (True, "fallback")):
             for link in pick[key]:
-                add(link, rule, "auto", fb)
-    # rows from an older podkop-probe have no link: match by name
-    by_name = {link_name(k): v for k, v in where.items()}
+                where.setdefault(link, []).append({"rule": rule, "fallback": fb})
     max_ping, min_speed = probe_limits(options)
-    out = []
-    for r in status.get("rows") or []:
-        goes = where.get(r["link"], []) if r.get("link") else by_name.get(r.get("node", ""), [])
-        out.append(dict(r, goes_to=goes, reason="" if goes else probe_reason(r, max_ping, min_speed)))
-    return out
+    return [dict(r, goes_to=where.get(r.get("link") or "", []),
+                 reason="" if where.get(r.get("link") or "") else probe_reason(r, max_ping, min_speed))
+            for r in status.get("rows") or []]
 
 
 PROTOCOLS = ("vless", "trojan", "ss", "hysteria2", "socks")
@@ -364,8 +322,25 @@ def _ip_in(ip: str, nets: list) -> bool:
     return False
 
 
+# what a rule needs from YouTube: nothing, that videos play, that YouTube
+# sees Russia (no ads)
+YOUTUBE_NEEDS = ("", "plays", "ru")
+
+
+def _youtube_why(row: dict, need: str) -> str:
+    st, _, cc = str(row.get("youtube") or "-").partition(":")
+    if st in ("", "-"):
+        return "YouTube was not checked on this server"
+    if st != "ok":
+        return {"bot": "YouTube asks to confirm you're not a bot", "no": "YouTube videos don't play"}.get(st, "YouTube failed")
+    if need == "ru" and cc.upper() != "RU":
+        return f"YouTube sees {cc or 'another country'}, not Russia (ads)"
+    return ""
+
+
 def check_auto_rule(rule: dict) -> dict:
-    """A rule by country as stored: lists cleaned up; raises ValueError."""
+    """A rule that takes servers from the probe, as stored: lists cleaned up;
+    raises ValueError. No countries = any country."""
     countries = sorted({str(c).strip().upper() for c in rule.get("countries") or [] if str(c).strip()})
     if any(not re.fullmatch(r"[A-Z]{2}", c) for c in countries):
         raise ValueError("countries are two-letter codes like PL")
@@ -380,19 +355,26 @@ def check_auto_rule(rule: dict) -> dict:
             raise ValueError(f"{x} is not an IP address or subnet") from None
     try:
         top, fallback = int(rule.get("top", 5)), int(rule.get("fallback", 2))
+        max_ping, min_speed = int(rule.get("max_ping", 700)), float(rule.get("min_speed", 40))
     except (TypeError, ValueError):
-        raise ValueError("how many servers to keep must be a number") from None
+        raise ValueError("server counts and limits must be numbers") from None
     if not 1 <= top <= 50 or not 0 <= fallback <= 50:
         raise ValueError("keep 1 to 50 servers and 0 to 50 fallback")
+    if not 100 <= max_ping <= 5000 or not 0 <= min_speed <= 10000:
+        raise ValueError("max ping is 100 to 5000 ms, min speed 0 to 10000 Mbit/s")
+    youtube = rule.get("youtube") or ""
+    if youtube not in YOUTUBE_NEEDS:
+        raise ValueError("YouTube is '', 'plays' or 'ru'")
     return {"countries": countries, "protocols": protocols, "exit_ips": exit_ips,
-            "name_contains": str(rule.get("name_contains") or "").strip(), "top": top, "fallback": fallback}
+            "name_contains": str(rule.get("name_contains") or "").strip(), "top": top, "fallback": fallback,
+            "max_ping": max_ping, "min_speed": min_speed, "youtube": youtube}
 
 
-def auto_pick(rows: list, rule: dict, max_ping: float, min_speed: float) -> dict:
-    """The servers of the probe's rows for a rule by country: those that pass
-    its filter and the probe's limits, fastest median first; top of them for
-    the URLTest, the next ones as fallback. left_out: servers in the rule's
-    countries that were not taken, with the reason."""
+def auto_pick(rows: list, rule: dict) -> dict:
+    """The servers of the probe's rows for a rule: those that pass its filter
+    and its limits, fastest median first; top of them for the URLTest, the
+    next ones as fallback. left_out: servers in the rule's countries that
+    were not taken, with the reason."""
     picked, left = [], []
     for r in rows:
         link = r.get("link")
@@ -410,7 +392,9 @@ def auto_pick(rows: list, rule: dict, max_ping: float, min_speed: float) -> dict
         elif rule["name_contains"] and rule["name_contains"].lower() not in name.lower():
             why = f"name does not contain {rule['name_contains']}"
         else:
-            why = probe_reason(r, max_ping, min_speed)
+            why = probe_reason(r, rule["max_ping"], rule["min_speed"])
+            if not why and rule["youtube"]:
+                why = _youtube_why(r, rule["youtube"])
         item = {"name": name, "link": link, "protocol": link_protocol(link), "exit_ip": r.get("exit_ip"),
                 "country": r.get("country"), "median": r.get("median"), "mbit": r.get("mbit"), "verdict": r.get("verdict")}
         if why:
@@ -421,7 +405,7 @@ def auto_pick(rows: list, rule: dict, max_ping: float, min_speed: float) -> dict
     keep, fb = picked[:rule["top"]], picked[rule["top"]:rule["top"] + rule["fallback"]]
     left += [dict(x, reason=f"not among the {rule['top'] + rule['fallback']} fastest")
              for x in picked[rule["top"] + rule["fallback"]:]]
-    return {"matched": keep, "fallback_rows": fb, "left_out": left,
+    return {"matched": keep, "fallback_rows": fb, "left_out": left, "youtube": bool(rule["youtube"]),
             "links": [x["link"] for x in keep], "fallback": [x["link"] for x in fb]}
 
 

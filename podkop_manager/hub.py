@@ -82,6 +82,7 @@ class Hub:
         rt.alert = ev
         self.update_draft(rt)
         self.db.sync_sub_keys(rt.id, self.db.probe_settings(rt.id)["keys"])
+        self._lists_to_rules(rt.id)
         rt.tasks = [asyncio.create_task(self._poll_loop(rt)), asyncio.create_task(self._watch_loop(rt)),
                     asyncio.create_task(self._usage_loop(rt))]
         return rt
@@ -272,7 +273,7 @@ class Hub:
             raise AgentError("no_keys", "add your keys (subscription URLs) first")
         if rid in self.probes and not self.probes[rid].done():
             raise AgentError("busy", "a probe is already running")
-        await rt.agent.call("probe-start", payload={"keys": ps["keys"], "options": ps["options"]}, timeout=30)
+        await rt.agent.call("probe-start", payload={"keys": ps["keys"], "options": self.probe_options(rid)}, timeout=30)
         run_id = self.db.add_probe_run(rid, trigger, ps["keys"])
         self.probes[rid] = asyncio.create_task(self._track_probe(rt, run_id, trigger))
         self.publish({"type": "probe", "router_id": rid, "state": "running", "run": run_id})
@@ -310,11 +311,46 @@ class Hub:
         self.db.add_event(rt.id, etype, data)
         self.publish({"type": "event", "router_id": rt.id, "event": etype, "data": data, "t": time.time()})
 
+    def _lists_to_rules(self, rid: int) -> None:
+        """Once: the probe's own main and YouTube lists of older versions become
+        rules that take servers from the probe, with the same limits."""
+        if self.db.get_setting(f"lists_to_rules:{rid}"):
+            return
+        self.db.set_setting(f"lists_to_rules:{rid}", True)
+        ps = self.db.probe_settings(rid)
+        if not ps.get("keys") and not self.db.probe_runs(rid):
+            return
+        opts = ps.get("options") or []
+        max_ping, min_speed = podkop.probe_limits(opts)
+        top = int(podkop._option(opts, "--top", 10))
+        for section, youtube in ((ps.get("main_section"), ""), (ps.get("youtube_section"), "ru")):
+            if section and not self.db.auto_rule(rid, section) and not (youtube and "--no-youtube" in opts):
+                self.db.set_auto_rule(rid, section, podkop.check_auto_rule(
+                    {"top": top, "fallback": 5, "max_ping": max_ping, "min_speed": min_speed, "youtube": youtube}))
+
     def auto_picks(self, rid: int, status: dict) -> dict:
-        """The servers of the last probe for each rule by country."""
-        max_ping, min_speed = podkop.probe_limits(self.db.probe_settings(rid).get("options") or [])
-        return {r["section"]: podkop.auto_pick(status.get("rows") or [], r, max_ping, min_speed)
-                for r in self.db.auto_rules(rid)}
+        """The servers of the last probe for each rule that takes them from it."""
+        return {r["section"]: podkop.auto_pick(status.get("rows") or [], r) for r in self.db.auto_rules(rid)}
+
+    def probe_options(self, rid: int) -> list:
+        """The probe's options for a run: what to test from the probe page, the
+        loosest limits of the rules, and the YouTube check if a rule needs it."""
+        opts, out = self.db.probe_settings(rid).get("options") or [], []
+        skip = {"--max-ping": 1, "--min-speed": 1, "--top": 1, "--youtube-noads": 1, "--no-youtube": 0}
+        i = 0
+        while i < len(opts):
+            if opts[i] in skip:
+                i += 1 + skip[opts[i]]
+                continue
+            out.append(opts[i])
+            i += 1
+        rules = self.db.auto_rules(rid)
+        if rules:
+            out += ["--max-ping", str(max(r["max_ping"] for r in rules)),
+                    "--min-speed", f"{min(r['min_speed'] for r in rules):g}"]
+        if not any(r["youtube"] for r in rules):
+            out.append("--no-youtube")
+        return out
 
     def _avoided_links(self, rid: int) -> set:
         """Links of the keys that passed their traffic threshold and are set to
@@ -328,18 +364,11 @@ class Hub:
         filled in, without the servers of keys moved away from; ValueError
         when nothing would change."""
         if avoided := self._avoided_links(rid):
-            keep = [r for r in status.get("rows") or [] if usage.norm(r.get("link") or "") not in avoided]
-            lists = {n: [x for x in v if usage.norm(x) not in avoided] for n, v in (status.get("lists") or {}).items()}
-            for n in ("main", "youtube"):
-                if not lists.get(n) and lists.get(f"{n}_fallback"):
-                    lists[n], lists[f"{n}_fallback"] = lists[f"{n}_fallback"], []
-            status = dict(status, rows=keep, lists=lists)
-        ps, lists = self.db.probe_settings(rid), status.get("lists") or {}
+            status = dict(status, rows=[r for r in status.get("rows") or [] if usage.norm(r.get("link") or "") not in avoided])
         picks = self.auto_picks(rid, status)
-        if not lists.get("main") and not lists.get("youtube") and not any(p["links"] for p in picks.values()):
-            raise ValueError("the probe found no server to use")
-        return podkop.merge_probe(cur["config"], lists, ps.get("main_section") or "main",
-                                  ps.get("youtube_section") or None, picks)
+        if not any(p["links"] for p in picks.values()):
+            raise ValueError("the probe found no server for any rule")
+        return podkop.merge_probe(cur["config"], picks)
 
     async def apply_probe(self, rid: int, status: dict, note: str) -> int:
         cur = await self.config(rid)

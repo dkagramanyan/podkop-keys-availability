@@ -4,7 +4,8 @@
   podkop-manager public-key [--data DIR]
 
 Credentials come from the environment (.env with Docker Compose):
-  PODKOP_MANAGER_PASSWORD         the web login, at least 8 characters
+  PODKOP_MANAGER_USER             the web login's name (default admin)
+  PODKOP_MANAGER_PASSWORD         its password, at least 8 characters
   PODKOP_MANAGER_ROUTER_PASSWORD  routers' root password, used when adding a
                                   router with the password field left empty
 """
@@ -82,7 +83,8 @@ def main(argv: list[str] | None = None) -> int:
     logging.getLogger("asyncssh").setLevel(logging.WARNING)
     host, _, port = a.listen.rpartition(":")
     app = create_app(db, Hub(db, key_path, src), public_key, password,
-                     os.environ.get("PODKOP_MANAGER_ROUTER_PASSWORD", ""))
+                     os.environ.get("PODKOP_MANAGER_ROUTER_PASSWORD", ""),
+                     os.environ.get("PODKOP_MANAGER_USER", "").strip() or "admin")
     uvicorn.run(app, host=host or "0.0.0.0", port=int(port), log_level="warning", proxy_headers=False)
     return 0
 

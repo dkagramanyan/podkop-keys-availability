@@ -81,13 +81,15 @@ def test_login_required(tmp_path):
     with client(tmp_path) as c:
         assert c.get("/api/schema").status_code == 401
         assert c.get("/", follow_redirects=False).headers["location"] == "/login"
-        r = c.post("/login", data={"password": "wrong"}, follow_redirects=False)
+        r = c.post("/login", data={"user": "admin", "password": "wrong"}, follow_redirects=False)
+        assert r.headers["location"] == "/login?bad=1"
+        r = c.post("/login", data={"user": "root", "password": "secret-pass"}, follow_redirects=False)
         assert r.headers["location"] == "/login?bad=1"
 
 
 def test_login_and_header_check(tmp_path):
     with client(tmp_path) as c:
-        c.post("/login", data={"password": "secret-pass"})
+        c.post("/login", data={"user": "admin", "password": "secret-pass"})
         assert c.get("/api/schema").json()["podkop"] == "0.7.24"
         assert c.get("/api/manager").json()["public_key"].startswith("ssh-ed25519")
         assert c.get("/api/routers").json() == []
@@ -98,7 +100,7 @@ def test_login_and_header_check(tmp_path):
 
 def test_draft_api(tmp_path):
     with client(tmp_path, with_router=True) as c:
-        c.post("/login", data={"password": "secret-pass"})
+        c.post("/login", data={"user": "admin", "password": "secret-pass"})
         assert c.get("/api/routers/1/draft").json() is None
         cfg = {"sections": [{"name": "settings", "type": "settings", "options": {}}]}
         assert c.put("/api/routers/1/draft", json={"config": {"x": 1}}, headers=H).status_code == 400
@@ -111,7 +113,7 @@ def test_draft_api(tmp_path):
 
 def test_logs_filters_and_parsed_fields(tmp_path):
     with client(tmp_path, with_router=True) as c:
-        c.post("/login", data={"password": "secret-pass"})
+        c.post("/login", data={"user": "admin", "password": "secret-pass"})
         c.db.add_log(1, "Sat Oct 17 23:18:40 2026 user.notice podkop: [info] Stopping", "podkop", "info")
         c.db.add_log(1, "Sat Oct 17 23:18:48 2026 daemon.err sing-box[1]: WARN[0000] slow", "sing-box", "warn")
         c.db.add_log(1, "Sat Oct 17 23:18:49 2026 daemon.err sing-box[1]: ERROR[0000] dead", "sing-box", "error")
@@ -123,7 +125,7 @@ def test_logs_filters_and_parsed_fields(tmp_path):
 
 def test_versions_trigger_reason_and_paging(tmp_path):
     with client(tmp_path, with_router=True) as c:
-        c.post("/login", data={"password": "secret-pass"})
+        c.post("/login", data={"user": "admin", "password": "secret-pass"})
         db = c.db
         v1 = db.add_version(1, {"sections": []}, [], "first", "fp0")
         db.update_version(v1, state="applied", details={"state": "applied", "fingerprint_after": "fp1",
@@ -147,7 +149,7 @@ def test_router_password_from_env(tmp_path, monkeypatch):
 
     monkeypatch.setattr(web, "install", fake_install)
     with client(tmp_path, router_password="env-root-pass") as c:
-        c.post("/login", data={"password": "secret-pass"})
+        c.post("/login", data={"user": "admin", "password": "secret-pass"})
         assert c.get("/api/manager").json()["router_password"] is True
         c.post("/api/routers", json={"host": "192.168.1.1", "password": ""}, headers=H)
         c.post("/api/routers", json={"host": "192.168.1.1", "password": "typed-pass"}, headers=H)
@@ -176,13 +178,14 @@ def test_old_database_gets_new_columns(tmp_path):
 def test_auto_rules_api_and_preview_from_last_run(tmp_path):
     from test_podkop import ROWS
     with client(tmp_path, with_router=True) as c:
-        c.post("/login", data={"password": "secret-pass"})
-        assert c.put("/api/routers/1/auto-rules/main", json={"countries": ["PL"]}, headers=H).status_code == 400
+        c.post("/login", data={"user": "admin", "password": "secret-pass"})
+        assert c.put("/api/routers/1/auto-rules/main", json={"youtube": "ru", "max_ping": 500}, headers=H).json()["youtube"] == "ru"
+        assert c.put("/api/routers/1/auto-rules/bad-name", json={}, headers=H).status_code == 400
         assert c.put("/api/routers/1/auto-rules/netflix", json={"countries": ["Poland"]}, headers=H).status_code == 400
         r = c.put("/api/routers/1/auto-rules/netflix", json={"countries": ["pl"], "protocols": ["vless"], "top": 2,
                                                              "fallback": 1}, headers=H).json()
         assert r["countries"] == ["PL"] and r["top"] == 2
-        assert [x["section"] for x in c.get("/api/routers/1/auto-rules").json()] == ["netflix"]
+        assert [x["section"] for x in c.get("/api/routers/1/auto-rules").json()] == ["main", "netflix"]
         run = c.db.add_probe_run(1, "manual")
         c.db.finish_probe_run(run, "done", {"finished": "2026-10-17T21:00:00Z", "rows": ROWS})
         p = c.get("/api/routers/1/auto-rules/netflix/preview").json()
@@ -194,10 +197,14 @@ def test_auto_rules_api_and_preview_from_last_run(tmp_path):
 
 def test_keys_api(tmp_path):
     with client(tmp_path, with_router=True) as c:
-        c.post("/login", data={"password": "secret-pass"})
+        c.post("/login", data={"user": "admin", "password": "secret-pass"})
         c.put("/api/routers/1/probe", json={"keys": ["https://sub.example.com/a", "not a url"]}, headers=H)
         assert [(k["kind"], k["url"]) for k in c.db.keys(1)] == [("sub", "https://sub.example.com/a")]
         assert c.post("/api/routers/1/keys", json={"link": "vmess://x"}, headers=H).status_code == 400
+        sub2 = c.post("/api/routers/1/keys", json={"link": "https://sub.example.com/b", "label": "b"}, headers=H).json()["id"]
+        assert c.db.probe_settings(1)["keys"] == ["https://sub.example.com/a", "https://sub.example.com/b"]
+        assert c.delete(f"/api/keys/{sub2}", headers=H).json() == {"ok": True}
+        assert c.db.probe_settings(1)["keys"] == ["https://sub.example.com/a"]
         kid = c.post("/api/routers/1/keys", json={"link": "vless://x@h:1#fra", "limit_gb": 10}, headers=H).json()["id"]
         assert c.post("/api/routers/1/keys", json={"link": "vless://x@h:1#fra"}, headers=H).status_code == 400
         assert c.put(f"/api/keys/{kid}", json={"threshold": 20}, headers=H).status_code == 400
@@ -206,8 +213,6 @@ def test_keys_api(tmp_path):
         assert (k["action"], k["threshold"], k["limit_source"]) == ("avoid", 80, "manual")   # a link has no provider
         u = c.get("/api/routers/1/usage").json()
         assert [(x["label"], x["limit"]) for x in u["keys"]] == [("sub.example.com", 0), ("fra", 10 * 1024 ** 3)]
-        sub = c.db.keys(1)[0]["id"]
-        assert c.delete(f"/api/keys/{sub}", headers=H).status_code == 400
         assert c.delete(f"/api/keys/{kid}", headers=H).json() == {"ok": True}
         c.put("/api/routers/1/probe", json={"keys": []}, headers=H)
         assert c.db.keys(1) == []

@@ -617,13 +617,13 @@ async function viewOverview(main, id) {
         h("a", { class: "alink", href: `#/r/${id}/rules` }, "Open changes")));
     }
     const ps = data.probe && data.probe.status;
-    if (ps && ps.state === "done" && cfg && probeIsNew(ps, cfg, data.probe.settings)) {
-      const n = (k) => asList(ps.lists[k]).length;
+    if (ps && ps.state === "done" && probeIsNew(data.probe)) {
       const rows = ps.rows || [];
       const usable = rows.filter((r) => ["GOOD", "OK", "FLAKY"].includes(r.verdict)).length;
+      const rules = data.probe.auto_rules.filter((r) => r.differs).map((r) => `${r.section} ${r.picked} and ${r.picked_fallback} fallback`);
       notes.push(h("div", { class: "note" }, h("span", { class: "dot accent" }),
-        h("div", { class: "col" }, h("span", {}, `Probe from ${shortWhen(agentTime(ps.finished))} has new server lists`),
-          h("span", {}, `main ${n("main")} and ${n("main_fallback")} fallback, YouTube ${n("youtube")} and ${n("youtube_fallback")} fallback. ${usable} of ${rows.length} servers usable.`)),
+        h("div", { class: "col" }, h("span", {}, `Probe from ${shortWhen(agentTime(ps.finished))} has new servers`),
+          h("span", {}, `${rules.join(", ")}. ${usable} of ${rows.length} servers usable.`)),
         h("a", { class: "alink", href: `#/r/${id}/probe` }, "See results")));
     }
     for (const a of (rt.usage && rt.usage.alerts) || []) {
@@ -672,7 +672,7 @@ async function viewOverview(main, id) {
               h("td", { class: "mono", style: "font-size: 13px; font-weight: 500" }, sec.name),
               h("td", { style: "color: var(--text-2)" }, ruleMatches(sec)),
               h("td", {}, data.auto[sec.name] && (sec.options || {}).connection_type === "proxy"
-                ? h("span", { class: "dest" }, `Proxy, ${data.auto[sec.name].countries.join(", ") || "any country"} servers`) : destChip(sec)),
+                ? h("span", { class: "dest" }, `Proxy, from subscriptions${data.auto[sec.name].countries.length ? ", " + data.auto[sec.name].countries.join(", ") : ""}`) : destChip(sec)),
               h("td", {}, h("span", { class: "row", style: "gap: 8px" }, h("span", { class: now.bad ? "bad-text" : "" }, now.text),
                 now.mode ? h("span", { class: "mode" }, now.mode) : null)));
           }),
@@ -730,19 +730,8 @@ async function viewOverview(main, id) {
   };
 }
 
-// the probe's lists differ from what the rules it fills have now
-function probeIsNew(ps, cfg, settings) {
-  const by = bySection(cfg);
-  const check = (key, section) => {
-    const links = asList(ps.lists && ps.lists[key]);
-    if (!links.length || !section) return false;
-    const s = by.get(section);
-    return !s || !same(asList((s.options || {}).urltest_proxy_links), links)
-      || !same(asList((s.options || {}).urltest_fallback_links), asList(ps.lists[`${key}_fallback`]));
-  };
-  return check("main", (settings && settings.main_section) || "main")
-    || check("youtube", settings ? settings.youtube_section : "youtube");
-}
+// the last probe run picked other servers than some rule has now
+const probeIsNew = (probe) => (probe.auto_rules || []).some((r) => r.differs);
 
 // --- servers ------------------------------------------------------------------------------------
 
@@ -1143,7 +1132,6 @@ const FINAL_STATES = ["applied", "saved", "unchanged", "rejected", "reverted", "
 
 const VALUE_OPTIONS = ["--countries", "--max-ping", "--min-speed", "--top"];
 const USABLE = ["GOOD", "OK", "FLAKY"];
-const FALLBACK = 5;   // podkop-probe's fallback servers per list
 
 // podkop-probe's options as a form: {"--countries": "europe", ..., flags: Set, rest: [...]}
 function parseOptions(opts) {
@@ -1169,11 +1157,13 @@ const countryName = (cc) => {
   try { return new Intl.DisplayNames(["en"], { type: "region" }).of(cc); } catch { return cc; }
 };
 
-// "exit PL, vless, 5 and 2 fallback"
+// "exit PL, vless, ping < 700 ms, YouTube RU, 5 and 2 fallback"
 const autoRuleSummary = (r) => [
-  r.countries.length ? `exit ${r.countries.join(", ")}` : "any exit country",
-  r.protocols.length ? r.protocols.join(", ") : "any protocol",
-  `${r.top} and ${r.fallback} fallback`].join(", ");
+  r.countries.length ? `exit ${r.countries.join(", ")}` : "any country",
+  r.protocols.length ? r.protocols.join(", ") : null,
+  `ping < ${r.max_ping} ms, > ${r.min_speed} Mbit/s`,
+  r.youtube === "ru" ? "YouTube RU" : r.youtube === "plays" ? "YouTube plays" : null,
+  `${r.top} and ${r.fallback} fallback`].filter(Boolean).join(", ");
 
 function verdictTag(v) {
   const cls = { GOOD: "good", OK: "good", FLAKY: "flaky" }[v] || "dead";
@@ -1183,7 +1173,7 @@ function verdictTag(v) {
 function goesTags(row) {
   if (!row.goes_to.length) return h("span", { class: "xs muted" }, "not used");
   return h("span", { class: "row", style: "gap: 4px" }, row.goes_to.map((g) => h("span", {
-    class: `box-tag ${g.fallback ? "fb" : `k-${g.kind === "youtube" ? "yt" : g.kind}`}`,
+    class: `box-tag ${g.fallback ? "fb" : "k-main"}`,
     title: g.fallback ? `fallback of ${g.rule}` : null,
   }, g.fallback ? `${g.rule} fallback` : g.rule)));
 }
@@ -1191,26 +1181,18 @@ function goesTags(row) {
 async function viewProbe(main, id) {
   const page = h("div", { class: "page" });
   put(main, page);
-  let data, config = null;
+  let data;
   let form;            // the left column's values, saved with Save
   let filter = "picked";
   let lastState = null;
 
-  const load = async () => {
-    const [p, c] = await Promise.all([api("GET", `/api/routers/${id}/probe`),
-      api("GET", `/api/routers/${id}/config`).catch(() => null)]);
-    data = p; config = c;
-  };
+  const load = async () => { data = await api("GET", `/api/routers/${id}/probe`); };
   const resetForm = () => {
     const ps = data.settings, o = parseOptions(ps.options || []);
     const c = o["--countries"] || "all";
     form = {
-      keys: [...(ps.keys || [])], newKey: "",
       countries: ["europe", "all"].includes(c) ? c : "choose", codes: ["europe", "all"].includes(c) ? "" : c,
-      maxPing: o["--max-ping"] || "", minSpeed: o["--min-speed"] || "", top: o["--top"] || "",
-      youtube: !o.flags.has("--no-youtube"), quick: o.flags.has("-q"), rest: o.rest,
-      main: ps.main_section || "main", yt: ps.youtube_section || "youtube",
-      schedule: ps.schedule || "", auto: !!ps.auto_apply,
+      quick: o.flags.has("-q"), rest: o.rest, schedule: ps.schedule || "", auto: !!ps.auto_apply,
     };
   };
 
@@ -1218,78 +1200,39 @@ async function viewProbe(main, id) {
     const options = [];
     const countries = form.countries === "choose" ? form.codes.trim() : form.countries;
     if (countries) options.push("--countries", countries);
-    if (String(form.maxPing).trim()) options.push("--max-ping", String(form.maxPing).trim());
-    if (String(form.minSpeed).trim()) options.push("--min-speed", String(form.minSpeed).trim());
-    if (String(form.top).trim()) options.push("--top", String(form.top).trim());
-    if (!form.youtube) options.push("--no-youtube");
     if (form.quick) options.push("-q");
     options.push(...form.rest);
-    data.settings = await api("PUT", `/api/routers/${id}/probe`, {
-      keys: form.keys, options, schedule: form.schedule, auto_apply: form.auto,
-      main_section: form.main, youtube_section: form.youtube ? form.yt : "",
-    });
+    data.settings = await api("PUT", `/api/routers/${id}/probe`, { options, schedule: form.schedule, auto_apply: form.auto });
   };
 
   const left = () => {
-    const sections = rulesOf(config && config.config).filter((s) => (s.options || {}).connection_type === "proxy").map((s) => s.name);
     const keys = (data.status && data.status.keys) || {};
-    const top = form.top || 10;
-    const sectionSelect = (value, onchange, id_, extra) => h("select", { id: id_, class: "input sm mono", style: "width: auto",
-      onchange: (e) => onchange(e.target.value), disabled: extra && extra.disabled },
-    [...new Set([...sections, value].filter(Boolean))].map((n) => h("option", { value: n, selected: n === value },
-      sections.includes(n) ? n : `${n} (new rule)`)));
-    const num = (label, key, unit, ph) => h("div", { class: "field" }, h("label", { for: `p-${key}` }, label),
-      h("div", { class: "unit" }, h("input", { id: `p-${key}`, class: "input mid", inputmode: "numeric", placeholder: ph, value: form[key],
-        oninput: (e) => { form[key] = e.target.value; } }), h("span", {}, unit)));
-    const addKey = () => {
-      const v = form.newKey.trim();
-      if (!/^https?:\/\//.test(v)) return toast("A subscription URL starts with https://", true);
-      if (!form.keys.includes(v)) form.keys.push(v);
-      form.newKey = ""; drawLeft();
-    };
+    const rules = data.auto_rules || [];
     return h("div", { class: "stack", style: "flex: 1 1 340px; min-width: 0" },
       h("section", { class: "card pad", "aria-labelledby": "p-subs" },
-        h("h2", { id: "p-subs" }, "Subscriptions"),
-        form.keys.map((k, i) => {
+        h("div", { class: "row", style: "justify-content: space-between" }, h("h2", { id: "p-subs" }, "Keys"),
+          h("a", { class: "alink small", href: `#/r/${id}/usage` }, "Manage keys")),
+        (data.settings.keys || []).length ? data.settings.keys.map((k) => {
           const info = keys[k];
-          return h("div", { class: "subscr" },
-            h("div", { class: "col" }, h("span", { class: "ellipsis", title: keyLabel(k) }, keyLabel(k)),
-              info ? h("span", { class: info.error ? "bad-text" : "" }, info.error ? info.error : `${info.servers} servers in the last run`) : null),
-            h("button", { type: "button", class: "btn icon", "aria-label": "Remove subscription", onclick: () => {
-              form.keys.splice(i, 1); drawLeft();
-            } }, icon("trash", 14, { width: 1.6 })));
-        }),
-        h("div", { class: "row", style: "flex-wrap: nowrap" },
-          h("label", { for: "newsub", class: "sr" }, "Subscription URL"),
-          h("input", { id: "newsub", class: "input mono", placeholder: "https:// subscription URL", value: form.newKey,
-            style: "font-size: 12.5px", oninput: (e) => { form.newKey = e.target.value; },
-            onkeydown: (e) => { if (e.key === "Enter") addKey(); } }),
-          h("button", { type: "button", class: "btn", onclick: addKey }, "Add"))),
+          return h("div", { class: "subscr" }, h("div", { class: "col" }, h("span", { class: "ellipsis", title: keyLabel(k) }, keyLabel(k)),
+            info ? h("span", { class: info.error ? "bad-text" : "" }, info.error ? info.error : `${info.servers} servers in the last run`) : null));
+        }) : h("p", { class: "small muted" }, "No subscriptions yet: add them under Keys and usage.")),
       h("section", { class: "card pad", "aria-labelledby": "p-filters" },
-        h("h2", { id: "p-filters" }, "What counts as good"),
+        h("h2", { id: "p-filters" }, "What to test"),
         h("div", { class: "field" }, h("span", { class: "label" }, "Countries"),
           seg([["europe", "Europe"], ["all", "All"], ["choose", "Choose"]], form.countries, (v) => { form.countries = v; drawLeft(); }, { label: "Countries" }),
           form.countries === "choose" ? h("input", { class: "input mid mono", placeholder: "Codes, e.g. DE,NL,FI", value: form.codes,
             "aria-label": "Country codes", oninput: (e) => { form.codes = e.target.value; } }) : null),
-        h("div", { style: "display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px" },
-          num("Max ping", "maxPing", "ms", "700"), num("Min speed", "minSpeed", "Mbit/s", "40"), num("Per list", "top", "servers", "10")),
-        h("label", { class: "check" }, h("input", { type: "checkbox", checked: form.youtube, onchange: (e) => { form.youtube = e.target.checked; drawLeft(); } }),
-          h("span", { class: "col" }, h("span", {}, "Build a YouTube list"), h("span", {}, "Where YouTube sees Russia, no ads"))),
         h("label", { class: "check" }, h("input", { type: "checkbox", checked: form.quick, onchange: (e) => { form.quick = e.target.checked; } }),
           h("span", {}, "Quick run"))),
       h("section", { class: "card pad", "aria-labelledby": "p-into" },
         h("h2", { id: "p-into" }, "Into podkop"),
-        h("div", { style: "display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px 12px; align-items: center" },
-          h("label", { for: "r-main", style: "font-size: 13.5px" }, `Main list, ${top} and ${FALLBACK} fallback`),
-          sectionSelect(form.main, (v) => { form.main = v; }, "r-main"),
-          h("label", { for: "r-yt", style: "font-size: 13.5px" }, `YouTube list, ${top} and ${FALLBACK} fallback`),
-          sectionSelect(form.yt, (v) => { form.yt = v; }, "r-yt", { disabled: !form.youtube })),
-        h("div", { class: "sep stack", style: "gap: 8px" },
-          h("span", { style: "font-size: 13.5px; font-weight: 500" }, "Rules with servers by country"),
-          (data.auto_rules || []).map((r) => h("a", { href: `#/r/${id}/rules/${r.section}`, class: "subscr", style: "padding: 9px 10px; color: var(--text)" },
+        h("div", { class: "stack", style: "gap: 8px" },
+          rules.map((r) => h("a", { href: `#/r/${id}/rules/${r.section}`, class: "subscr", style: "padding: 9px 10px; color: var(--text)" },
             h("span", { class: "mono", style: "font-size: 13px; font-weight: 500" }, r.section),
             h("span", { class: "xs muted grow" }, autoRuleSummary(r)), icon("right", 14, { stroke: "var(--muted)", width: 1.6 }))),
-          (data.auto_rules || []).length ? null : h("span", { class: "xs muted" }, "None. In a rule: Sends to → From my subscriptions.")),
+          h("span", { class: "xs muted" }, rules.length ? "Each rule picks its servers with its own limits, set in the rule."
+            : "No rule takes servers from the probe. In a rule: Sends to → From my subscriptions.")),
         h("div", { class: "sep stack", style: "gap: 10px" },
           h("div", { class: "row", style: "justify-content: space-between" },
             h("label", { for: "sched", style: "font-size: 13.5px; font-weight: 500" }, "Every night at"),
@@ -1327,13 +1270,11 @@ async function viewProbe(main, id) {
     const run = (data.runs || [])[0];
     const by = run && run.trigger === "schedule" ? "by the nightly schedule" : "by you";
     const started = agentTime(st.started), finished = agentTime(st.finished);
-    const isNew = st.state === "done" && config && probeIsNew(st, config.config, data.settings)
-      || (st.state === "done" && (data.auto_rules || []).some((r) => r.picked));
+    const isNew = st.state === "done" && probeIsNew(data);
     let sub = `Started ${by} at ${started ? shortWhen(started) : "?"}`;
     if (st.state === "running") sub += ". Running now, this takes 2 to 10 minutes.";
     else if (finished && started) sub += `, took ${duration(finished - started)}.`;
     if (st.state === "done") sub += isNew ? " Not applied yet." : " Its servers are in podkop.";
-    const n = (k) => asList(st.lists && st.lists[k]).length;
     const shown = rows.filter((r) => filter === "all" || (filter === "usable" ? USABLE.includes(r.verdict) : r.goes_to.length || r.reason));
     const pill = { running: ["running", "accent"], done: ["done", "ok"], failed: ["failed", "bad"] }[st.state] || [st.state, ""];
     return h("section", { class: "card clip", "aria-labelledby": "p-last" },
@@ -1346,9 +1287,7 @@ async function viewProbe(main, id) {
       rows.length ? h("div", { class: "totals" },
         h("div", {}, h("span", {}, "Tested"), h("span", {}, rows.length)),
         h("div", {}, h("span", {}, "Usable"), h("span", {}, usable.length)),
-        h("div", {}, h("span", {}, "Main list"), h("span", {}, `${n("main")} + ${n("main_fallback")}`)),
-        data.settings.youtube_section ? h("div", {}, h("span", {}, "YouTube list"), h("span", {}, `${n("youtube")} + ${n("youtube_fallback")}`)) : null,
-        (data.auto_rules || []).map((r) => h("div", {}, h("span", {}, `${r.section}${r.countries.length ? ", " + r.countries.join(", ") : ""}`),
+        (data.auto_rules || []).map((r) => h("div", {}, h("span", {}, r.section),
           h("span", {}, `${r.picked || 0} + ${r.picked_fallback || 0}`)))) : null,
       rows.length ? h("div", { class: "row", style: "padding: 12px 18px" },
         [["all", `All ${rows.length}`], ["usable", `Usable ${usable.length}`], ["picked", "Picked and rejected"]].map(([v, t]) =>
@@ -1499,7 +1438,7 @@ async function viewUsage(main, id) {
     h("select", { id: `act-${k.id}`, class: "input", style: "width: auto; height: 32px", onchange: (e) => save(k, { action: e.target.value }) },
       h("option", { value: "avoid", selected: k.action === "avoid" }, "Move rules to other keys"),
       h("option", { value: "warn", selected: k.action === "warn" }, "Only warn me")));
-  const editBtn = (k) => h("button", { type: "button", class: "btn sm", onclick: () => editKey(k) }, "Edit limit");
+  const editBtn = (k) => h("button", { type: "button", class: "btn sm", onclick: () => editKey(k) }, "Edit");
 
   const byRule = (k) => {
     const tot = k.by_rule.reduce((a, r) => a + r.bytes, 0);
@@ -1600,21 +1539,27 @@ async function viewUsage(main, id) {
   };
 
   const addLink = () => {
-    const f = { link: h("input", { class: "input mono", id: "nk-link", placeholder: "vless://…" }),
+    const f = { link: h("input", { class: "input mono", id: "nk-link", placeholder: "https://… subscription, or vless://… link" }),
       label: h("input", { class: "input", id: "nk-label", placeholder: "e.g. fra-personal" }),
       limit: h("input", { class: "input mid", id: "nk-limit", inputmode: "decimal", placeholder: "10" }) };
     return h("form", { class: "card pad", "aria-labelledby": "u-add", onsubmit: async (e) => {
       e.preventDefault();
       try {
-        await api("POST", `/api/routers/${id}/keys`, { link: f.link.value.trim(), label: f.label.value.trim(), limit_gb: f.limit.value || 0 });
+        const link = f.link.value.trim();
+        await api("POST", `/api/routers/${id}/keys`, { link, label: f.label.value.trim(), limit_gb: f.limit.value || 0 });
+        if (/^https?:\/\//.test(link)) {
+          toast("Subscription added: its usage shows up in a minute, its servers after the next probe run");
+          api("POST", `/api/routers/${id}/usage/refresh`).then((d) => { data = d; draw(); }).catch(() => {});
+        }
         await load(); draw();
       } catch (err) { toast(err.message, true); }
     } },
-    h("h2", { id: "u-add" }, "Add a single link"),
+    h("h2", { id: "u-add" }, "Add a key"),
     h("div", { class: "auto-grid", style: "grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr))" },
-      h("div", { class: "field", style: "grid-column: span 2" }, h("label", { for: "nk-link" }, "Link"), f.link),
+      h("div", { class: "field", style: "grid-column: span 2" }, h("label", { for: "nk-link" }, "Subscription URL or link"), f.link),
       h("div", { class: "field" }, h("label", { for: "nk-label" }, "Name"), f.label),
-      h("div", { class: "field" }, h("label", { for: "nk-limit" }, "GB per day"), h("div", { class: "unit" }, f.limit, h("span", {}, "GB")))),
+      h("div", { class: "field" }, h("label", { for: "nk-limit" }, "GB per day"), h("div", { class: "unit" }, f.limit, h("span", {}, "GB")),
+        h("span", { class: "help" }, "For a link; a subscription's limit comes from the provider"))),
     h("div", {}, h("button", { type: "submit", class: "btn" }, "Add")));
   };
 
@@ -1643,11 +1588,11 @@ async function viewUsage(main, id) {
     const box = h("div", { class: "stack" });
     const redraw = () => put(box, body());
     redraw();
-    const m = modal({ title: `Limit of ${k.label}`, narrow: true, body: box,
-      foot: [k.kind === "link" ? h("button", { type: "button", class: "btn danger", onclick: async () => {
-        if (!confirm(`Remove ${k.label}?`)) return;
+    const m = modal({ title: k.label, narrow: true, body: box,
+      foot: [h("button", { type: "button", class: "btn danger", onclick: async () => {
+        if (!confirm(k.kind === "sub" ? `Remove ${k.label}? The probe stops testing its servers.` : `Remove ${k.label}?`)) return;
         try { await api("DELETE", `/api/keys/${k.id}`); m.close(); await load(); draw(); } catch (e) { toast(e.message, true); }
-      } }, "Remove") : h("span"),
+      } }, "Remove"),
       h("div", { class: "row" }, h("button", { type: "button", class: "btn", onclick: () => m.close() }, "Cancel"),
         h("button", { type: "button", class: "btn primary", onclick: async () => {
           try {
@@ -1674,7 +1619,7 @@ async function viewUsage(main, id) {
       old ? h("div", { class: "banner" }, h("span", { class: "dot warn" }),
         h("span", { class: "grow" }, "podkop-agent on this router is too old to count traffic."), h("a", { class: "alink", href: "#/settings" }, "Reinstall agent")) : null,
       warnings(),
-      data.keys.length ? null : h("div", { class: "card empty" }, "No keys yet: add subscriptions under Servers probe, or a single link below."),
+      data.keys.length ? null : h("div", { class: "card empty" }, "No keys yet: add a subscription or a link below."),
       big.map(bigCard),
       small.length ? h("div", { class: "cards-2" }, small.map(smallCard)) : null,
       history(), servers(), addLink(),
@@ -2043,7 +1988,7 @@ async function viewRules(main, id, sub) {
         h("span", { class: "n" }, i + 1),
         h("div", { class: "col grow", style: "gap: 6px" },
           h("div", { class: "row" }, h("span", { class: "name" }, s.name), tag,
-            auto ? h("span", { class: "tag", style: "background: var(--line-soft); color: var(--text-2)" }, "servers by country") : null),
+            auto ? h("span", { class: "tag", style: "background: var(--line-soft); color: var(--text-2)" }, "from subscriptions") : null),
           h("div", { class: "what" }, h("span", {}, ruleMatches(s)), icon("arrow", 14, { stroke: "var(--muted)" }),
             auto ? h("span", { class: "dest" }, autoDest(auto, s)) : destChip(s))));
       }),
@@ -2076,7 +2021,8 @@ async function viewRules(main, id, sub) {
 }
 
 // "Proxy, PL servers, 4"
-const autoDest = (rule, sec) => `Proxy, ${rule.countries.length ? rule.countries.join(", ") : "any country"} servers, ${asList((sec.options || {}).urltest_proxy_links).length}`;
+const autoDest = (rule, sec) => `Proxy, fastest ${asList((sec.options || {}).urltest_proxy_links).length} from subscriptions${
+  rule.countries.length ? ", " + rule.countries.join(", ") : ""}`;
 
 function ruleEditor(w, s, { onRename }) {
   const defs = S.schema.section;
@@ -2268,7 +2214,7 @@ function proxyAdvanced(w, b, s, ct, pt) {
   return det;
 }
 
-// --- rules whose servers the probe picks by country ----------------------------------------------------------
+// --- rules whose servers the probe picks from the subscriptions ----------------------------------------------------------
 
 function sourceCards(w, s, auto) {
   const card = (on, title, sub, onclick) => h("button", { type: "button", "aria-pressed": String(on), onclick,
@@ -2279,13 +2225,14 @@ function sourceCards(w, s, auto) {
   return h("div", { role: "group", "aria-label": "Where servers come from",
     style: "display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 10px" },
   card(!auto, "Links I add", "Paste vless:// and other links", () => auto && toggleAuto(w, s, false)),
-  card(!!auto, "From my subscriptions", "Picked by the probe, by country", () => !auto && toggleAuto(w, s, true)));
+  card(!!auto, "From my subscriptions", "Picked by the probe with this rule's limits", () => !auto && toggleAuto(w, s, true)));
 }
 
 async function toggleAuto(w, s, on) {
   try {
     if (on) {
-      w.auto[s.name] = await api("PUT", `/api/routers/${w.id}/auto-rules/${s.name}`, { countries: [], protocols: [], top: 5, fallback: 2 });
+      w.auto[s.name] = await api("PUT", `/api/routers/${w.id}/auto-rules/${s.name}`, { countries: [], protocols: [], top: 5, fallback: 2,
+        youtube: asList(s.options.community_lists).includes("youtube") ? "ru" : "" });
       const o = s.options;
       o.proxy_config_type = "urltest";
       touch(w);
@@ -2297,7 +2244,7 @@ async function toggleAuto(w, s, on) {
   w.redraw();
 }
 
-// the filter of a rule by country, what it matches now, and its servers in the draft
+// a rule's filter and limits for the probe's servers, what it matches now, and its servers in the draft
 function autoRuleEditor(w, s, rule) {
   const box = h("div", { class: "stack", style: "gap: 16px" });
   const ui = w.ui[`${s.name}:auto`] || (w.ui[`${s.name}:auto`] = { preview: null, loading: false });
@@ -2340,7 +2287,7 @@ function autoRuleEditor(w, s, rule) {
     put(box,
       h("div", { class: "stack", style: "gap: 14px; padding: 16px; border: 1px solid var(--line); border-radius: 10px" },
         h("div", { class: "part-head" }, h("span", { style: "font-size: 13.5px; font-weight: 600" }, "Take servers where"),
-          h("a", { href: `#/r/${w.id}/probe`, class: "xs" }, p ? `${plural(p.keys, "subscription")}, from Servers probe` : "Servers probe")),
+          h("a", { href: `#/r/${w.id}/usage`, class: "xs" }, p ? `${plural(p.keys, "subscription")}, from Keys and usage` : "Keys and usage")),
         h("div", { class: "form-grid", style: "grid-template-columns: minmax(110px, 140px) minmax(0, 1fr); align-items: start" },
           h("span", { class: "lbl", style: "font-weight: 500; padding-top: 6px" }, "Exit country"),
           h("div", { class: "ctl", style: "gap: 6px" },
@@ -2381,7 +2328,20 @@ function autoRuleEditor(w, s, rule) {
             h("label", { class: "sr", for: "fb" }, "Fallback servers"),
             h("input", { id: "fb", class: "input mid", style: "width: 56px", inputmode: "numeric", "data-k": "auto-fb", value: rule.fallback,
               oninput: (e) => { const n = parseInt(e.target.value, 10); if (n >= 0) update({ fallback: n }); } }),
-            h("span", {}, "fallback. Ping and speed limits come from the probe.")))),
+            h("span", {}, "fallback")),
+          h("span", { class: "lbl", style: "font-weight: 500; padding-top: 8px" }, "Limits"),
+          h("div", { class: "row small", style: "gap: 8px 10px" },
+            h("label", { for: "maxp" }, "Ping under"),
+            h("input", { id: "maxp", class: "input mid", style: "width: 64px", inputmode: "numeric", "data-k": "auto-ping", value: rule.max_ping,
+              oninput: (e) => { const n = parseInt(e.target.value, 10); if (n >= 100) update({ max_ping: n }); } }),
+            h("span", {}, "ms, speed over"),
+            h("label", { class: "sr", for: "mins" }, "Speed over, Mbit/s"),
+            h("input", { id: "mins", class: "input mid", style: "width: 56px", inputmode: "numeric", "data-k": "auto-speed", value: rule.min_speed,
+              oninput: (e) => { const n = parseFloat(e.target.value); if (n >= 0) update({ min_speed: n }); } }),
+            h("span", {}, "Mbit/s")),
+          h("span", { class: "lbl", style: "font-weight: 500; padding-top: 6px" }, "YouTube"),
+          seg([["", "Not needed"], ["plays", "Plays"], ["ru", "Sees Russia, no ads"]], rule.youtube, (v) => update({ youtube: v }, true),
+            { small: true, label: "YouTube" }))),
       h("div", { class: "servers" },
         h("div", { class: "part-head", style: "padding: 12px 14px" },
           h("span", { style: "font-size: 13.5px; font-weight: 600" }, ui.loading && !p ? "Matches now" : `Matches now: ${plural(matched.length + fb.length, "server")}`),
@@ -2835,7 +2795,7 @@ async function viewSettings(main) {
             } }, "Copy"))),
         h("section", { class: "card pad", "aria-labelledby": "s-acc", style: "gap: 12px" },
           h("h2", { id: "s-acc" }, "Login"),
-          h("span", { class: "small muted" }, "Set in .env (PODKOP_MANAGER_PASSWORD)"),
+          h("span", { class: "small muted" }, "Login and password are set in .env (PODKOP_MANAGER_USER, PODKOP_MANAGER_PASSWORD)"),
           h("div", { class: "row" },
             h("form", { method: "post", action: "/logout", style: "display: contents" }, h("button", { type: "submit", class: "btn" }, "Log out"))))));
   };
