@@ -165,3 +165,11 @@ def test_fix_fingerprint():
     for same in ("vless://u@h:443?security=reality&fp=chrome#A", "vless://u@h:443?security=tls&fp=qq#A",
                  "vless://u@h:443?security=reality&fp=qqx#A", "trojan://p@h:443#A"):
         assert f(same) == same
+
+
+def test_probe_rows_match_picks_with_the_fingerprint_fixed():
+    link = "vless://u@h:443?security=reality&fp=qq&pbk=x#DE"
+    rows = [{"link": link, "verdict": "GOOD", "median": "0.1", "mbit": "90"}]
+    picks = {"main": {"links": [podkop.fix_fingerprint(link)], "fallback": []}}
+    [row] = podkop.probe_rows({"rows": rows}, [], picks)
+    assert row["goes_to"] == [{"rule": "main", "fallback": False}] and row["reason"] == ""

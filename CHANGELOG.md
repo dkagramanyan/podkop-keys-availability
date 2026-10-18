@@ -3,6 +3,90 @@
 Versions are podkop-probe's (`probe.sh`); a release also carries
 podkop-agent and podkop-manager.
 
+## 1.21.0 — 2026-10-18
+
+- **Faster probe:** one sing-box runs every server under test, each behind its
+  own local port, instead of one sing-box per server: no start-up per server,
+  and a few MB per server tested instead of ~40 MB. Servers are tested one per
+  CPU core at a time (a router with ~100 MB free managed only 2 before; more
+  than the CPU can handshake makes every ping look slower). A server sing-box
+  refuses is set aside with its message; if sing-box stops during the test, it
+  is started again and the servers tested meanwhile are tested again.
+- **Less work per server:** 20 ping requests instead of 40 (losses still show
+  in 5% steps), and a speed test of 3 s instead of up to 8 s. The speed counts
+  from the first second on, after the tunnel's ramp-up, so the short test
+  gives the steady speed. A test also ends after 2 s when the outcome is clear
+  (at 85% of the line's own speed and above the minimum: a node can't show
+  more than the line). `-n`, `-F` and `-q` (now 2 s) set other sizes.
+  On openwrt-reserv (dual core, 35 servers, a ~45 Mbit/s line): 347 s → ~175 s.
+- The test's local ports start at 20000, below the ones Linux gives outgoing
+  connections, and a port held by any connection is skipped (a busy port could
+  stop the test from starting).
+- Manager 0.11.0: **Overview → Now routing** shows where each rule's traffic
+  leaves to the internet: country and exit IP of the server it uses now (or
+  of a VPN rule's interface), looked up when the server changes and hourly.
+- **Less flash wear on the router:**
+  - the nightly self-update downloads to /tmp and writes
+    /usr/bin/podkop-probe only for a newer version;
+  - the probe's own nightly run doesn't rewrite /etc/config/podkop or restart
+    podkop when the servers are the same;
+  - the agent rewrites its pins file only when a pin was dropped.
+- podkop-agent 0.3.2: `exit-ip <section>`; the router's UTC offset in the
+  status.
+
+Fixes from a review of the whole project:
+
+- **Security:**
+  - podkop-agent accepts only http(s) subscription keys;
+  - podkop-probe never passes a key to curl where it could be read as an
+    option;
+  - **Reinstall agent** checks the router's SSH host key before it sends the
+    root password;
+  - install.sh refuses a cut-off download of the agent or the probe.
+- **The router keeps its settings:**
+  - after a crash the watchdog restarts podkop with the settings it has (made
+    in LuCI or by the probe) and goes back to the last applied ones only if
+    podkop does not start with them;
+  - a moment when ubus does not answer no longer looks like changed settings;
+  - Restart and Stop from the manager wait for an apply in progress;
+  - the probe's own run waits for the agent's apply;
+  - an apply killed while the agent runs (out of memory) is undone at once,
+    not at the next reboot.
+- **Agent:**
+  - several checks at once no longer share scratch files;
+  - pins come back even when the Clash API answers late, and two pin changes
+    at once don't lose one;
+  - a probe that could not start, ran past 3 hours or was killed is marked
+    failed, and its sing-box and work folder are removed;
+  - the traffic counts in RAM keep only the current links;
+  - a refused probe request no longer replaces the last run's.
+- **Manager:**
+  - a command that times out closes its SSH channel;
+  - a move of rules for a traffic limit counts only once the router took it
+    (it is tried again otherwise), runs in the background, one at a time;
+  - rules and their preview never get the servers of a key moved away from;
+  - **Let the manager run it** keeps the time on the router's clock (the
+    manager may run in another time zone), takes the router's keys when the
+    manager has none, and refuses a cron line without one daily time;
+  - an imported YouTube list with several countries takes the first, and
+    "any country" becomes "plays";
+  - with the fingerprint fix on, the probe table shows where the fixed
+    servers went;
+  - removing a router stops its probe and apply tracking;
+  - a probe still running after 3 hours is marked failed;
+  - install steps time out;
+  - bad input gets a 400 instead of a 500.
+- **UI:**
+  - draft saves go one at a time (fast typing on a slow line no longer
+    reports "changed elsewhere" and loses the edit);
+  - Rules and Global settings open from the last read settings when the router
+    is away, and switching between rules doesn't read the router again;
+  - the page no longer stays dimmed after a quick click elsewhere;
+  - Review and apply, Show older, Save config and Add key ignore a second
+    click while the first is under way;
+  - renaming or duplicating a probe rule keeps its probe parameters on the
+    page that opens next.
+
 ## 1.20.0 — 2026-10-18
 
 - Manager 0.10.0: adding a router that already runs podkop changes nothing in

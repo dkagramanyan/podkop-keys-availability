@@ -23,7 +23,21 @@ OK_JOB_STATES = {"applied", "saved", "unchanged"}
 ALERT_EVENTS = ("reverted", "revert_failed", "apply_interrupted")
 POLL_SECONDS = 30
 TRAFFIC_SECONDS = 60     # the router's traffic per server
+EXIT_SECONDS = 3600      # a section's exit IP is looked up again after this long
+EXIT_RETRY_SECONDS = 600     # ... or this long after the lookup failed
 USAGE_SECONDS = 600      # the providers' numbers, read through the router
+
+
+def manager_minutes(router_minutes: int, utc_offset: str) -> int:
+    """A time of day on the router's clock (minutes; its UTC offset like
+    "+0300") on the manager's clock. Unknown offset: the same clock."""
+    try:
+        sign = -1 if utc_offset[0] == "-" else 1
+        router_off = sign * (int(utc_offset[1:3]) * 60 + int(utc_offset[3:5]))
+    except (IndexError, ValueError):
+        return router_minutes
+    here = (time.localtime().tm_gmtoff or 0) // 60
+    return (router_minutes - router_off + here) % 1440
 
 
 class RouterRuntime:
@@ -46,12 +60,16 @@ class RouterRuntime:
         self.tasks: list[asyncio.Task] = []
         self.wake = asyncio.Event()
         self.move_retry = 0.0              # when to try a failed usage move again
+        self.exits: dict = {}              # section -> {server, ip, country, city, org, t} or {server, error, t}
+        self.exit_task: asyncio.Task | None = None
+        self.exit_ip = True                # False for an agent before 0.3.2 (no exit-ip)
+        self.moving = False                 # a move of rules for the traffic limit is under way
 
     def snapshot(self) -> dict:
         return {"id": self.id, "name": self.row["name"], "host": self.row["host"], "port": self.row["port"],
                 "online": self.online, "error": self.error, "checked": self.checked, "down_since": self.down_since,
                 "status": self.status, "proxies": self.proxies, "names": self.names,
-                "draft": self.draft, "alert": self.alert, "usage": self.usage}
+                "draft": self.draft, "alert": self.alert, "usage": self.usage, "exits": self.exits}
 
 
 class Hub:
@@ -99,8 +117,9 @@ class Hub:
 
     async def _stop_router(self, rid: int) -> None:
         rt = self.routers.pop(rid, None)
+        probe = self.probes.pop(rid, None)
         if rt:
-            for t in rt.tasks:
+            for t in rt.tasks + [x for x in (rt.exit_task, probe) if x]:
                 t.cancel()
             rt.agent.close()
 
@@ -134,7 +153,10 @@ class Hub:
     # --- polling and the event stream ------------------------------------------------
     async def refresh(self, rt: RouterRuntime) -> None:
         try:
+            old = (rt.status or {}).get("agent")
             rt.status = await rt.agent.call("status", timeout=30)
+            if rt.status.get("agent") != old:
+                rt.exit_ip = True                 # a new agent may have exit-ip
             if rt.status.get("fingerprint") != rt.names_fp:
                 self._got_config(rt, await rt.agent.call("config-get", timeout=30))
             rt.proxies = None
@@ -142,6 +164,7 @@ class Hub:
                 with contextlib.suppress(AgentError):
                     rt.proxies = await rt.agent.call("proxies", timeout=30)
             rt.online, rt.error, rt.down_since = True, "", None
+            self._check_exits(rt)
         except AgentError as e:
             rt.online, rt.error = False, e.message
             rt.down_since = rt.down_since or time.time()
@@ -151,6 +174,34 @@ class Hub:
             rt.down_since = rt.down_since or time.time()
         rt.checked = time.time()
         self.publish({"type": "router", "router": rt.snapshot()})
+
+    # --- where each section's traffic leaves to the internet ------------------------
+    def _check_exits(self, rt: RouterRuntime) -> None:
+        """Look up the exit IP of the sections whose server changed, or whose
+        last lookup is old, in the background."""
+        if not rt.exit_ip or not rt.config or (rt.exit_task and not rt.exit_task.done()):
+            return
+        targets = podkop.exit_targets(rt.config["config"], rt.proxies)
+        for s in [s for s in rt.exits if s not in targets]:
+            del rt.exits[s]
+        now = time.time()
+        todo = {s: t for s, t in targets.items()
+                if (e := rt.exits.get(s)) is None or e.get("server") != t
+                or now - e["t"] > (EXIT_RETRY_SECONDS if e.get("error") else EXIT_SECONDS)}
+        if todo:
+            rt.exit_task = asyncio.create_task(self._read_exits(rt, todo))
+
+    async def _read_exits(self, rt: RouterRuntime, todo: dict) -> None:
+        for section, target in todo.items():
+            try:
+                e = await rt.agent.call("exit-ip", section, timeout=30)
+                rt.exits[section] = {**e, "t": time.time()}
+            except AgentError as e:
+                if e.code == "bad_request" and e.message.startswith("unknown command"):
+                    rt.exit_ip = False          # an agent before 0.3.2
+                    return
+                rt.exits[section] = {"server": target, "error": e.message, "t": time.time()}
+            self.publish({"type": "router", "router": rt.snapshot()})
 
     async def _poll_loop(self, rt: RouterRuntime) -> None:
         while True:
@@ -249,6 +300,8 @@ class Hub:
         task = asyncio.create_task(self._track_job(rt, vid, job))
         self.jobs.add(task)
         task.add_done_callback(self.jobs.discard)
+        rt.tasks.append(task)               # stopped with the router
+        task.add_done_callback(lambda t: t in rt.tasks and rt.tasks.remove(t))
 
     def _resume(self) -> None:
         """After a restart (or a restore): follow the changes and probe runs
@@ -336,6 +389,8 @@ class Hub:
             if st.get("state") != "running":
                 break
         state = st.get("state", "unknown")
+        if state not in ("done", "failed"):
+            state = "failed"            # still running after 3 hours, or no answer at all
         vid = None
         ps = self.db.probe_settings(rt.id)
         if state == "done":
@@ -375,6 +430,9 @@ class Hub:
     def auto_picks(self, rid: int, status: dict) -> dict:
         """The servers of the last probe for each rule that takes them from it;
         with fix_fingerprint, REALITY links get a fingerprint new servers accept."""
+        # never the servers of keys moved away from for their traffic limit
+        if avoided := self._avoided_links(rid):
+            status = dict(status, rows=[r for r in status.get("rows") or [] if usage.norm(r.get("link") or "") not in avoided])
         picks = {r["section"]: podkop.auto_pick(status.get("rows") or [], r) for r in self.db.auto_rules(rid)}
         if self.db.probe_settings(rid).get("fix_fingerprint"):
             for p in picks.values():
@@ -427,6 +485,8 @@ class Hub:
         except AgentError as e:
             log.info("import from %s: %s", rt.row["host"], e.message)
             return
+        if self.routers.get(rid) is not rt:
+            return                  # removed meanwhile
         self.db.set_setting(f"imported:{rid}", True)
         name = f"{rt.row['name']}, as found {time.strftime('%Y-%m-%d %H:%M')}"
         version = (((rt.status or {}).get("podkop")) or {}).get("version") or ""
@@ -437,6 +497,8 @@ class Hub:
             pc = await rt.agent.call("probe-config", timeout=30) or {}
         except AgentError:           # an agent before 0.3.1
             pc = {}
+        if self.routers.get(rid) is not rt:
+            return
         if pc.get("saved"):
             keys = [k for k in pc.get("keys") or [] if k.startswith(("http://", "https://"))]
             if keys and not self.db.probe_settings(rid).get("keys"):
@@ -455,8 +517,10 @@ class Hub:
         base = {"countries": countries, "top": pc.get("top") or 10, "fallback": 5,
                 "max_ping": pc.get("max_ping") or 700, "min_speed": pc.get("min_speed") or 40}
         made = []
+        # podkop-probe's ad-free countries: one or more codes, or none for any country
+        noads = str(pc.get("youtube_noads") or "").split()
         for section, youtube, used in ((pc.get("section"), "", pc.get("apply_to") in ("both", "main")),
-                                       (pc.get("youtube_section"), pc.get("youtube_noads") or "RU",
+                                       (pc.get("youtube_section"), noads[0].upper() if noads else "plays",
                                         pc.get("youtube") and pc.get("apply_to") in ("both", "youtube"))):
             if used and section in names and not self.db.auto_rule(rid, section):
                 with contextlib.suppress(ValueError):
@@ -465,13 +529,27 @@ class Hub:
         return made
 
     async def take_over_probe(self, rt: RouterRuntime) -> dict:
-        """Turn off podkop-probe's own cron line; the manager runs it at that time."""
-        cron = (((rt.status or {}).get("probe") or {}).get("cron") or "").split()
+        """Turn off podkop-probe's own cron line; the manager runs it at that
+        time (on the manager's clock) with its keys. Refused, with nothing
+        changed, when the manager could not run it."""
+        status = rt.status or {}
+        cron = ((status.get("probe") or {}).get("cron") or "").split()
+        if not (len(cron) >= 2 and cron[0].isdigit() and cron[1].isdigit() and int(cron[0]) < 60 and int(cron[1]) < 24):
+            raise AgentError("bad_request", "the router's own run has no single daily time; "
+                             "set the time in Global settings → Nightly probe, then turn the router's run off")
+        minutes = manager_minutes(int(cron[1]) * 60 + int(cron[0]), (status.get("router") or {}).get("utc_offset") or "")
+        fields = {"auto_apply": 1, "schedule": f"{minutes // 60:02d}:{minutes % 60:02d}"}
+        if not self.db.probe_settings(rt.id).get("keys"):
+            # routers added before the manager took the probe's keys at once
+            pc = await rt.agent.call("probe-config", timeout=30) or {}
+            keys = [k for k in pc.get("keys") or [] if isinstance(k, str) and k.startswith(("http://", "https://"))]
+            if not keys:
+                raise AgentError("no_keys", "the router's podkop-probe has no keys the manager could use; add them in Keys and usage first")
+            fields["keys"] = keys
         await rt.agent.call("probe-cron", "off", timeout=30)
-        fields = {"auto_apply": 1}
-        if len(cron) >= 2 and cron[0].isdigit() and cron[1].isdigit():
-            fields["schedule"] = f"{int(cron[1]):02d}:{int(cron[0]):02d}"
         self.db.set_probe_settings(rt.id, **fields)
+        if "keys" in fields:
+            self.db.sync_sub_keys(rt.id, fields["keys"])
         rt.wake.set()
         return self.db.probe_settings(rt.id)
 
@@ -527,8 +605,6 @@ class Hub:
         """The router's config with the probe's lists and the rules by country
         filled in, without the servers of keys moved away from; ValueError
         when nothing would change."""
-        if avoided := self._avoided_links(rid):
-            status = dict(status, rows=[r for r in status.get("rows") or [] if usage.norm(r.get("link") or "") not in avoided])
         picks = self.auto_picks(rid, status)
         if not any(p["links"] for p in picks.values()):
             raise ValueError("the probe found no server for any rule")
@@ -622,18 +698,28 @@ class Hub:
                 self.db.update_key(k["id"], acted_until=k["next_reset"])
                 self._event(rt, "usage_threshold", {"key": k["label"], "pct": k["pct"], "action": k["action"]})
         avoid = sorted(k["id"] for k in self.db.keys(rt.id) if k["action"] == "avoid" and (k["acted_until"] or 0) > now)
-        if avoid != (self.db.get_setting(f"avoid:{rt.id}") or []) and now >= rt.move_retry:
-            # remembered once the move went through; a failed one is tried again in 10 minutes
-            if await self._move_rules(rt, [k["label"] for k in u["keys"] if k["id"] in avoid]):
-                self.db.set_setting(f"avoid:{rt.id}", avoid)
-            else:
-                rt.move_retry = now + 600
+        if avoid != (self.db.get_setting(f"avoid:{rt.id}") or []) and now >= rt.move_retry and not rt.moving:
+            # one at a time, in the background: it waits until the router took the change
+            rt.moving = True
+            task = asyncio.create_task(self._move(rt, avoid, [k["label"] for k in u["keys"] if k["id"] in avoid]))
+            self.jobs.add(task)
+            task.add_done_callback(self.jobs.discard)
         daily = [k for k in u["keys"] if k["daily"] and k["limit"]]
         rt.usage = {"pct": max((k["pct"] for k in daily), default=None),
                     "alerts": [{k_: k[k_] for k_ in ("id", "label", "used", "limit", "pct", "threshold", "action", "forecast")}
                                for k in daily if usage.over_threshold(k) or (k["forecast"] or {}).get("hits_today")]}
         self.publish({"type": "usage", "router_id": rt.id})
         self.publish({"type": "router", "router": rt.snapshot()})
+
+    async def _move(self, rt: RouterRuntime, avoid: list, labels: list) -> None:
+        """Remembered once the move went through; a failed one is tried again in 10 minutes."""
+        try:
+            if await self._move_rules(rt, labels):
+                self.db.set_setting(f"avoid:{rt.id}", avoid)
+            else:
+                rt.move_retry = time.time() + 600
+        finally:
+            rt.moving = False
 
     async def _move_rules(self, rt: RouterRuntime, labels: list) -> bool:
         """Rebuild the probe's rules from its last run without the servers of
@@ -658,7 +744,11 @@ class Hub:
             new = dict(new, sections=secs)
             if podkop.diff(cur["config"], new):
                 note = f"traffic limit of {', '.join(labels)}: rules moved to other keys" if labels else "traffic limit reset"
-                await self.apply(rt.id, cur["fingerprint"], new, note, "usage")
+                vid = (await self.apply(rt.id, cur["fingerprint"], new, note, "usage"))["version"]
+                v = await self.wait_version(vid)        # done only when the router took it
+                if not v or v["state"] not in OK_JOB_STATES:
+                    self._event(rt, "usage_move_failed", {"message": (v or {}).get("message") or "the change did not finish"})
+                    return False
             self.db.set_setting(f"moved:{rt.id}", sorted(touched) if avoided else [])
             return True
         except (AgentError, ValueError) as e:

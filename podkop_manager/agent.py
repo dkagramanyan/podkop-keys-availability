@@ -61,22 +61,26 @@ class Agent:
         """Run one command; returns its data or raises AgentError."""
         conn = await self.connection()
         cmd = "podkop-agent " + " ".join(shlex.quote(a) for a in args)
+        proc = None
         try:
-            r = await asyncio.wait_for(
-                conn.run(cmd, input=json.dumps(payload) if payload is not None else "", check=False),
-                timeout=timeout)
+            proc = await conn.create_process(cmd)
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(json.dumps(payload) if payload is not None else ""), timeout=timeout)
         except asyncio.TimeoutError:
             raise AgentError("timeout", f"{args[0]} took longer than {timeout:.0f} s") from None
         except (OSError, asyncssh.Error) as e:
             self.close()
             raise AgentError("unreachable", f"connection to {self.host} lost: {e}") from None
-        out = (r.stdout or "").strip().splitlines()
+        finally:
+            if proc is not None:
+                proc.close()        # a timed-out command must not keep its channel (and process) open
+        out = (stdout or "").strip().splitlines()
         try:
             msg = json.loads(out[-1]) if out else None
         except json.JSONDecodeError:
             msg = None
         if not isinstance(msg, dict) or "ok" not in msg:
-            raise AgentError("bad_answer", f"unexpected answer from podkop-agent: {(r.stdout or r.stderr or '')[:200]}")
+            raise AgentError("bad_answer", f"unexpected answer from podkop-agent: {(stdout or stderr or '')[:200]}")
         if not msg["ok"]:
             e = msg.get("error") or {}
             raise AgentError(e.get("code", "error"), e.get("message", "error"), e.get("details"))
@@ -104,32 +108,47 @@ AGENT_FILES = ("router/podkop-agent", "router/podkop-agent.init", "router/instal
 
 
 async def install(host: str, port: int, password: str, public_key: str, src: Path,
-                  allow_clash: list[str], close_clash: bool = True) -> str:
+                  allow_clash: list[str], close_clash: bool = True, host_key: str | None = None) -> str:
     """Log in once with the root password, copy podkop-agent and podkop-probe
     to the router and run install.sh. Returns the router's host key, which
-    every later connection is checked against. The password is not kept."""
+    every later connection is checked against. The password is not kept.
+    With <host_key> (a reinstall), the router must still have that key before
+    the password is sent."""
+    known = asyncssh.import_known_hosts(known_hosts_line(host, port, host_key)) if host_key else None
     try:
         conn = await asyncio.wait_for(asyncssh.connect(
-            host, port=port, username="root", password=password, known_hosts=None,
+            host, port=port, username="root", password=password, known_hosts=known,
             client_keys=None, agent_path=None, preferred_auth="password,keyboard-interactive"), timeout=20)
     except asyncssh.PermissionDenied:
         raise AgentError("auth", "wrong root password") from None
+    except asyncssh.HostKeyNotVerifiable:
+        raise AgentError("host_key", f"{host} has another SSH host key than when it was added; "
+                         "if the router was reset, remove it and add it again") from None
     except (OSError, asyncssh.Error, asyncio.TimeoutError) as e:
         raise AgentError("unreachable", f"cannot connect to {host}: {e or type(e).__name__}") from None
+
+    async def run(cmd: str, timeout: float = 30, **kw):
+        try:
+            return await asyncio.wait_for(conn.run(cmd, **kw), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise AgentError("install", f"{cmd.split()[0]} took longer than {timeout:.0f} s on the router") from None
+        except (OSError, asyncssh.Error) as e:
+            raise AgentError("install", f"on the router: {e}") from None
+
     async with conn:
-        host_key = conn.get_server_host_key().export_public_key().decode().strip()
+        key = conn.get_server_host_key().export_public_key().decode().strip()
         tmp = "/tmp/podkop-agent-src"
-        await conn.run(f"rm -rf {tmp} && mkdir -p {tmp}", check=True)
+        await run(f"rm -rf {tmp} && mkdir -p {tmp}", check=True)
         for f in AGENT_FILES:
             data = (src / f).read_bytes()
-            await conn.run(f"cat > {tmp}/{Path(f).name}", input=data, encoding=None, check=True)
+            await run(f"cat > {tmp}/{Path(f).name}", input=data, encoding=None, check=True)
         cmd = f"sh {tmp}/install.sh --src {tmp} --key {shlex.quote(public_key)}"
         for ip in allow_clash:
             cmd += f" --allow-clash {shlex.quote(ip)}"
         if not close_clash:
             cmd += " --keep-clash-open"
-        r = await conn.run(cmd, check=False)
-        await conn.run(f"rm -rf {tmp}", check=False)
+        r = await run(cmd, timeout=300, check=False)        # may install jq first
+        await run(f"rm -rf {tmp}", check=False)
         if r.exit_status != 0:
             raise AgentError("install", ((r.stderr or "") + (r.stdout or "")).strip()[-500:] or "install.sh failed")
-    return " ".join(host_key.split()[:2])
+    return " ".join(key.split()[:2])

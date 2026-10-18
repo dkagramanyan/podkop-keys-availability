@@ -282,6 +282,7 @@ async function render() {
   // the Servers and Servers probe pages are gone: their old links open the rules
   if (r.rid && ["servers", "probe"].includes(r.section)) { location.replace(`#/r/${r.rid}/rules`); return; }
   if (r.rid) store("router", String(r.rid));
+  S.from = S.at; S.at = `${r.rid}/${r.section}`;      // the page before this one (see workFor)
   S.rid = r.rid || lastRouter();
   drawSide();
   const sec = SECTIONS[r.section];
@@ -289,6 +290,7 @@ async function render() {
   const token = ++renders;
   const slot = h("div");
   const wait = setTimeout(() => {
+    if (token !== renders) return;       // a newer page took over
     main.classList.add("busy");
     if (!main.firstChild) put(main, h("div", { class: "page" }, h("p", { class: "loading" }, "Loading…")));
   }, 250);
@@ -301,6 +303,7 @@ async function render() {
   }
   if (token !== renders) {
     // a newer page was asked for meanwhile: drop this one
+    clearTimeout(wait);
     if (S.view !== S.shown) { if (S.view && S.view.leave) S.view.leave(); S.view = S.shown; }
     return;
   }
@@ -505,6 +508,16 @@ function ruleNow(rt, sec, devices) {
   const name = (rt.names || {})[tag] || tag;
   return { text: server && server.delay ? `${name}, ${server.delay} ms` : name,
     mode: pinned ? "pinned" : o.proxy_config_type === "urltest" ? "auto" : "" };
+}
+
+// where a rule's traffic leaves to the internet: "DE, Germany · 203.0.113.5"
+function ruleExit(rt, sec) {
+  const e = (rt.exits || {})[sec.name];
+  if (!e) return null;
+  if (e.error) return h("span", { class: "small muted", title: e.error }, "Exit IP unknown");
+  const place = [e.city, e.org].filter(Boolean).join(", ");
+  return h("span", { class: "small muted", title: place || null },
+    `${e.country ? `${e.country}, ${countryName(e.country)} · ` : ""}${e.ip}`);
 }
 
 // the version the router runs now, by its fingerprint
@@ -714,9 +727,11 @@ async function viewOverview(main, id) {
               h("td", { style: "color: var(--text-2)" }, ruleMatches(sec)),
               h("td", {}, data.auto[sec.name] && (sec.options || {}).connection_type === "proxy"
                 ? h("span", { class: "dest" }, `Proxy, from probe${data.auto[sec.name].countries.length ? ", " + countriesText(data.auto[sec.name].countries) : ""}`) : destChip(sec)),
-              h("td", {}, h("span", { class: "row", style: "gap: 8px" }, h("span", { class: now.bad ? "bad-text" : "" }, now.text),
-                now.mode ? h("span", { class: "mode" }, now.mode) : null,
-                now.mode === "pinned" ? h("button", { type: "button", class: "link-btn xs", onclick: () => unpin(sec.name) }, "Unpin") : null)));
+              h("td", {}, h("div", { class: "col" },
+                h("span", { class: "row", style: "gap: 8px" }, h("span", { class: now.bad ? "bad-text" : "" }, now.text),
+                  now.mode ? h("span", { class: "mode" }, now.mode) : null,
+                  now.mode === "pinned" ? h("button", { type: "button", class: "link-btn xs", onclick: () => unpin(sec.name) }, "Unpin") : null),
+                ruleExit(rt, sec))));
           }),
           h("tr", {}, h("td", {}), h("td", { class: "nowrap", style: "color: var(--text-2)" }, "Everything else"),
             h("td", { class: "muted" }, "no rule matched"), h("td", {}, h("span", { class: "dest direct" }, "Direct")),
@@ -1005,9 +1020,9 @@ async function viewHistory(main, id) {
           isOpen ? h("div", { class: "changes-grid" }, rows.map(([sec, lbl, val]) => [
             h("span", { class: "mono xs" }, sec), h("span", { class: "muted" }, lbl), val])) : null);
       })) : h("div", { class: "card empty" }, list.length ? "Nothing here with this filter." : "Nothing applied from this manager yet."),
-      more && list.length ? h("button", { type: "button", class: "btn", style: "align-self: center", onclick: async () => {
+      more && list.length ? h("button", { type: "button", class: "btn", style: "align-self: center", onclick: busyClick(async () => {
         await load(true); draw();
-      } }, "Show older") : null);
+      }) }, "Show older") : null);
   };
 
   const restore = async (vid) => {
@@ -1229,8 +1244,11 @@ async function viewUsage(main, id) {
     const f = { link: h("input", { class: "input mono", id: "nk-link", placeholder: "https://… subscription, or vless://… link" }),
       label: h("input", { class: "input", id: "nk-label", placeholder: "e.g. fra-personal" }),
       limit: h("input", { class: "input mid", id: "nk-limit", inputmode: "decimal", placeholder: "10" }) };
+    let sending = false;
     return h("form", { class: "card pad", "aria-labelledby": "u-add", onsubmit: async (e) => {
       e.preventDefault();
+      if (sending) return;
+      sending = true;
       try {
         const link = f.link.value.trim();
         await api("POST", `/api/routers/${id}/keys`, { link, label: f.label.value.trim(), limit_gb: f.limit.value || 0 });
@@ -1239,7 +1257,7 @@ async function viewUsage(main, id) {
           api("POST", `/api/routers/${id}/usage/refresh`).then((d) => { data = d; draw(); }).catch(() => {});
         }
         await load(); draw();
-      } catch (err) { toast(err.message, true); }
+      } catch (err) { toast(err.message, true); } finally { sending = false; }
     } },
     h("h2", { id: "u-add" }, "Add a key"),
     h("div", { class: "auto-grid", style: "grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr))" },
@@ -1318,12 +1336,21 @@ async function viewUsage(main, id) {
   S.view = { onUsage: (m) => { if (m.router_id === id && !document.querySelector(".modal-bg") && !page.querySelector("form :focus")) load().then(draw).catch(() => {}); } };
 }
 
+// busyClick(fn): a click handler that ignores clicks while its work runs (the button is disabled meanwhile)
+const busyClick = (fn) => async (e) => {
+  const b = e && e.currentTarget;
+  if (b) { if (b.disabled) return; b.disabled = true; b.setAttribute("aria-busy", "true"); }
+  try { await fn(e); } finally { if (b) { b.disabled = false; b.removeAttribute("aria-busy"); } }
+};
+
 // --- the routing draft ---------------------------------------------------------------------------------
 // One per router, shared by Rules and Global settings, kept on the manager
 // (/draft) so it survives reloads. w.config is edited in place.
 
 async function loadWork(id) {
-  if (S.work[id] && S.work[id].saving) await saveWork(S.work[id]);
+  const prev = S.work[id];
+  if (prev && prev.saving) saveWork(prev);
+  if (prev && prev.inflight) await prev.inflight;      // its saves first, or they would look like someone else's
   const [cur, draft, versions, rules] = await Promise.all([api("GET", `/api/routers/${id}/config`),
     api("GET", `/api/routers/${id}/draft`), api("GET", `/api/routers/${id}/versions?limit=50`).catch(() => []),
     api("GET", `/api/routers/${id}/auto-rules`).catch(() => [])]);
@@ -1335,17 +1362,34 @@ async function loadWork(id) {
     rev: draft ? draft.updated : null,     // the draft this page started from, see saveWork
     versions, auto: Object.fromEntries(rules.map((r) => [r.section, r])),
     problems: old && old.problems && draft && same(old.config, draft.config) ? old.problems : null,
-    saving: null, redraw: () => {},
+    saving: null, inflight: null, loaded: Date.now(), redraw: () => {},
   };
   S.work[id] = w;
   return w;
 }
 
+// workFor: the draft as loaded a moment ago when moving between rules (or to
+// Global settings) of one router; loaded again after any other page (Configs
+// may have changed it), after 2 minutes, or when the router's settings changed
+async function workFor(id) {
+  const w = S.work[id], rt = S.routers[id];
+  if (w && !w.stale && [`${id}/rules`, `${id}/global`].includes(S.from) && Date.now() - w.loaded < 120e3
+      && rt && rt.status && rt.status.fingerprint === w.fp) return w;
+  return loadWork(id);
+}
+
 const workChanges = (w) => configDiff(w.orig, w.config);
 
-async function saveWork(w) {
+// one save at a time: each PUT goes after the one before, with the rev that one returned
+function saveWork(w) {
   clearTimeout(w.saving);
   w.saving = null;
+  w.inflight = (w.inflight || Promise.resolve()).then(() => putWork(w));
+  return w.inflight;
+}
+
+async function putWork(w) {
+  if (w.stale) return;
   try {
     if (workChanges(w).length) {
       const d = await api("PUT", `/api/routers/${w.id}/draft`, { config: w.config, base: w.base, rev: w.rev });
@@ -1358,7 +1402,9 @@ async function saveWork(w) {
     if (e.status !== 409) { toast(`The draft was not saved: ${e.message}`, true); return; }
     // another tab, or "Load into draft", changed it: show that one instead of overwriting it
     toast("The draft was changed elsewhere; showing that one", true);
-    if (S.work[w.id] === w) { await loadWork(w.id); render(); }
+    w.stale = true;
+    // not awaited: loadWork waits for this save to end
+    if (S.work[w.id] === w) loadWork(w.id).then(render).catch((e2) => toast(e2.message, true));
   }
 }
 
@@ -1635,7 +1681,7 @@ const PROXY_HELP = {
 };
 
 async function viewRules(main, id, sub) {
-  const w = await loadWork(id);
+  const w = await workFor(id);
   w.ui = w.ui || {};
   const page = h("div", { class: "page" });
   put(main, page);
@@ -1747,29 +1793,34 @@ function ruleEditor(w, s, { onRename }) {
   const pt = o.proxy_config_type || "url";
   const auto = w.auto[s.name];
 
-  const rename = (name) => {
+  const rename = async (name) => {
     name = name.trim();
     if (name === s.name) return;
     if (!/^[A-Za-z0-9_]+$/.test(name)) { toast("A rule name has letters, digits and _ only", true); w.redraw(); return; }
     if (bySection(w.config).has(name)) { toast(`There is already a rule ${name}`, true); w.redraw(); return; }
     const old = s.name;
     s.name = name;
-    if (w.auto[old]) {
-      api("PUT", `/api/routers/${w.id}/auto-rules/${name}`, w.auto[old])
-        .then((r) => api("DELETE", `/api/routers/${w.id}/auto-rules/${old}`).then(() => { delete w.auto[old]; w.auto[name] = r; }))
-        .catch((e) => toast(e.message, true));
-    }
     touch(w);
+    // the probe parameters move first: the page that opens next reads them
+    if (w.auto[old]) {
+      try {
+        const r = await api("PUT", `/api/routers/${w.id}/auto-rules/${name}`, w.auto[old]);
+        await api("DELETE", `/api/routers/${w.id}/auto-rules/${old}`);
+        delete w.auto[old]; w.auto[name] = r;
+      } catch (e) { toast(e.message, true); }
+    }
     onRename(name);
   };
 
-  const duplicate = () => {
+  const duplicate = async () => {
     let name = `${s.name}_copy`, k = 2;
     while (bySection(w.config).has(name)) name = `${s.name}_copy${k++}`;
     const copy = clone(s); copy.name = name;
     w.config.sections.splice(w.config.sections.indexOf(s) + 1, 0, copy);
-    if (auto) api("PUT", `/api/routers/${w.id}/auto-rules/${name}`, auto).then((r) => { w.auto[name] = r; }).catch((e) => toast(e.message, true));
     touch(w);
+    if (auto) {
+      try { w.auto[name] = await api("PUT", `/api/routers/${w.id}/auto-rules/${name}`, auto); } catch (e) { toast(e.message, true); }
+    }
     onRename(name);
   };
 
@@ -2115,7 +2166,7 @@ function autoRuleEditor(w, s, rule) {
 // --- global settings ----------------------------------------------------------------------------------------
 
 async function viewGlobal(main, id) {
-  const w = await loadWork(id);
+  const w = await workFor(id);
   w.ui = w.ui || {};
   const page = h("div", { class: "page" });
   put(main, page);
@@ -2283,9 +2334,9 @@ async function viewConfigs(main, id) {
     put(page,
       pageHead("Configs", "podkop's settings with each rule's probe parameters",
         h("button", { type: "button", class: "btn", onclick: () => fileInput.click() }, "Import file"),
-        draftChanges(rt) ? h("button", { type: "button", class: "btn", onclick: () => run(() => api("POST", "/api/configs", { router_id: id, from: "draft" }), "Draft saved") }, "Save draft") : null,
+        draftChanges(rt) ? h("button", { type: "button", class: "btn", onclick: busyClick(() => run(() => api("POST", "/api/configs", { router_id: id, from: "draft" }), "Draft saved")) }, "Save draft") : null,
         h("button", { type: "button", class: "btn primary", disabled: !rt.online,
-          onclick: () => run(() => api("POST", "/api/configs", { router_id: id }), "Saved") }, `Save ${rt.name}'s config`)),
+          onclick: busyClick(() => run(() => api("POST", "/api/configs", { router_id: id }), "Saved")) }, `Save ${rt.name}'s config`)),
       fileInput,
       h("section", { class: "card clip", "aria-label": "Saved configs" },
         list.length ? h("div", { class: "scroll-x" }, h("table", { class: "wide" },
@@ -2395,13 +2446,17 @@ function stepRow(st) {
     h("span", {}, label), h("span", {}, st.t !== null && st.t !== undefined ? `${st.t} s` : ""));
 }
 
+let applyOpening = false;     // a second click while the router is asked: no second dialog
+
 async function openApply(id, { base, config, note, trigger, done }) {
   const rt = S.routers[id];
+  if (applyOpening) return;
+  applyOpening = true;
   let d, versions;
   try {
     [d, versions] = await Promise.all([api("POST", `/api/routers/${id}/diff`, { config }),
       api("GET", `/api/routers/${id}/versions?limit=50`).catch(() => [])]);
-  } catch (e) { toast(e.message, true); return; }
+  } catch (e) { toast(e.message, true); return; } finally { applyOpening = false; }
   if (!d.diff.length) { toast("Nothing to apply: the router already has these settings"); return; }
   const running = runningVersion(rt, versions);
   const stale = d.fingerprint !== base;

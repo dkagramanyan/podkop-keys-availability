@@ -238,6 +238,27 @@ def tag_names(config: dict) -> dict:
     return out
 
 
+def exit_targets(config: dict, proxies: dict | None) -> dict:
+    """section -> what its traffic leaves through now: the server tag a proxy
+    section uses (its selector's choice, or the urltest group's) or a VPN
+    section's interface."""
+    groups = {g.get("name"): g for g in (proxies or {}).get("groups") or []}
+    out = {}
+    for s in config.get("sections", []):
+        o, name = s.get("options") or {}, s.get("name")
+        if s.get("type") != "section":
+            continue
+        if o.get("connection_type") == "vpn" and o.get("interface"):
+            out[name] = o["interface"]
+        elif o.get("connection_type") == "proxy" and proxies is not None:
+            now = groups.get(f"{name}-out", {}).get("now") or f"{name}-out"
+            if now == f"{name}-urltest-out":
+                now = groups.get(now, {}).get("now") or ""
+            if now:
+                out[name] = now
+    return out
+
+
 # --- podkop-probe's results -------------------------------------------------------
 
 USABLE = {"GOOD", "OK", "FLAKY"}
@@ -289,15 +310,19 @@ def probe_rows(status: dict, options: list, picks: dict) -> list[dict]:
     """The rows of podkop-probe's CSV with the rules each server went to and,
     for the others, why the probe's limits rule it out. goes_to: [{"rule",
     "fallback"}]; picks: auto_pick results by rule."""
+    # matched with the fingerprint fixed on both sides: with that setting on,
+    # a pick is the row's link with fp=chrome
     where: dict[str, list] = {}
     for rule, pick in picks.items():
         for fb, key in ((False, "links"), (True, "fallback")):
             for link in pick[key]:
-                where.setdefault(link, []).append({"rule": rule, "fallback": fb})
+                where.setdefault(fix_fingerprint(link), []).append({"rule": rule, "fallback": fb})
     max_ping, min_speed = probe_limits(options)
-    return [dict(r, goes_to=where.get(r.get("link") or "", []),
-                 reason="" if where.get(r.get("link") or "") else probe_reason(r, max_ping, min_speed))
-            for r in status.get("rows") or []]
+    out = []
+    for r in status.get("rows") or []:
+        goes = where.get(fix_fingerprint(r.get("link") or ""), [])
+        out.append(dict(r, goes_to=goes, reason="" if goes else probe_reason(r, max_ping, min_speed)))
+    return out
 
 
 PROTOCOLS = ("vless", "trojan", "ss", "hysteria2", "socks")

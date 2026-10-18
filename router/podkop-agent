@@ -12,7 +12,7 @@
 # $SSH_ORIGINAL_COMMAND, requests come as JSON on stdin, answers go as JSON to
 # stdout: {"v":1,"ok":true,"data":...} or {"v":1,"ok":false,"error":{...}}.
 
-AGENT_VERSION="0.3.1"
+AGENT_VERSION="0.3.2"
 PROTO=1
 ETC=/etc/podkop-agent
 RUN=/tmp/podkop-agent
@@ -75,7 +75,14 @@ NORM='{sections: [.sections[] | {name: (.name | tostring), type: (.type | tostri
 # start and stop, so it is left out
 FP_JQ='(.sections[] | select(.name == "settings") | .options) |= del(.shutdown_correctly)'
 
-config_json() { ubus call uci get '{"config":"podkop"}' 2>/dev/null | jq -c "$UBUS2CONF"; }
+# fails (no output) when ubus does not answer, e.g. while rpcd restarts
+config_json() {
+  _cj=$(ubus call uci get '{"config":"podkop"}' 2>/dev/null) && [ -n "$_cj" ] || return 1
+  printf '%s' "$_cj" | jq -c "$UBUS2CONF"
+}
+
+# config_fp: the fingerprint of podkop's settings now; fails like config_json
+config_fp() { _cf=$(config_json) && [ -n "$_cf" ] || return 1; printf '%s' "$_cf" | fingerprint; }
 fingerprint() { jq -cS "$FP_JQ" | md5sum | cut -c 1-32; }
 
 # the UCI file for a config
@@ -148,17 +155,17 @@ EOF
 check_links() (
   set +u
   . "$PODKOP_LIB/sing_box_config_facade.sh"
-  log() { case "$2" in error|fatal) printf '%s\n' "$1" >> "$RUN/chk.err" ;; esac; }
+  log() { case "$2" in error|fatal) printf '%s\n' "$1" >> "$RUN/chk.$$.err" ;; esac; }
   while IFS="$TAB" read -r _s _o _i _l; do
-    rm -f "$RUN/chk.err"
-    ( sing_box_cf_add_proxy_outbound '{"outbounds":[]}' chk "$_l" 0 ) > "$RUN/chk.out" 2>/dev/null
-    if [ -s "$RUN/chk.err" ] || ! jq -e '.outbounds[0]' "$RUN/chk.out" >/dev/null 2>&1; then
+    rm -f "$RUN/chk.$$.err"
+    ( sing_box_cf_add_proxy_outbound '{"outbounds":[]}' chk "$_l" 0 ) > "$RUN/chk.$$.out" 2>/dev/null
+    if [ -s "$RUN/chk.$$.err" ] || ! jq -e '.outbounds[0]' "$RUN/chk.$$.out" >/dev/null 2>&1; then
       jq -nc --arg s "$_s" --arg o "$_o" --argjson i "$_i" \
-        --arg m "$(head -n 1 "$RUN/chk.err" 2>/dev/null | sed 's/ Aborted\.$//')" \
+        --arg m "$(head -n 1 "$RUN/chk.$$.err" 2>/dev/null | sed 's/ Aborted\.$//')" \
         '{section: $s, option: $o, index: $i, message: (if $m == "" then "podkop cannot read this link" else $m end)}'
     fi
   done
-  rm -f "$RUN/chk.err" "$RUN/chk.out"
+  rm -f "$RUN/chk.$$.err" "$RUN/chk.$$.out"
 )
 
 # check_outbounds <config file>: outbound_json of each section through sing-box check
@@ -168,13 +175,13 @@ check_outbounds() {
   while IFS= read -r _s; do
     jq -c --arg s "$_s" '{log: {disabled: true},
         outbounds: [.sections[] | select(.name == $s) | .options.outbound_json | fromjson | .tag = "x"]}' \
-      "$1" > "$RUN/chk.json"
-    if ! _m=$(sing-box check -c "$RUN/chk.json" 2>&1); then
+      "$1" > "$RUN/chk.$$.json"
+    if ! _m=$(sing-box check -c "$RUN/chk.$$.json" 2>&1); then
       jq -nc --arg s "$_s" --arg m "$(printf '%s' "$_m" | tail -n 1)" \
         '{section: $s, option: "outbound_json", message: ("sing-box: " + $m)}'
     fi
   done
-  rm -f "$RUN/chk.json"
+  rm -f "$RUN/chk.$$.json"
 }
 
 community_lists() ( set +u; . "$PODKOP_LIB/constants.sh" 2>/dev/null; printf '%s' "${COMMUNITY_SERVICES:-}" )
@@ -281,7 +288,7 @@ restart_podkop() {
 # through temp files, so a full disk can't leave a cut-off copy
 save_last_good() {
   cp "$CFG" "$ETC/last-good.t" && mv "$ETC/last-good.t" "$ETC/last-good" &&
-    config_json | fingerprint > "$ETC/last-good.fp.t" && mv "$ETC/last-good.fp.t" "$ETC/last-good.fp"
+    config_fp > "$ETC/last-good.fp.t" && mv "$ETC/last-good.fp.t" "$ETC/last-good.fp"
 }
 
 backup_config() {
@@ -333,21 +340,30 @@ link_tag() {
 select_server() { podkop clash_api set_group_proxy "$1-out" "$2" 2>/dev/null | jq -e '.success' >/dev/null 2>&1; }
 
 # reapply_pins: after a restart podkop's selectors start on their default
+# fails when a pinned server could not be selected (Clash API not up yet)
 reapply_pins() {
   [ -s "$ETC/pins" ] || return 0
-  : > "$ETC/pins.new"
+  mkdir -p "$RUN"
+  exec 6> "$RUN/pins.lock"; flock 6
+  : > "$RUN/pins.new"; _rp=0
   while IFS="$TAB" read -r _s _h; do
     _t=$(link_tag "$_s" "$_h")
     if [ -z "$_t" ]; then
       event pin_dropped "$(jq -nc --arg s "$_s" '{section: $s, reason: "the pinned server is no longer in the section"}')"
       continue
     fi
-    printf '%s\t%s\n' "$_s" "$_h" >> "$ETC/pins.new"
+    printf '%s\t%s\n' "$_s" "$_h" >> "$RUN/pins.new"
     if select_server "$_s" "$_t"; then
       event pin_restored "$(jq -nc --arg s "$_s" --arg t "$_t" '{section: $s, server: $t}')"
+    else
+      _rp=1
     fi
   done < "$ETC/pins"
-  mv "$ETC/pins.new" "$ETC/pins"
+  # /etc is flash: written only when a pin was dropped
+  if cmp -s "$RUN/pins.new" "$ETC/pins"; then rm -f "$RUN/pins.new"
+  else cp "$RUN/pins.new" "$ETC/pins.t" && mv "$ETC/pins.t" "$ETC/pins"; rm -f "$RUN/pins.new"; fi
+  exec 6>&-
+  return "$_rp"
 }
 
 # --- jobs (changes run detached, so a dropped SSH connection can't cut them) -------
@@ -364,7 +380,7 @@ job_new() { # <kind> -> id
   mkdir -p "$RUN/jobs"
   _id="$(date +%Y%m%d%H%M%S)-$$"
   jq -nc --arg id "$_id" --arg k "$1" --arg t "$(now)" '{id: $id, kind: $k, state: "queued", started: $t}' > "$(job_file "$_id")"
-  ls -1t "$RUN/jobs"/*.json 2>/dev/null | tail -n +51 | while IFS= read -r _f; do rm -f "$_f" "${_f%.json}".*; done
+  ls -1t "$RUN/jobs"/*.json 2>/dev/null | tail -n +21 | while IFS= read -r _f; do rm -f "$_f" "${_f%.json}".*; done
   echo "$_id"
 }
 
@@ -382,7 +398,7 @@ run_apply() {
   exec 9> "$RUN/apply.lock"; flock 9
   job_set "$_id" '.state = "checking"'
   jq -c ".config | $NORM" "$_in" > "$_new" 2>/dev/null || { job_end "$_id" rejected "the config is not valid JSON"; return; }
-  _cur=$(config_json | fingerprint)
+  _cur=$(config_fp) || { job_end "$_id" failed "could not read podkop's settings (ubus does not answer)"; return; }
   _base=$(jq -r '.base // ""' "$_in")
   if [ -n "$_base" ] && [ "$_base" != "$_cur" ]; then
     job_end "$_id" rejected "podkop's settings changed since you loaded them; reload and apply again" \
@@ -476,12 +492,18 @@ recover() {
   fi
   echo "$_t" >> "$RUN/recoveries"
   exec 9> "$RUN/apply.lock"; flock 9
+  # first with the settings as they are (LuCI or the probe may have changed
+  # them on purpose); the last settings applied here only if that fails
   _what="restarted podkop"
-  if [ -s "$ETC/last-good" ] && [ "$(config_json | fingerprint)" != "$(cat "$ETC/last-good.fp" 2>/dev/null)" ]; then
-    backup_config >/dev/null && install_config "$ETC/last-good" && _what="restored the last working settings and restarted podkop"
-  fi
   restart_podkop "recover $_t"
-  if _why=$(health "recover $_t"); then
+  if ! _why=$(health "recover $_t") && [ -s "$ETC/last-good" ] && _fp=$(config_fp) &&
+     [ "$_fp" != "$(cat "$ETC/last-good.fp" 2>/dev/null)" ] &&
+     backup_config >/dev/null && install_config "$ETC/last-good"; then
+    _what="podkop did not start with its settings ($_why); restored the last working settings and restarted podkop"
+    restart_podkop "recover $_t last-good"
+    _why=$(health "recover $_t last-good") && _why=""
+  fi
+  if [ -z "$_why" ]; then
     rm -f "$RUN/gave-up"; reapply_pins
     event recovered "$(jq -nc --arg w "$_what" '{action: $w}')"
   else
@@ -533,7 +555,10 @@ traffic_poll() {
     | {since: $s.since, total: $total, conns: ($cs | map({key: .id, value: .b}) | from_entries),
        servers: (reduce $ns[] as $x ($s.servers; .[$x.tag] += $x.n)
                  | if $seen == 0 and $gone > 0 then .[""] += $gone else . end),
-       links: (reduce $ns[] as $x ($s.links // {}; if $tl[$x.tag] then .[$tl[$x.tag]] += $x.n else . end))}' > "$_d/state.new" 2>/dev/null &&
+       # only the links podkop has now: the file in RAM does not grow as links come and go
+       links: (reduce $ns[] as $x ($s.links // {}; if $tl[$x.tag] then .[$tl[$x.tag]] += $x.n else . end)
+               | ([$tl[]] | map({key: ., value: true}) | from_entries) as $live
+               | with_entries(select($live[.key])))}' > "$_d/state.new" 2>/dev/null &&
     mv "$_d/state.new" "$_d/state.json"
 }
 
@@ -548,14 +573,16 @@ daemon() {
     if [ -f "$ETC/paused" ] || ! podkop_enabled; then _down=0; continue; fi
     # a change or a recovery holds the lock; podkop's own start takes a while
     flock -n "$RUN/apply.lock" true || continue
+    # an apply killed while the daemon runs (e.g. out of memory)
+    [ -s "$ETC/apply-pending" ] && { undo_interrupted; continue; }
     [ "$(podkop_start_state)" = running ] && continue
     _pid=$(singbox_pid)
     if [ -n "$_pid" ]; then
       [ "$_down" -ge 2 ] && event podkop_up
       _down=0
-      if [ "$_pid" != "$_last" ]; then
+      # tried every round until the Clash API answers and the pins are back
+      if [ "$_pid" != "$_last" ] && [ -n "$(proxies)" ] && reapply_pins; then
         _last=$_pid
-        [ -n "$(proxies)" ] && reapply_pins
       fi
       continue
     fi
@@ -571,7 +598,7 @@ daemon() {
 # --- commands ---------------------------------------------------------------------
 
 cmd_status() {
-  _fp=$(config_json | fingerprint)
+  _fp=$(config_fp)
   _st=$(podkop_start_state)
   _feat=$(sing-box version 2>/dev/null | sed -n 's/^Features:[[:space:]]*//p')
   _probe=$(cat "$RUN/probe/state" 2>/dev/null || echo none)
@@ -592,9 +619,9 @@ cmd_status() {
     --arg probe "$_probe" --argjson pins "${_pins:-[]}" \
     --arg fs "$(tail -n 1 /etc/sing-box/failsafe.last 2>/dev/null)" --arg fst "$(head -n 1 /etc/sing-box/failsafe.last 2>/dev/null)" \
     --arg pb "$([ -x "$PROBE" ] && sed -n 's/^VERSION="\(.*\)"/\1/p' "$PROBE")" \
-    --arg pcron "$(probe_cron)" --arg eng "$(sing-box version 2>/dev/null | grep -q 'tools.decode-link' && echo 1)" \
+    --arg pcron "$(probe_cron)" --arg tz "$(date +%z)" --arg eng "$(sing-box version 2>/dev/null | grep -q 'tools.decode-link' && echo 1)" \
     '{agent: {version: $av, protocol: $pv}, boot: $boot, uptime: ($up | tonumber? // 0),
-      router: {model: $model, openwrt: $os},
+      router: {model: $model, openwrt: $os, utc_offset: $tz},
       podkop: {version: $pk, enabled: ($en == "1"), paused: ($pa == "1"), start: $st,
                running: ($pid != ""), busy: ($busy == "1")},
       singbox: {version: $sb, features: ($feat | split(",") | map(select(. != "")))},
@@ -640,10 +667,11 @@ cmd_job() {
 
 # validate: the checks of "apply" without changing anything
 cmd_validate() {
-  cat | jq -c ".config | $NORM" > "$RUN/validate.json" 2>/dev/null || fail bad_request "expected {\"config\": {...}}"
-  _bad=$(check_names "$RUN/validate.json")
-  [ -z "$_bad" ] || fail bad_request "\"$_bad\" is not a valid name"
-  _p=$(validate "$RUN/validate.json"); rm -f "$RUN/validate.json"
+  _vf="$RUN/validate.$$.json"
+  cat | jq -c ".config | $NORM" > "$_vf" 2>/dev/null || { rm -f "$_vf"; fail bad_request "expected {\"config\": {...}}"; }
+  _bad=$(check_names "$_vf")
+  [ -z "$_bad" ] || { rm -f "$_vf"; fail bad_request "\"$_bad\" is not a valid name"; }
+  _p=$(validate "$_vf"); rm -f "$_vf"
   reply "$(jq -nc --argjson p "$_p" '{problems: $p}')"
 }
 
@@ -653,8 +681,11 @@ cmd_pin() {
   case "$_s" in ""|*[!A-Za-z0-9_]*) fail bad_request "section name expected" ;; esac
   _pt=$(config_json | jq -r --arg s "$_s" '.sections[] | select(.name == $s) | .options.proxy_config_type // ""')
   case "$_pt" in selector|urltest) ;; *) fail bad_request "section $_s has no server choice (needs selector or urltest)" ;; esac
+  exec 6> "$RUN/pins.lock"; flock 6
   touch "$ETC/pins"
-  grep -v "^$_s$TAB" "$ETC/pins" > "$ETC/pins.t"; mv "$ETC/pins.t" "$ETC/pins"
+  grep -v "^$_s$TAB" "$ETC/pins" > "$RUN/pins.t"
+  cmp -s "$RUN/pins.t" "$ETC/pins" || { cp "$RUN/pins.t" "$ETC/pins.t" && mv "$ETC/pins.t" "$ETC/pins"; }
+  rm -f "$RUN/pins.t"
   if [ "$_t" = auto ]; then
     [ "$_pt" = urltest ] && { select_server "$_s" "$_s-urltest-out" || fail clash "could not switch $_s-out"; }
     event pin_cleared "$(jq -nc --arg s "$_s" '{section: $s}')"
@@ -676,6 +707,50 @@ cmd_proxies() {
                | {name: .key, type: .value.type, now: .value.now, all: .value.all}],
       servers: [to_entries[] | select(.value.all == null)
                 | {name: .key, type: .value.type, delay: ((.value.history // []) | last | .delay // null)}]}')"
+}
+
+# exit-ip <section>: where the section's traffic leaves to the internet now:
+# through the server it uses (a sing-box run of just that outbound, taken
+# from podkop's running config) or, for a VPN section, its interface ->
+# {section, server, ip, country, city, org}
+cmd_exit_ip() {
+  _s=${1:-}
+  case "$_s" in ""|*[!A-Za-z0-9_]*) fail bad_request "section name expected" ;; esac
+  _o=$(config_json | jq -c --arg s "$_s" '.sections[] | select(.name == $s) | .options')
+  [ -n "$_o" ] || fail not_found "no section $_s"
+  _t=""
+  case "$(printf '%s' "$_o" | jq -r '.connection_type // ""')" in
+    proxy)
+      _p=$(proxies); [ -n "$_p" ] || fail podkop_down "the Clash API does not answer (is podkop running?)"
+      # the group's choice; through the urltest group, that group's choice
+      _t=$(printf '%s' "$_p" | jq -r --arg s "$_s" '.proxies as $p | ($p["\($s)-out"].now // "\($s)-out") as $n
+        | if $n == "\($s)-urltest-out" then ($p[$n].now // "") else $n end')
+      case "$_t" in ""|*[!A-Za-z0-9_-]*) fail not_found "section $_s has no server now" ;; esac
+      _cfg=$(uci -q get podkop.settings.config_path); [ -n "$_cfg" ] || _cfg=/etc/sing-box/config.json
+      # the outbound and the ones it goes through (detour); podkop's DNS servers are not there
+      jq -c --arg t "$_t" '.outbounds as $all
+        | [$t | recurse(. as $x | ($all[] | select(.tag == $x) | .detour) // empty)] as $chain
+        | {log: {disabled: true}, dns: {servers: [{type: "local", tag: "local"}]},
+           outbounds: [$all[] | select(.tag as $x | $chain | index($x)) | del(.domain_resolver)],
+           route: {final: $t, default_domain_resolver: "local"}}
+        | if (.outbounds | length) == 0 then error("no outbound") else . end' "$_cfg" > "$RUN/exit.$$.json" 2>/dev/null ||
+        { rm -f "$RUN/exit.$$.json"; fail not_found "$_t is not in sing-box's config"; }
+      sing-box tools fetch -c "$RUN/exit.$$.json" https://ipinfo.io/json > "$RUN/exit.$$.out" 2>&1 &
+      _fp=$!; _w=0
+      while kill -0 "$_fp" 2>/dev/null && [ "$_w" -lt 15 ]; do sleep 1; _w=$((_w + 1)); done
+      kill "$_fp" 2>/dev/null; wait "$_fp" 2>/dev/null
+      _j=$(cat "$RUN/exit.$$.out"); rm -f "$RUN/exit.$$.json" "$RUN/exit.$$.out" ;;
+    vpn)
+      _if=$(printf '%s' "$_o" | jq -r '.interface // ""')
+      case "$_if" in ""|*[!A-Za-z0-9_.@-]*) fail bad_request "section $_s has no interface" ;; esac
+      _t=$_if
+      _j=$(curl -s --max-time 15 --interface "$_if" https://ipinfo.io/json 2>/dev/null) ;;
+    *) fail bad_request "section $_s does not leave through a server or an interface" ;;
+  esac
+  printf '%s' "$_j" | jq -e '.ip' >/dev/null 2>&1 ||
+    fail exit_unknown "no answer from ipinfo.io through $_t: $(printf '%s' "$_j" | tail -n 1 | tr -d '\033' | sed 's/\[[0-9;]*m//g' | cut -c 1-200)"
+  reply "$(printf '%s' "$_j" | jq -c --arg s "$_s" --arg t "$_t" \
+    '{section: $s, server: $t, ip: (.ip // ""), country: (.country // ""), city: (.city // ""), org: (.org // "")}')"
 }
 
 # delays <section>: test every server of the section now
@@ -725,9 +800,12 @@ cmd_watch() {
 
 # service <start|stop|restart|enable|disable>; stop pauses the watchdog too
 cmd_service() {
+  # not in the middle of an apply or a recovery: its health check would fail
+  exec 9> "$RUN/apply.lock"
+  flock -n 9 || fail busy "podkop's settings are being applied or podkop is being recovered; try again in a minute"
   case "${1:-}" in
-    start)   rm -f "$ETC/paused"; /etc/init.d/podkop start >/dev/null 2>&1 ;;
-    stop)    touch "$ETC/paused"; /etc/init.d/podkop stop >/dev/null 2>&1 ;;
+    start)   rm -f "$ETC/paused"; /etc/init.d/podkop start >/dev/null 2>&1 9>&- ;;
+    stop)    touch "$ETC/paused"; /etc/init.d/podkop stop >/dev/null 2>&1 9>&- ;;
     restart) rm -f "$ETC/paused"; restart_podkop "restart by manager" ;;
     enable)  /etc/init.d/podkop enable ;;
     disable) /etc/init.d/podkop disable ;;
@@ -744,16 +822,41 @@ PROBE_OPTS="-q:0 -F:0 -v:0 --no-speed:0 --no-youtube:0 --no-entry-check:0 --fix-
 --countries:1 --top:1 --max-ping:1 --min-speed:1 --speed-jobs:1 --youtube-noads:1"
 
 # probe_check: a "running" probe whose runner is gone (killed, e.g. out of
-# memory) has failed; call it holding the probe lock (fd 7)
+# memory, or never started) has failed; call it holding the probe lock (fd 7)
 probe_check() {
   [ "$(cat "$RUN/probe/state" 2>/dev/null)" = running ] || return 0
   _pp=$(cat "$RUN/probe/pid" 2>/dev/null)
-  [ -n "$_pp" ] || return 0   # the runner has not started yet
-  tr '\0' ' ' < "/proc/$_pp/cmdline" 2>/dev/null | grep -q _run-probe && return 0
-  echo "podkop-agent: the probe was killed (out of memory?)" >> "$RUN/probe/log"
+  if [ -z "$_pp" ]; then
+    # the runner writes its pid at once; a minute without it: it never started
+    [ -n "$(find "$RUN/probe/started" -mmin -1 2>/dev/null)" ] && return 0
+    _why="podkop-agent: the probe did not start (out of memory?)"
+  else
+    tr '\0' ' ' < "/proc/$_pp/cmdline" 2>/dev/null | grep -q _run-probe && return 0
+    _why="podkop-agent: the probe was killed (out of memory?)"
+  fi
+  echo "$_why" >> "$RUN/probe/log"
+  probe_leftovers
   now > "$RUN/probe/finished"
   echo failed > "$RUN/probe/state"
 }
+
+# probe_leftovers: a probe killed outright (no time to clean up) leaves its
+# sing-box and its /tmp/podkop-probe.<pid> folder; remove those of probes
+# that no longer run
+probe_leftovers() {
+  for _w in /tmp/podkop-probe.[0-9]*; do
+    [ -d "$_w" ] || continue
+    [ -d "/proc/${_w##*.}" ] && continue
+    for _f in "$_w"/pids/*; do
+      [ -f "$_f" ] || continue
+      _sp=$(cat "$_f"); tr '\0' ' ' < "/proc/$_sp/cmdline" 2>/dev/null | grep -q "$_w/" && kill "$_sp" 2>/dev/null
+    done
+    rm -rf "$_w"
+  done
+}
+
+# key_ok <url>: a subscription key is an http(s) address and nothing else
+key_ok() { printf '%s' "$1" | grep -qE '^https?://[^[:space:]]+$'; }
 
 # probe-start: stdin {"keys": [subscription urls], "options": ["--countries", "europe", ...]}
 cmd_probe_start() {
@@ -762,23 +865,32 @@ cmd_probe_start() {
   exec 7> "$RUN/probe.lock"; flock 7
   probe_check
   [ "$(cat "$RUN/probe/state" 2>/dev/null)" = running ] && fail busy "a probe is already running"
-  cat > "$RUN/probe/req.json"
-  jq -e '(.keys | type == "array" and length > 0) and ((.options // []) | type == "array")' \
-    "$RUN/probe/req.json" >/dev/null 2>&1 || fail bad_request "expected {\"keys\": [...], \"options\": [...]}"
+  # checked before it replaces the last run's request
+  _rq="$RUN/probe/req.$$.json"
+  cat > "$_rq"
+  jq -e '(.keys | type == "array" and length > 0 and all(type == "string"))
+         and ((.options // []) | type == "array" and all(type == "string"))' \
+    "$_rq" >/dev/null 2>&1 || { rm -f "$_rq"; fail bad_request "expected {\"keys\": [...], \"options\": [...]}"; }
   _left=0
   set -f
-  for _a in $(jq -r '.options // [] | .[]' "$RUN/probe/req.json"); do
+  for _k in $(jq -r '.keys[]' "$_rq"); do key_ok "$_k" || { rm -f "$_rq"; fail bad_request "a key is not an http(s) address"; }; done
+  for _a in $(jq -r '.options // [] | .[]' "$_rq"); do
     if [ "$_left" -gt 0 ]; then _left=$((_left - 1)); continue; fi
-    _k=$(printf '%s' "$PROBE_OPTS" | tr ' ' '\n' | grep -- "^$_a:" | cut -d : -f 2)
-    [ -n "$_k" ] || fail bad_request "probe option $_a is not allowed"
+    _k=""
+    for _po in $PROBE_OPTS; do [ "${_po%:*}" = "$_a" ] && _k=${_po##*:}; done
+    [ -n "$_k" ] || { rm -f "$_rq"; fail bad_request "probe option $_a is not allowed"; }
     _left=$_k
   done
   set +f
+  mv "$_rq" "$RUN/probe/req.json"
   echo running > "$RUN/probe/state"
   rm -f "$RUN/probe/result.csv" "$RUN/probe/result.csv.links" "$RUN/probe/exit" "$RUN/probe/pid"
   now > "$RUN/probe/started"
   exec 7>&-   # the runner must not inherit the lock
-  spawn _run-probe
+  if ! spawn _run-probe; then
+    echo failed > "$RUN/probe/state"; now > "$RUN/probe/finished"
+    fail no_memory "the probe could not be started (out of memory?)"
+  fi
   event probe_started
   reply '{"state":"running"}'
 }
@@ -791,8 +903,14 @@ run_probe() {
   for _k in $(jq -r '.keys[]' "$RUN/probe/req.json"); do set -- "$@" -s "$_k"; done
   rm -f /tmp/podkop-probe-best.txt /tmp/podkop-probe-fallback.txt /tmp/podkop-probe-youtube.txt \
     /tmp/podkop-probe-youtube-fallback.txt
-  "$PROBE" --no-apply --no-color -o "$RUN/probe/result.csv" "$@" > "$RUN/probe/log" 2>&1
+  # at most 3 hours (the manager waits that long); TERM lets it clean up
+  if command -v timeout >/dev/null 2>&1; then
+    timeout -s TERM 10800 "$PROBE" --no-apply --no-color -o "$RUN/probe/result.csv" "$@" > "$RUN/probe/log" 2>&1
+  else
+    "$PROBE" --no-apply --no-color -o "$RUN/probe/result.csv" "$@" > "$RUN/probe/log" 2>&1
+  fi
   _rc=$?
+  probe_leftovers
   (
     flock 7
     echo "$_rc" > "$RUN/probe/exit"
@@ -809,7 +927,10 @@ cmd_sub_info() {
   _req=$(cat)
   printf '%s' "$_req" | jq -e '.keys | type == "array" and length > 0' >/dev/null 2>&1 || fail bad_request 'expected {"keys": [...]}'
   set -f; set --
-  for _k in $(printf '%s' "$_req" | jq -r '.keys[]'); do set -- "$@" -s "$_k"; done
+  for _k in $(printf '%s' "$_req" | jq -r '.keys[] | strings'); do
+    key_ok "$_k" || fail bad_request "a key is not an http(s) address"
+    set -- "$@" -s "$_k"
+  done
   set +f
   _out=$("$PROBE" --sub-info --no-color "$@" 2>/dev/null)
   printf '%s\n' "$_out" | grep -q '^K' || fail old_probe "podkop-probe can't read key usage: reinstall the agent"
@@ -839,14 +960,14 @@ cmd_probe_config() {
   [ -f "$PROBE_CONF" ] || reply "$(jq -nc --arg c "$(probe_cron)" '{saved: false, cron: $c}')"
   # its own file, written by podkop-probe as shell assignments
   # shellcheck disable=SC1090
-  reply "$( (SUBS=""; COUNTRIES=""; TOP=""; SECTION=""; YOUTUBE=""; YT_NOADS=""; YT_SECTION=""; APPLY_TO=""; MAX_PING=""; MIN_SPEED=""
+  reply "$( (SUBS=""; COUNTRIES=""; TOP=""; SECTION=""; YOUTUBE=""; YT_NOADS="RU"; YT_SECTION=""; APPLY_TO=""; MAX_PING=""; MIN_SPEED=""
     . "$PROBE_CONF" >/dev/null 2>&1
     jq -nc --arg subs "$SUBS" --arg c "$COUNTRIES" --arg top "$TOP" --arg sec "$SECTION" --arg yt "$YOUTUBE" \
       --arg noads "$YT_NOADS" --arg ysec "$YT_SECTION" --arg to "$APPLY_TO" --arg mp "$MAX_PING" --arg ms "$MIN_SPEED" \
       --arg cron "$(probe_cron)" \
       '{saved: true, keys: ($subs | split("\n") | map(select(. != ""))), countries: $c, top: ($top | tonumber? // 10),
         section: (if $sec == "" then "main" else $sec end), youtube: ($yt != "0"),
-        youtube_noads: (if $noads == "" then "RU" else $noads end),
+        youtube_noads: $noads,
         youtube_section: (if $ysec == "" then "youtube" else $ysec end),
         apply_to: (if $to == "" then "both" else $to end),
         max_ping: ($mp | tonumber? // 700), min_speed: ($ms | tonumber? // 40), cron: $cron}') )"
@@ -910,6 +1031,7 @@ case "$_cmd" in
   pin)           cmd_pin "$@" ;;
   proxies)       cmd_proxies ;;
   delays)        cmd_delays "$@" ;;
+  exit-ip)       cmd_exit_ip "$@" ;;
   logs)          cmd_logs "$@" ;;
   watch)         cmd_watch "$@" ;;
   service)       cmd_service "$@" ;;
@@ -933,6 +1055,7 @@ case "$_cmd" in
       _run-probe) run_probe ;;
     esac ;;
   help|-h|--help)
-    echo "podkop-agent $AGENT_VERSION: status config-get validate apply job pin proxies delays logs watch service probe-start probe-status probe-config probe-cron sub-info traffic uninstall version" ;;
+    echo "podkop-agent $AGENT_VERSION: status config-get validate apply job pin proxies exit-ip delays logs watch service probe-start probe-status probe-config probe-cron sub-info traffic uninstall version" ;;
   *) fail bad_request "unknown command $_cmd" ;;
 esac
+# end of podkop-agent

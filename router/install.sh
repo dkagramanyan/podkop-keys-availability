@@ -82,15 +82,20 @@ case "$KEY" in ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-*) ;; *) die "--key must be 
 sing-box version 2>/dev/null | grep -q 'tools.decode-link' ||
   echo "warning: podkop-engine is not installed, so podkop-probe can't test servers here (https://github.com/FiyeroT/podkop-engine)" >&2
 command -v jq >/dev/null 2>&1 || die "jq is not installed"
+for _t in flock setsid; do command -v "$_t" >/dev/null 2>&1 || die "$_t is not available (BusyBox without it?)"; done
 
 TMP=/tmp/podkop-agent-install.$$
 mkdir -p "$TMP" || die "cannot create $TMP"
 trap 'rm -rf "$TMP"' EXIT
-fetch podkop-agent "$TMP/podkop-agent" && grep -q '^AGENT_VERSION=' "$TMP/podkop-agent" || die "could not get podkop-agent"
-fetch podkop-agent.init "$TMP/podkop-agent.init" && grep -q 'podkop-agent daemon' "$TMP/podkop-agent.init" || die "could not get podkop-agent.init"
-fetch probe.sh "$TMP/probe.sh" && grep -q '^VERSION=' "$TMP/probe.sh" || die "could not get probe.sh"
+# whole <file> <its last line>: a cut-off download is not installed
+whole() { [ "$(tail -n 1 "$1")" = "$2" ] && sh -n "$1" 2>/dev/null; }
+fetch podkop-agent "$TMP/podkop-agent" && whole "$TMP/podkop-agent" "# end of podkop-agent" || die "could not get podkop-agent"
+fetch podkop-agent.init "$TMP/podkop-agent.init" && grep -q 'podkop-agent daemon' "$TMP/podkop-agent.init" &&
+  sh -n "$TMP/podkop-agent.init" 2>/dev/null || die "could not get podkop-agent.init"
+fetch probe.sh "$TMP/probe.sh" && whole "$TMP/probe.sh" "# end of podkop-probe" || die "could not get probe.sh"
 
-put() { cp "$1" "$2.new" && chmod 755 "$2.new" && mv "$2.new" "$2" || die "could not write $2"; }
+# flash: a file that is already the same is not written again
+put() { cmp -s "$1" "$2" || { cp "$1" "$2.new" && chmod 755 "$2.new" && mv "$2.new" "$2"; } || die "could not write $2"; }
 put "$TMP/podkop-agent" /usr/bin/podkop-agent
 put "$TMP/podkop-agent.init" /etc/init.d/podkop-agent
 put "$TMP/probe.sh" /usr/bin/podkop-probe
