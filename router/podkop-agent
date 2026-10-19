@@ -310,7 +310,7 @@ servers_only() {
 podkop_build() (
   set +u
   _out=$1
-  . /lib/functions.sh && . /lib/config/uci.sh && . /lib/functions/network.sh || exit 1
+  for _f in /lib/functions.sh /lib/config/uci.sh /lib/functions/network.sh; do . "$_f" || exit 1; done
   for _f in constants nft helpers sing_box_config_manager sing_box_config_facade logging rulesets; do
     . "$PODKOP_LIB/$_f.sh" || exit 1
   done
@@ -338,7 +338,7 @@ hot_apply() {
   _hp=$(singbox_pid)
   if [ -z "$_hp" ] || [ "$(podkop_start_state)" != 0 ]; then echo "podkop is not fully running"; return 1; fi
   _cp=$(uci -q get podkop.settings.config_path)
-  [ -n "$_cp" ] && [ -f "$_cp" ] || { echo "no sing-box config file"; return 1; }
+  if [ -z "$_cp" ] || [ ! -f "$_cp" ]; then echo "no sing-box config file"; return 1; fi
   _hb="$RUN/hot.$$.json"
   rm -f "$_hb" "$_hb.err"
   if ! podkop_build "$_hb" || [ -s "$_hb.err" ] || ! jq -e '.outbounds' "$_hb" >/dev/null 2>&1; then
