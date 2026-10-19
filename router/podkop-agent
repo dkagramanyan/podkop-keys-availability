@@ -346,7 +346,9 @@ hot_apply() {
   fi
   logger -t podkop-agent "$1"
   if ! cmp -s "$_hb" "$_cp"; then
-    cp "$_hb" "$_cp.agent-new" && mv "$_cp.agent-new" "$_cp" || { rm -f "$_hb" "$_cp.agent-new"; echo "could not write $_cp"; return 1; }
+    if ! { cp "$_hb" "$_cp.agent-new" && mv "$_cp.agent-new" "$_cp"; }; then
+      rm -f "$_hb" "$_cp.agent-new"; echo "could not write $_cp"; return 1
+    fi
   fi
   _tags=$(jq -r '.outbounds[].tag' "$_hb")
   rm -f "$_hb" "$_hb.err"
