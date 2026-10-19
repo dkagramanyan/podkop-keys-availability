@@ -78,6 +78,12 @@ that already runs there are taken into **Keys and usage** and the rules.
 - **Keys and usage**: add subscriptions and single links here, and see each
   key's traffic against its limit (from the provider or your own). At 90% it warns, or moves the probe's rules to other keys
   until the reset.
+- **Dead servers don't hang connections:** the agent adds HTTP/2 pings
+  (15 s) to gRPC servers and `interrupt_exist_connections` to URLTest groups
+  in sing-box's config, after every podkop start and apply (podkop itself
+  leaves them off and is not changed). A connection through a server that
+  stopped answering is dropped within ~30 s, so apps reconnect through a
+  working server instead of hanging for minutes.
 - To stop podkop, use **Stop**: otherwise the watchdog starts it again within
   about 30 s (**Disable** in LuCI turns that off).
 

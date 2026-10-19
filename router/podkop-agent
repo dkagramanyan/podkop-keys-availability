@@ -12,7 +12,7 @@
 # $SSH_ORIGINAL_COMMAND, requests come as JSON on stdin, answers go as JSON to
 # stdout: {"v":1,"ok":true,"data":...} or {"v":1,"ok":false,"error":{...}}.
 
-AGENT_VERSION="0.5.0"
+AGENT_VERSION="0.6.0"
 PROTO=1
 ETC=/etc/podkop-agent
 RUN=/tmp/podkop-agent
@@ -219,7 +219,12 @@ failsafe_recent() {
 }
 
 podkop_enabled() { /etc/init.d/podkop enabled 2>/dev/null; }
-singbox_pid() { pidof sing-box 2>/dev/null | cut -d ' ' -f 1; }
+# the sing-box procd runs: `sing-box check`, the exit-IP check and the probe
+# run sing-box processes too
+singbox_pid() {
+  ubus call service list '{"name":"sing-box"}' 2>/dev/null |
+    jq -r '[.["sing-box"].instances[]? | select(.running) | .pid] | first // empty'
+}
 proxies() { podkop clash_api get_proxies 2>/dev/null; }
 
 # fatal_since <marker>: podkop's first fatal message after our marker log line
@@ -344,6 +349,9 @@ hot_apply() {
   if ! podkop_build "$_hb" || [ -s "$_hb.err" ] || ! jq -e '.outbounds' "$_hb" >/dev/null 2>&1; then
     echo "podkop could not build the config: $(head -n 1 "$_hb.err" 2>/dev/null)"; rm -f "$_hb" "$_hb.err"; return 1
   fi
+  if ! { jq "$HEALTH_JQ" "$_hb" > "$_hb.i" && mv "$_hb.i" "$_hb"; }; then
+    rm -f "$_hb" "$_hb.i" "$_hb.err"; echo "could not add gRPC pings and interrupt_exist_connections"; return 1
+  fi
   logger -t podkop-agent "$1"
   if ! cmp -s "$_hb" "$_cp"; then
     if ! { cp "$_hb" "$_cp.agent-new" && mv "$_cp.agent-new" "$_cp"; }; then
@@ -367,6 +375,41 @@ hot_apply() {
     [ "$_w" -ge 15 ] && { echo "sing-box did not take the new servers:${_miss:- no Clash API}"; return 1; }
   done
   dns_ok || { sleep 2; dns_ok; } || { echo "DNS through the router does not answer"; return 1; }
+}
+
+# --- dead servers: connections don't hang ------------------------------------------
+
+# Two sing-box options podkop leaves off; podkop writes its config without
+# them at every start, the daemon adds them then, hot_apply at once:
+# - gRPC: when a server stops answering, its connections just wait for data
+#   that never comes, and apps (phones above all) hang for minutes until their
+#   own timeouts. With HTTP/2 pings (idle_timeout, ping_timeout) a quiet
+#   connection is pinged after 15 s and dropped 15 s later without an answer,
+#   with everything on it: apps reconnect at once. A link's own values stay.
+# - urltest interrupt_exist_connections: when a group switches servers, it
+#   closes the connections still open through the one it left.
+HEALTH_JQ='(.outbounds[]? | select(.type == "urltest")) += {interrupt_exist_connections: true}
+  | (.outbounds[]? | select(.transport.type == "grpc") | .transport) |= ({idle_timeout: "15s", ping_timeout: "15s"} + .)'
+
+# health_on: sing-box's config gets them and sing-box reloads in place
+# ("reloaded" on stdout); nothing is written when they're there already, and
+# a config sing-box would refuse with them stays as it is (tried once per sing-box)
+health_on() {
+  _ic=$(uci -q get podkop.settings.config_path)
+  _ip=$(singbox_pid)
+  if [ -z "$_ic" ] || [ ! -f "$_ic" ] || [ -z "$_ip" ]; then return 0; fi
+  [ "$(cat "$RUN/health.failed" 2>/dev/null)" = "$_ip" ] && return 0
+  jq "$HEALTH_JQ" "$_ic" > "$RUN/health.json" 2>/dev/null || { rm -f "$RUN/health.json"; return 0; }
+  if [ "$(jq -c . "$RUN/health.json")" = "$(jq -c . "$_ic")" ]; then rm -f "$RUN/health.json"; return 0; fi
+  if ! { sing-box check -c "$RUN/health.json" >/dev/null 2>&1 &&
+         cp "$RUN/health.json" "$_ic.agent-new" && mv "$_ic.agent-new" "$_ic"; }; then
+    rm -f "$RUN/health.json" "$_ic.agent-new"; echo "$_ip" > "$RUN/health.failed"
+    logger -t podkop-agent "could not add gRPC pings and interrupt_exist_connections to sing-box's config"
+    return 0
+  fi
+  rm -f "$RUN/health.json"
+  logger -t podkop-agent "dead servers: gRPC pings and interrupt_exist_connections added to sing-box's config"
+  if kill -HUP "$_ip" 2>/dev/null; then echo reloaded; fi
 }
 
 # through temp files, so a full disk can't leave a cut-off copy
@@ -676,9 +719,12 @@ daemon() {
     if [ -n "$_pid" ]; then
       [ "$_down" -ge 2 ] && event podkop_up
       _down=0
-      # tried every round until the Clash API answers and the pins are back
-      if [ "$_pid" != "$_last" ] && [ -n "$(proxies)" ] && reapply_pins; then
-        _last=$_pid
+      # tried every round until the Clash API answers and the pins are back;
+      # a reload drops the pins, so they go back the round after it
+      if [ "$_pid" != "$_last" ]; then
+        _r=$( (flock -n 9 || exit 1; health_on) 9> "$RUN/apply.lock") || continue
+        [ "$_r" = reloaded ] && continue
+        if [ -n "$(proxies)" ] && reapply_pins; then _last=$_pid; fi
       fi
       continue
     fi

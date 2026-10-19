@@ -3,6 +3,28 @@
 Versions are podkop-probe's (`probe.sh`); a release also carries
 podkop-agent and podkop-manager.
 
+## 1.26.0 — 2026-10-19
+
+- **No minutes-long hang when a server dies** (podkop-agent 0.6.0). When a
+  gRPC server stopped answering, sing-box kept the connections through it
+  open, waiting for data that never came; apps (phones above all) hung on
+  them for minutes, even after urltest had switched to another server. The
+  agent now adds two sing-box options podkop leaves off, after every podkop
+  start (the daemon, within ~15 s, sing-box reloads in place) and in applies
+  that change only servers:
+  - gRPC transports: HTTP/2 pings, `idle_timeout` 15s and `ping_timeout`
+    15s (a link's own values stay). A quiet connection is pinged and dropped
+    when no answer comes, with everything on it, so apps reconnect at once.
+  - urltest groups: `interrupt_exist_connections`, so a switch closes the
+    connections still open through the server it left.
+  - On openwrt-reserv, the server of a running download blocked: without
+    the pings the download stayed frozen for over 3 minutes (also after the
+    switch); with them the connection was closed 29 s after the block.
+  - podkop's own files are not changed. The reload when the agent adds the
+    options cost at most one failed DNS check (~0.1 s).
+- podkop-agent finds podkop's sing-box through procd: `sing-box check`, the
+  exit-IP check and the probe run sing-box processes too.
+
 ## 1.25.0 — 2026-10-19
 
 - **No outage when only servers change** (podkop-agent 0.5.0). podkop's
