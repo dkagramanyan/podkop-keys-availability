@@ -541,7 +541,7 @@ function diffSummary(diff) {
 // --- events ---------------------------------------------------------------------------------
 
 const EVENT_TEXT = {
-  applied: (d) => (d.restarted ? "Settings applied, podkop restarted" : "Settings saved, podkop is stopped"),
+  applied: (d) => (d.hot ? "Servers applied, sing-box reloaded them without a podkop restart" : d.restarted ? "Settings applied, podkop restarted" : "Settings saved, podkop is stopped"),
   reverted: (d) => `Change undone: ${d.reason}`,
   revert_failed: (d) => `Change failed and podkop does not run with the old settings either: ${d.revert_reason}`,
   apply_interrupted: (d) => d.message || "A change was cut off (reboot?): the old settings are back",
@@ -2471,6 +2471,7 @@ const STEP_TEXT = {
   check: ["Checking the settings on the router", "Checked the settings on the router", "The router refused these settings"],
   write: ["Saving a backup and writing the new settings", "Saved a backup and wrote the new settings", "Could not write the new settings"],
   restart: ["Restarting podkop and checking that it runs", "Restarted podkop, it runs", "podkop did not come up"],
+  reload: ["Only servers changed: sing-box takes them without a podkop restart", "sing-box took the new servers, podkop kept running", "sing-box could not take them in place, so podkop restarts"],
   revert: ["Putting the old settings back", "Put the old settings back", "podkop does not run with the old settings either"],
 };
 
@@ -2481,9 +2482,13 @@ function jobSteps(state, marks, now) {
   switch (state) {
     case "pending": case "queued": case "checking":
       return [s("check", "now", "check"), s("write", "todo"), s("restart", "todo")];
-    case "restarting": return [s("check", "done", "check", "restart"), s("write", "done"), s("restart", "now", "restart")];
+    case "reloading": return [s("check", "done", "check", "reload"), s("write", "done"), s("reload", "now", "reload")];
+    case "restarting": return [s("check", "done", "check", marks.reload ? "reload" : "restart"), s("write", "done"),
+      marks.reload ? s("reload", "fail", "reload", "restart") : null, s("restart", "now", "restart")].filter(Boolean);
     case "reverting": return [s("check", "done", "check", "restart"), s("write", "done"), s("restart", "fail", "restart", "revert"), s("revert", "now", "revert")];
-    case "applied": return [s("check", "done", "check", "restart"), s("write", "done"), s("restart", "done", "restart", "end")];
+    case "applied": return marks.reload && !marks.restart
+      ? [s("check", "done", "check", "reload"), s("write", "done"), s("reload", "done", "reload", "end")]
+      : [s("check", "done", "check", "restart"), s("write", "done"), s("restart", "done", "restart", "end")];
     case "saved": return [s("check", "done", "check", "end"), s("write", "done"), { key: "saved", status: "done", t: null }];
     case "unchanged": return [s("check", "done", "check", "end"), { key: "unchanged", status: "done", t: null }];
     case "rejected": return [s("check", "fail", "check", "end")];
@@ -2570,6 +2575,7 @@ async function openApply(id, { base, config, note, trigger, done }) {
       if (finished || !job || !job.state || job.state === state) return;
       state = job.state;
       const t = Date.now();
+      if (state === "reloading") marks.reload = marks.reload || t;
       if (state === "restarting") marks.restart = marks.restart || t;
       if (state === "reverting") { marks.restart = marks.restart || marks.check; marks.revert = t; }
       if (FINAL_STATES.includes(state)) end(job, t);
@@ -2579,7 +2585,7 @@ async function openApply(id, { base, config, note, trigger, done }) {
       finished = true; marks.end = t; clearInterval(timer); S.jobWatch.delete(vid);
       const ok = ["applied", "saved", "unchanged"].includes(job.state);
       if (job.problems && job.problems.length) { problems = job.problems; showChecks(); }
-      put(result, h("div", { class: `result ${ok ? "ok" : "bad"}` }, ok ? (job.state === "applied" ? "Applied, podkop is running." : job.message)
+      put(result, h("div", { class: `result ${ok ? "ok" : "bad"}` }, ok ? (job.state === "applied" ? (job.hot ? "Applied without restarting podkop: only servers changed." : "Applied, podkop is running.") : job.message)
         : job.state === "reverted" ? `podkop did not start with these settings, so the router put the old ones back: ${job.reason || job.message}` : job.message));
       go.textContent = ok ? "Done" : "Applying failed";
       close.textContent = "Close";

@@ -3,6 +3,27 @@
 Versions are podkop-probe's (`probe.sh`); a release also carries
 podkop-agent and podkop-manager.
 
+## 1.25.0 — 2026-10-19
+
+- **No outage when only servers change** (podkop-agent 0.5.0). podkop's
+  restart stops sing-box, removes its firewall rules and DNS setup, rebuilds
+  everything and loads the IP lists again: 20-30 s in which nothing goes
+  through the proxy. When an apply changes only which servers rules use
+  (the nightly probe, Take links from probe, edited server lists), the agent
+  now builds the new sing-box config with podkop's own functions (the same
+  `sing_box_init_config` its start runs), puts it in place and has sing-box
+  reload it in place (SIGHUP). Firewall, DNS and lists stay as they are.
+  - On openwrt-reserv with openwrt-main's config: DNS through sing-box
+    checked every 0.1 s failed 0-1 times during the swap (about 0.1 s),
+    against 20-30 s for a restart; sing-box stays the same process.
+  - The config is byte for byte what podkop's own restart writes (checked:
+    a restart afterwards reports "configuration is unchanged").
+  - Any other change (domains, lists, DNS, settings) still restarts podkop,
+    and so does a swap that fails for any reason; the health check and the
+    automatic undo work as before.
+  - The apply dialog shows "sing-box took the new servers, podkop kept
+    running" (manager 0.15.0).
+
 ## 1.24.0 — 2026-10-18
 
 - **Nightly probe in the rules:** its settings (time, apply by itself, TLS
