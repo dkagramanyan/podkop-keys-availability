@@ -317,11 +317,15 @@ podkop_build() (
   # podkop's functions, without running podkop (outside them it only loads
   # these files and runs the command it is given)
   eval "$(sed -n '/^[A-Za-z_][A-Za-z0-9_]*() {$/,/^}$/p' /usr/bin/podkop)" || exit 1
+  # shellcheck disable=SC2329   # called by podkop's functions
   log() { case "${2:-}" in error|fatal) printf '%s\n' "$1" >> "$_out.err" ;; esac; }
   # a start finds the rule-set folder empty (its stop empties it), so each
   # local rule set is added as new; here its file is already there, with the
   # same content (podkop merges the same, unchanged lists into it again)
+  # shellcheck disable=SC2329
   create_source_rule_set() { [ -f "$1" ] || jq -n '{version: 3, rules: []}' > "$1"; }
+  # $config: podkop's sing_box_init_config builds it
+  # shellcheck disable=SC2154,SC2329
   sing_box_save_config() { sing_box_cm_save_config_to_file "$config" "$_out" && sing-box check -c "$_out" >/dev/null 2>&1; }
   config_load podkop
   sing_box_init_config
@@ -332,7 +336,7 @@ podkop_build() (
 # is off. On failure the reason goes to stdout.
 hot_apply() {
   _hp=$(singbox_pid)
-  [ -n "$_hp" ] && [ "$(podkop_start_state)" = 0 ] || { echo "podkop is not fully running"; return 1; }
+  if [ -z "$_hp" ] || [ "$(podkop_start_state)" != 0 ]; then echo "podkop is not fully running"; return 1; fi
   _cp=$(uci -q get podkop.settings.config_path)
   [ -n "$_cp" ] && [ -f "$_cp" ] || { echo "no sing-box config file"; return 1; }
   _hb="$RUN/hot.$$.json"
